@@ -127,6 +127,40 @@ const VRAM_WIDTH:  i32 = 1024;
 const VRAM_HEIGHT: i32 = 512;
 const VRAM_PITCH:  i32 = 2048;        // bytes per row at 16 bpp
 
+// Maximum on-screen resolution we support — 640×480 is the largest the
+// PSX can produce (interlaced 640H × 480V). The SDL window is sized to
+// this and the active display region is read out of the GPU's
+// display_mode register each frame so different resolutions all fit.
+const SCREEN_W: i32 = 640;
+const SCREEN_H: i32 = 480;
+
+// Decode the GPU's display-mode register (set by GP1 0x08) into
+// horizontal and vertical pixel counts. Mirrors psxe's
+// `psx_get_dmode_width` / `psx_get_dmode_height` so the SDL window
+// shows whatever resolution the BIOS or game has currently selected.
+//
+// Bit layout of GP1 0x08:
+//   0-1 horizontal res code (0=256, 1=320, 2=512, 3=640)
+//   2   vertical res (0=240, 1=480 — but only if bit 5 interlace=1)
+//   3   PAL/NTSC
+//   4   24bpp colour depth
+//   5   interlace enable
+//   6   horizontal res 2 override (1=368)
+fn dmodeWidth(dm: u32) i32 {
+    if ((dm & 0x40) != 0) { return 368; }
+    const hr: u32 = dm & 3;
+    if (hr == 0) { return 256; }
+    if (hr == 1) { return 320; }
+    if (hr == 2) { return 512; }
+    return 640;
+}
+
+fn dmodeHeight(dm: u32) i32 {
+    // Vertical 480 requires interlace (bit 5).
+    if ((dm & 0x04) != 0 and (dm & 0x20) != 0) { return 480; }
+    return 240;
+}
+
 // ---------- PSX-EXE loader ---------------------------------------------
 
 fn readU32At(buf: *mut[] u8, off: u32) u32 {
@@ -276,7 +310,29 @@ fn main() {
     var preMsg: []u8 = "Initializing SDL2...\n";
     write(STDOUT, preMsg.ptr, preMsg.len);
     var title: []u8 = "psone-jam";
-    var sdl: Sdl = sdlInit(title, VRAM_WIDTH, VRAM_HEIGHT);
+    // Set the JAM_PSONE_FULL_VRAM env var (any non-empty value) to
+    // see the whole 1024×512 VRAM in the window instead of the
+    // BIOS's 320×240 display rectangle. Useful for spotting where the
+    // BIOS is loading textures / drawing into off-screen targets when
+    // the visible window looks empty.
+    // Touch a `./FULL_VRAM` sentinel file (any contents) to swap the
+    // window to a 1024×512 view of the entire VRAM instead of the
+    // BIOS's 320×240 display rectangle. Useful for spotting where the
+    // BIOS is loading textures / drawing into off-screen targets when
+    // the visible window looks empty. (Env-var detection would have
+    // been cleaner but Jam v0.1.0 can't compare a `*const[] u8` from
+    // getenv() against NULL.)
+    var sentinel: []u8 = "./FULL_VRAM";
+    const fullVram: bool = fileExists(sentinel);
+    var sdlW: i32 = SCREEN_W;
+    var sdlH: i32 = SCREEN_H;
+    if (fullVram) {
+        sdlW = VRAM_WIDTH;
+        sdlH = VRAM_HEIGHT;
+        var fmsg: []u8 = "JAM_PSONE_FULL_VRAM set — showing full VRAM\n";
+        write(STDOUT, fmsg.ptr, fmsg.len);
+    }
+    var sdl: Sdl = sdlInit(title, sdlW, sdlH);
     var postMsg: []u8 = "SDL2 ready. Priming VRAM...\n";
     write(STDOUT, postMsg.ptr, postMsg.len);
     // Skip the gradient test pattern for now — the nested 1024x512 loop
@@ -293,7 +349,20 @@ fn main() {
     while (quit == 0) {
         c = runOneFrame(c, bus, regs, cop0);
         var vram: *mut[] u8 = busVramPtr(bus);
-        sdlBlit(sdl, vram, VRAM_PITCH);
+        // Read the current display origin out of the GPU state buffer
+        // (g[63] disp_x, g[64] disp_y — set by GP1 0x05). The BIOS
+        // moves these around during double-buffered animation.
+        var gpuState: *mut[] u32 = busGpuPtr(bus);
+        const dispX: i32 = gpuState[63] as i32;
+        const dispY: i32 = gpuState[64] as i32;
+        if (fullVram) {
+            sdlBlit(sdl, vram, VRAM_PITCH, 0, 0, VRAM_WIDTH, VRAM_HEIGHT);
+        } else {
+            const dm: u32 = gpuState[47];
+            const w: i32 = dmodeWidth(dm);
+            const h: i32 = dmodeHeight(dm);
+            sdlBlit(sdl, vram, VRAM_PITCH, dispX, dispY, w, h);
+        }
         quit = sdlPump();
         frames = frames + 1;
         // Bail after a long-but-finite session if no quit event comes —

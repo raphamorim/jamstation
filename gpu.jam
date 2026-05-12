@@ -431,22 +431,354 @@ pub fn gpuPolyCmd(g: *mut[] u32, vram: *mut[] u8) {
         const isGour:  bool = (flags & 0x10) != 0;
         var verts: u32 = 3;
         if (isQuad) { verts = 4; }
-        // Words per vertex: 1 (xy) + 1 if tex + 1 if gouraud (except
-        // the first vertex's color is in buf[0]).
         var perVert: u32 = 1;
         if (isTex)  { perVert = perVert + 1; }
         if (isGour) { perVert = perVert + 1; }
-        // First vertex: color already in buf[0]; only its xy + tex word
-        // come, but for shaded the per-vertex color is already used.
         var args: u32 = perVert * verts;
-        if (isGour) { args = args - 1; }       // first colour is buf[0]
+        if (isGour) { args = args - 1; }
         g[17] = args;
         g[19] = GP_RECV_ARGS;
         return;
     }
     if (g[17] != 0) { return; }
     g[19] = GP_RECV_CMD;
-    // Rasterization stubbed — args latched but no draw call.
+    gpuRasterPoly(g, vram);
+}
+
+// Sign-extend an 11-bit PSX-screen coordinate (top 5 bits of a 16-bit
+// xy word are garbage; the low 11 bits are the signed value).
+pub fn gpuSe11(v: u32) u32 {
+    if ((v & 0x400) != 0) { return v | 0xFFFFF800; }
+    return v & 0x7FF;
+}
+
+pub fn gpuVertX(xy: u32) u32 { return gpuSe11(xy & 0xFFFF); }
+pub fn gpuVertY(xy: u32) u32 { return gpuSe11((xy >> 16) & 0xFFFF); }
+
+// Cross-product of edges (b-a) and (c-a). Result is the signed twice-
+// area of triangle abc. Use i64 to dodge overflow at ±2048 coords.
+pub fn gpuEdge(ax: u32, ay: u32, bx: u32, by: u32, cx: u32, cy: u32) i64 {
+    const ax64: i64 = sext32(ax);
+    const ay64: i64 = sext32(ay);
+    const bx64: i64 = sext32(bx);
+    const by64: i64 = sext32(by);
+    const cx64: i64 = sext32(cx);
+    const cy64: i64 = sext32(cy);
+    return (bx64 - ax64) * (cy64 - ay64) - (by64 - ay64) * (cx64 - ax64);
+}
+
+// Sign-extend a u32 (interpreted as i32) to i64. Used so the edge
+// function's intermediate products stay in range.
+pub fn sext32(v: u32) i64 {
+    var w: i64 = v as i64;
+    if ((v & 0x80000000) != 0) {
+        w = w - 0x100000000;
+    }
+    return w;
+}
+
+// Top-left rule — when an edge result lands exactly on zero, only the
+// pixel "owns" the edge if the edge is a top or left edge. This stops
+// shared edges between adjacent triangles from drawing twice.
+pub fn gpuTopLeftRule(z: i64, ax: u32, ay: u32, bx: u32, by: u32) bool {
+    if (z < 0) { return true; }
+    if (z != 0) { return false; }
+    const ay32: u32 = ay & 0xFFFF;
+    const by32: u32 = by & 0xFFFF;
+    const ax32: u32 = ax & 0xFFFF;
+    const bx32: u32 = bx & 0xFFFF;
+    // Use raw signed compare via sext32 helper.
+    const ays: i64 = sext32(ay);
+    const bys: i64 = sext32(by);
+    const axs: i64 = sext32(ax);
+    const bxs: i64 = sext32(bx);
+    if (bys > ays) { return true; }
+    if (bys == ays and bxs < axs) { return true; }
+    return false;
+}
+
+// Min / max of three i32 values (passed as u32, signed compare).
+pub fn gpuMin3(a: u32, b: u32, c: u32) u32 {
+    var m: u32 = a;
+    if (sext32(b) < sext32(m)) { m = b; }
+    if (sext32(c) < sext32(m)) { m = c; }
+    return m;
+}
+
+pub fn gpuMax3(a: u32, b: u32, c: u32) u32 {
+    var m: u32 = a;
+    if (sext32(b) > sext32(m)) { m = b; }
+    if (sext32(c) > sext32(m)) { m = c; }
+    return m;
+}
+
+// Rasterize one flat-shaded triangle. Caller has already applied the
+// drawing offset to the vertex coordinates. Pixels are clipped to the
+// drawing area registered via GP0 0xE3 / 0xE4.
+pub fn gpuFlatTriangle(g: *mut[] u32, vram: *mut[] u8,
+                       a0x: u32, a0y: u32,
+                       b0x: u32, b0y: u32,
+                       c0x: u32, c0y: u32,
+                       color: u32) {
+    // Apply drawing offset (sign-extended in GP0 0xE5).
+    const ox: u32 = g[52];
+    const oy: u32 = g[53];
+    const ax: u32 = a0x + ox;
+    const ay: u32 = a0y + oy;
+    var bx: u32 = b0x + ox;
+    var by: u32 = b0y + oy;
+    var cx: u32 = c0x + ox;
+    var cy: u32 = c0y + oy;
+
+    // Force CCW winding: if the triangle is CW, swap b and c.
+    const area: i64 = gpuEdge(ax, ay, bx, by, cx, cy);
+    if (area < 0) {
+        const tx: u32 = bx;  const ty: u32 = by;
+        bx = cx;             by = cy;
+        cx = tx;             cy = ty;
+    }
+
+    const xmin: u32 = gpuMin3(ax, bx, cx);
+    const ymin: u32 = gpuMin3(ay, by, cy);
+    const xmax: u32 = gpuMax3(ax, bx, cx);
+    const ymax: u32 = gpuMax3(ay, by, cy);
+
+    // Clip to drawing area.
+    const dx1: u32 = g[48];
+    const dy1: u32 = g[49];
+    const dx2: u32 = g[50];
+    const dy2: u32 = g[51];
+
+    // Bail on pathologically large bounding boxes (PSX hardware caps).
+    if (sext32(xmax - xmin) > 1024 or sext32(ymax - ymin) > 512) { return; }
+
+    // Use signed comparisons throughout. The drawing-area registers
+    // are non-negative, so an unsigned `x >= dx1` would erroneously
+    // include far-negative x positions (sext32 0xFFFFF800 > 0 in
+    // unsigned terms).
+    var y: u32 = ymin;
+    while (sext32(y) <= sext32(ymax)) {
+        var x: u32 = xmin;
+        while (sext32(x) <= sext32(xmax)) {
+            if (sext32(x) >= sext32(dx1) and sext32(x) <= sext32(dx2) and
+                sext32(y) >= sext32(dy1) and sext32(y) <= sext32(dy2)) {
+                const z0: i64 = gpuEdge(bx, by, cx, cy, x, y);
+                const z1: i64 = gpuEdge(cx, cy, ax, ay, x, y);
+                const z2: i64 = gpuEdge(ax, ay, bx, by, x, y);
+                if (!gpuTopLeftRule(z0, bx, by, cx, cy) and
+                    !gpuTopLeftRule(z1, cx, cy, ax, ay) and
+                    !gpuTopLeftRule(z2, ax, ay, bx, by)) {
+                    vramWritePixel(vram, x & 0x3FF, y & 0x1FF, color);
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+// Polygon dispatcher — reads the command flags and triggers one or
+// two triangles. Handles monochrome and textured variants; gouraud
+// shading falls back to flat-shaded with the base colour.
+pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
+    const flags: u32 = (g[0] >> 24) & 0xFF;
+    const isQuad: bool = (flags & 0x08) != 0;
+    const isTex:  bool = (flags & 0x04) != 0;
+    const isGour: bool = (flags & 0x10) != 0;
+    const isRaw:  bool = (flags & 0x01) != 0;
+
+    // PSX command layout per nocash psx-spx:
+    //   monochrome triangle      buf[0]=cmd+colour, buf[1..3]=xy
+    //   monochrome quad          buf[0]=cmd+colour, buf[1..4]=xy
+    //   textured triangle        buf[0]=cmd+colour, buf[1]=vv0xy,
+    //                            buf[2]=vv0clut+uv, buf[3]=vv1xy,
+    //                            buf[4]=vv1page+uv, buf[5]=vv2xy,
+    //                            buf[6]=vv2uv
+    //   textured quad            +buf[7]=vv3xy, buf[8]=vv3uv
+    //   shaded triangle          buf[0]=colour0+cmd, buf[1]=vv0xy,
+    //                            buf[2]=colour1, buf[3]=vv1xy, ...
+    // We only render mono + textured here; shaded reuses the base
+    // colour from buf[0].
+
+    var v0x: u32 = 0; var v0y: u32 = 0;
+    var v1x: u32 = 0; var v1y: u32 = 0;
+    var v2x: u32 = 0; var v2y: u32 = 0;
+    var v3x: u32 = 0; var v3y: u32 = 0;
+    var uu0: u32 = 0;  var vv0: u32 = 0;
+    var uu1: u32 = 0;  var vv1: u32 = 0;
+    var uu2: u32 = 0;  var vv2: u32 = 0;
+    var uu3: u32 = 0;  var vv3: u32 = 0;
+    var clutX: u32 = 0;  var clutY: u32 = 0;
+    var tpx: u32 = g[60];
+    var tpy: u32 = g[61];
+    var depth: u32 = g[62];
+
+    if (isTex and !isGour) {
+        v0x = gpuVertX(g[1]); v0y = gpuVertY(g[1]);
+        uu0 = g[2] & 0xFF;  vv0 = (g[2] >> 8) & 0xFF;
+        const clut: u32 = (g[2] >> 16) & 0xFFFF;
+        clutX = (clut & 0x3F) << 4;
+        clutY = (clut >> 6) & 0x1FF;
+        v1x = gpuVertX(g[3]); v1y = gpuVertY(g[3]);
+        uu1 = g[4] & 0xFF;  vv1 = (g[4] >> 8) & 0xFF;
+        const page: u32 = (g[4] >> 16) & 0xFFFF;
+        tpx = (page & 0xF) << 6;
+        tpy = (page & 0x10) << 4;
+        depth = (page >> 7) & 3;
+        v2x = gpuVertX(g[5]); v2y = gpuVertY(g[5]);
+        uu2 = g[6] & 0xFF;  vv2 = (g[6] >> 8) & 0xFF;
+        if (isQuad) {
+            v3x = gpuVertX(g[7]); v3y = gpuVertY(g[7]);
+            uu3 = g[8] & 0xFF;  vv3 = (g[8] >> 8) & 0xFF;
+        }
+    } else {
+        // Monochrome (or fall-through gouraud).
+        var off0: u32 = 1;
+        if (isGour) { off0 = 2; }
+        var stride: u32 = 1;
+        if (isGour) { stride = stride + 1; }
+        v0x = gpuVertX(g[off0]); v0y = gpuVertY(g[off0]);
+        v1x = gpuVertX(g[off0 + stride]); v1y = gpuVertY(g[off0 + stride]);
+        v2x = gpuVertX(g[off0 + 2 * stride]); v2y = gpuVertY(g[off0 + 2 * stride]);
+        if (isQuad) {
+            v3x = gpuVertX(g[off0 + 3 * stride]);
+            v3y = gpuVertY(g[off0 + 3 * stride]);
+        }
+    }
+
+    const baseColor: u32 = g[0] & 0xFFFFFF;
+
+    gpuRasterTri(g, vram, isTex, isRaw,
+        v0x, v0y, uu0, vv0,
+        v1x, v1y, uu1, vv1,
+        v2x, v2y, uu2, vv2,
+        tpx, tpy, clutX, clutY, depth, baseColor);
+    if (isQuad) {
+        gpuRasterTri(g, vram, isTex, isRaw,
+            v1x, v1y, uu1, vv1,
+            v2x, v2y, uu2, vv2,
+            v3x, v3y, uu3, vv3,
+            tpx, tpy, clutX, clutY, depth, baseColor);
+    }
+}
+
+// Rasterize one triangle with optional texture sampling. Pixels inside
+// the triangle's three half-planes (top-left rule applied) get a colour
+// either from the base colour (untextured) or by sampling the texture
+// page at the barycentric-interpolated uv.
+pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
+                    isTex: bool, isRaw: bool,
+                    ax0: u32, ay0: u32, au: u32, av: u32,
+                    bx0: u32, by0: u32, bu: u32, bv: u32,
+                    cx0: u32, cy0: u32, cu: u32, cv: u32,
+                    tpx: u32, tpy: u32, clutX: u32, clutY: u32,
+                    depth: u32, baseColor: u32) {
+    const ox: u32 = g[52];
+    const oy: u32 = g[53];
+    var ax: u32 = ax0 + ox;
+    var ay: u32 = ay0 + oy;
+    var bx: u32 = bx0 + ox;
+    var by: u32 = by0 + oy;
+    var cx: u32 = cx0 + ox;
+    var cy: u32 = cy0 + oy;
+    // UV stays unswapped when we flip winding (per psxe).
+    var bu2: u32 = bu;  var bv2: u32 = bv;
+    var cu2: u32 = cu;  var cv2: u32 = cv;
+
+    const area: i64 = gpuEdge(ax, ay, bx, by, cx, cy);
+    if (area == 0) { return; }
+    if (area < 0) {
+        const tx: u32 = bx;  const ty: u32 = by;
+        bx = cx;  by = cy;   cx = tx;  cy = ty;
+        const tu: u32 = bu2; const tv: u32 = bv2;
+        bu2 = cu2; bv2 = cv2;
+        cu2 = tu;  cv2 = tv;
+    }
+
+    const xmin: u32 = gpuMin3(ax, bx, cx);
+    const ymin: u32 = gpuMin3(ay, by, cy);
+    const xmax: u32 = gpuMax3(ax, bx, cx);
+    const ymax: u32 = gpuMax3(ay, by, cy);
+    if (sext32(xmax - xmin) > 1024 or sext32(ymax - ymin) > 512) { return; }
+
+    const absArea: i64 = gpuAbsI64(gpuEdge(ax, ay, bx, by, cx, cy));
+    const dx1: u32 = g[48];
+    const dy1: u32 = g[49];
+    const dx2: u32 = g[50];
+    const dy2: u32 = g[51];
+
+    var y: u32 = ymin;
+    while (sext32(y) <= sext32(ymax)) {
+        var x: u32 = xmin;
+        while (sext32(x) <= sext32(xmax)) {
+            if (sext32(x) >= sext32(dx1) and sext32(x) <= sext32(dx2) and
+                sext32(y) >= sext32(dy1) and sext32(y) <= sext32(dy2)) {
+                const z0: i64 = gpuEdge(bx, by, cx, cy, x, y);
+                const z1: i64 = gpuEdge(cx, cy, ax, ay, x, y);
+                const z2: i64 = gpuEdge(ax, ay, bx, by, x, y);
+                if (!gpuTopLeftRule(z0, bx, by, cx, cy) and
+                    !gpuTopLeftRule(z1, cx, cy, ax, ay) and
+                    !gpuTopLeftRule(z2, ax, ay, bx, by)) {
+                    var color: u32 = 0;
+                    if (isTex) {
+                        // Barycentric interpolation for uv. Each zN is
+                        // signed; combine with the corresponding uv,
+                        // sum, divide by area. We use the absolute area
+                        // since the edges may carry negative sign.
+                        const tx: i64 = (z0 * (au as i64) + z1 * (bu2 as i64)
+                                       + z2 * (cu2 as i64));
+                        const ty: i64 = (z0 * (av as i64) + z1 * (bv2 as i64)
+                                       + z2 * (cv2 as i64));
+                        const txu: u32 = gpuDivClamp(tx, absArea, 0xFF);
+                        const tyu: u32 = gpuDivClamp(ty, absArea, 0xFF);
+                        const texel: u32 = gpuFetchTexel(vram, txu, tyu,
+                                                         tpx, tpy,
+                                                         clutX, clutY, depth);
+                        if (texel == 0) {
+                            x = x + 1;
+                            continue;
+                        }
+                        if (isRaw) { color = texel; }
+                        else       { color = gpuModulate(texel, baseColor); }
+                    } else {
+                        color = gpuToBgr555(baseColor);
+                    }
+                    vramWritePixel(vram, x & 0x3FF, y & 0x1FF, color);
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+pub fn gpuAbsI64(v: i64) i64 {
+    if (v < 0) { return -v; }
+    return v;
+}
+
+// Divide an i64 dividend by a (positive) i64 divisor, clamping the
+// result to 0..maxOut. Hand-rolled because Jam has no `/` operator;
+// we use shift-and-subtract on the absolute values.
+pub fn gpuDivClamp(num: i64, den: i64, maxOut: u32) u32 {
+    if (den == 0) { return 0; }
+    var n: i64 = num;
+    var neg: bool = false;
+    if (n < 0) { n = -n; neg = true; }
+    var q: u64 = 0;
+    var r: u64 = 0;
+    var i: u32 = 64;
+    while (i > 0) {
+        i = i - 1;
+        r = (r << 1) | (((n as u64) >> i) & 1);
+        if (r >= (den as u64)) {
+            r = r - (den as u64);
+            q = q | (1 << i);
+        }
+    }
+    if (neg) { return 0; }
+    if (q > (maxOut as u64)) { return maxOut; }
+    return q as u32;
 }
 
 pub fn gpuLineCmd(g: *mut[] u32, vram: *mut[] u8) {
@@ -473,8 +805,8 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
         const sizeBits: u32 = (flags >> 3) & 3;
         const isTex: bool = (flags & 0x04) != 0;
         var args: u32 = 1;         // x/y
-        if (sizeBits == 0) { args = args + 1; }    // free-size args
-        if (isTex)         { args = args + 1; }    // tex+clut word
+        if (sizeBits == 0) { args = args + 1; }
+        if (isTex)         { args = args + 1; }
         g[17] = args;
         g[19] = GP_RECV_ARGS;
         return;
@@ -483,10 +815,15 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
     const flags: u32 = (g[0] >> 24) & 0xFF;
     const sizeBits: u32 = (flags >> 3) & 3;
     const isTex: bool = (flags & 0x04) != 0;
+    const isRaw: bool = (flags & 0x01) != 0;
     var bufIdx: u32 = 1;
     const xy: u32 = g[bufIdx];
     bufIdx = bufIdx + 1;
-    if (isTex) { bufIdx = bufIdx + 1; }
+    var uvword: u32 = 0;
+    if (isTex) {
+        uvword = g[bufIdx];
+        bufIdx = bufIdx + 1;
+    }
     var w: u32 = 1;
     var h: u32 = 1;
     if (sizeBits == 1) { w = 1;  h = 1;  }
@@ -497,14 +834,13 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
         w = sz & 0xFFFF;
         h = (sz >> 16) & 0xFFFF;
     }
-    var x: u32 = xy & 0xFFFF;
-    var y: u32 = (xy >> 16) & 0xFFFF;
-    x = (x + g[52]) & 0xFFFF;
-    y = (y + g[53]) & 0xFFFF;
-    const color: u32 = gpuToBgr555(g[0] & 0xFFFFFF);
-    // Untextured rect — fill with the base colour. Textured rects are
-    // stubbed since they need texture page / CLUT decode.
+    var x: u32 = gpuSe11(xy & 0xFFFF);
+    var y: u32 = gpuSe11((xy >> 16) & 0xFFFF);
+    x = x + g[52];
+    y = y + g[53];
+
     if (!isTex) {
+        const color: u32 = gpuToBgr555(g[0] & 0xFFFFFF);
         var iy: u32 = 0;
         while (iy < h) {
             var ix: u32 = 0;
@@ -514,8 +850,80 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
             }
             iy = iy + 1;
         }
+    } else {
+        // Textured rect: sample each pixel from VRAM via the current
+        // texture page + CLUT setup. uvword low 16 bits hold u, v;
+        // high 16 hold the CLUT location.
+        const uu0: u32 = uvword & 0xFF;
+        const v0: u32 = (uvword >> 8) & 0xFF;
+        const clut: u32 = (uvword >> 16) & 0xFFFF;
+        const clutx: u32 = (clut & 0x3F) << 4;
+        const cluty: u32 = (clut >> 6) & 0x1FF;
+        var iy: u32 = 0;
+        while (iy < h) {
+            var ix: u32 = 0;
+            while (ix < w) {
+                const tx: u32 = (uu0 + ix) & 0xFF;
+                const ty: u32 = (v0 + iy) & 0xFF;
+                const texel: u32 = gpuFetchTexel(vram, tx, ty, g[60], g[61],
+                                                  clutx, cluty, g[62]);
+                if (texel != 0) {
+                    var color: u32 = texel;
+                    if (!isRaw) {
+                        color = gpuModulate(texel, g[0] & 0xFFFFFF);
+                    }
+                    vramWritePixel(vram, (x + ix) & 0x3FF, (y + iy) & 0x1FF,
+                                   color);
+                }
+                ix = ix + 1;
+            }
+            iy = iy + 1;
+        }
     }
     g[19] = GP_RECV_CMD;
+}
+
+// Fetch one 16-bit BGR555 texel from VRAM, decoding CLUT-indexed
+// formats. `depth` is the texture page colour mode: 0 = 4bpp, 1 = 8bpp,
+// 2/3 = 15bpp direct. (tpx, tpy) is the texture page top-left in VRAM
+// pixels; (clutx, cluty) is the CLUT row's top-left.
+pub fn gpuFetchTexel(vram: *mut[] u8, tx: u32, ty: u32,
+                     tpx: u32, tpy: u32,
+                     clutx: u32, cluty: u32, depth: u32) u32 {
+    if (depth == 0) {
+        // 4 texels per VRAM pixel.
+        const texel: u32 = vramReadPixel(vram, tpx + (tx >> 2), tpy + ty);
+        const idx: u32 = (texel >> ((tx & 3) * 4)) & 0xF;
+        return vramReadPixel(vram, clutx + idx, cluty);
+    }
+    if (depth == 1) {
+        // 2 texels per VRAM pixel.
+        const texel: u32 = vramReadPixel(vram, tpx + (tx >> 1), tpy + ty);
+        const idx: u32 = (texel >> ((tx & 1) * 8)) & 0xFF;
+        return vramReadPixel(vram, clutx + idx, cluty);
+    }
+    // 15bpp direct.
+    return vramReadPixel(vram, tpx + tx, tpy + ty);
+}
+
+// Modulate a BGR555 texel by a 24-bit BGR colour. PSX texture blending
+// is multiply-then-double: out = clamp(tex * mod / 128). At mod = 0x80
+// (the "neutral" value the BIOS uses for plain texture rendering) the
+// texel passes through unchanged.
+pub fn gpuModulate(texel: u32, mod: u32) u32 {
+    const tr: u32 = (texel & 0x1F) << 3;
+    const tg: u32 = ((texel >> 5) & 0x1F) << 3;
+    const tb: u32 = ((texel >> 10) & 0x1F) << 3;
+    const mr: u32 = mod & 0xFF;
+    const mg: u32 = (mod >> 8) & 0xFF;
+    const mb: u32 = (mod >> 16) & 0xFF;
+    var cr: u32 = (tr * mr) >> 7;
+    var cg: u32 = (tg * mg) >> 7;
+    var cb: u32 = (tb * mb) >> 7;
+    if (cr > 255) { cr = 255; }
+    if (cg > 255) { cg = 255; }
+    if (cb > 255) { cb = 255; }
+    return gpuToBgr555(cr | (cg << 8) | (cb << 16));
 }
 
 // ---------- frame pacing -----------------------------------------------
