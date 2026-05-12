@@ -1,0 +1,356 @@
+// CPU + bus unit tests.
+//
+// `jam.out test tests.jam` discovers every `tfn` and runs it against
+// hand-assembled MIPS programs staged into RAM. Lives in its own file
+// so test builds don't have to link SDL2.
+
+const { assert } = import("test");
+
+const {
+    allocBus, freeBus,
+    busWrite32
+} = import("bus");
+
+const {
+    freshCpuAt,
+    allocRegFile, freeRegFile,
+    gprRead, gprWrite,
+    cop0Read, cop0Write,
+    run,
+    encR, encI, encJ
+} = import("cpu");
+
+// Force device modules into this module's codegen context so bus.jam's
+// allocBus body (which calls gpuAlloc / dmaAlloc / etc.) resolves.
+const { gpuAlloc } = import("gpu");
+const { dmaAlloc } = import("dma");
+const { irqAlloc } = import("irq");
+const { timerAlloc } = import("timer");
+
+const C0_SR:  u32 = 12;
+const SR_BEV: u32 = 0x00400000;
+
+// Re-declare the same shapes as bus.jam / cpu.jam — structural equality
+// lets us pass values across module boundaries.
+const Bus = struct {
+    ram:  *mut[] u8,
+    bios: *mut[] u8,
+    spad: *mut[] u8,
+    io:   *mut[] u8,
+    vram: *mut[] u8,
+    gpu:   *mut[] u32,
+    dma:   *mut[] u32,
+    irq:   *mut[] u32,
+    timer: *mut[] u32,
+    biosLoaded: u8,
+};
+
+const Cpu = struct {
+    pc: u32,
+    nextPc: u32,
+    savedPc: u32,
+    hi: u32,
+    lo: u32,
+    loadD: u32,
+    loadV: u32,
+    branch: u8,
+    delaySlot: u8,
+    branchTaken: u8,
+    halted: u8,
+    cycles: u64,
+};
+
+// Bundles the four moving pieces of a fresh emulator so tests can
+// allocate / free with one call each.
+const Harness = struct {
+    cpu: Cpu,
+    regs: *mut[] u32,
+    cop0: *mut[] u32,
+    bus: Bus,
+};
+
+fn allocHarness() Harness {
+    var regs: *mut[] u32 = allocRegFile(32);
+    var cop0: *mut[] u32 = allocRegFile(16);
+    var bus: Bus = allocBus();
+    var cpu: Cpu = freshCpuAt(0x80000000);
+    var h: Harness = { cpu: cpu, regs: regs, cop0: cop0, bus: bus };
+    return h;
+}
+
+fn freeHarness(h: Harness) {
+    freeRegFile(h.regs);
+    freeRegFile(h.cop0);
+    freeBus(h.bus);
+}
+
+fn placeOp(bus: Bus, cop0: *mut[] u32, addr: u32, opc: u32) {
+    busWrite32(bus, cop0, addr, opc);
+}
+
+fn tOriImm() u32 {
+    var h: Harness = allocHarness();
+    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0D, 0, 8, 0x1234));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 4);
+    const v: u32 = gprRead(h.regs, 8);
+    freeHarness(h);
+    return v;
+}
+
+fn tLuiOri() u32 {
+    var h: Harness = allocHarness();
+    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0F, 0, 9, 0xABCD));
+    placeOp(h.bus, h.cop0, 0x80000004, encI(0x0D, 9, 9, 0xEF01));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 4);
+    const v: u32 = gprRead(h.regs, 9);
+    freeHarness(h);
+    return v;
+}
+
+fn tAdduChain() u32 {
+    var h: Harness = allocHarness();
+    placeOp(h.bus, h.cop0, 0x80000000, encI(0x09, 0, 8, 7));
+    placeOp(h.bus, h.cop0, 0x80000004, encI(0x09, 0, 9, 5));
+    placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 10, 0, 0x21));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    const v: u32 = gprRead(h.regs, 10);
+    freeHarness(h);
+    return v;
+}
+
+fn tSltSigned() u32 {
+    var h: Harness = allocHarness();
+    placeOp(h.bus, h.cop0, 0x80000000, encI(0x09, 0, 8, 0xFFFF));
+    placeOp(h.bus, h.cop0, 0x80000004, encI(0x09, 0, 9, 1));
+    placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 10, 0, 0x2A));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    const v: u32 = gprRead(h.regs, 10);
+    freeHarness(h);
+    return v;
+}
+
+fn tSltuSigned() u32 {
+    var h: Harness = allocHarness();
+    placeOp(h.bus, h.cop0, 0x80000000, encI(0x09, 0, 8, 0xFFFF));
+    placeOp(h.bus, h.cop0, 0x80000004, encI(0x09, 0, 9, 1));
+    placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 10, 0, 0x2B));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    const v: u32 = gprRead(h.regs, 10);
+    freeHarness(h);
+    return v;
+}
+
+fn tShiftSra() u32 {
+    var h: Harness = allocHarness();
+    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0F, 0, 8, 0x8000));
+    placeOp(h.bus, h.cop0, 0x80000004, encR(0x00, 0, 8, 9, 2, 0x03));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 4);
+    const v: u32 = gprRead(h.regs, 9);
+    freeHarness(h);
+    return v;
+}
+
+fn tAndOr() u32 {
+    var h: Harness = allocHarness();
+    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0D, 0, 8, 0xF0F0));
+    placeOp(h.bus, h.cop0, 0x80000004, encI(0x0D, 0, 9, 0x0FF0));
+    placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 10, 0, 0x24));
+    placeOp(h.bus, h.cop0, 0x8000000C, encR(0x00, 8, 9, 11, 0, 0x25));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    const a: u32 = gprRead(h.regs, 10);
+    const o: u32 = gprRead(h.regs, 11);
+    freeHarness(h);
+    return (a << 16) | o;
+}
+
+fn tBranchDelay() u32 {
+    var h: Harness = allocHarness();
+    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0D, 0, 8, 7));
+    placeOp(h.bus, h.cop0, 0x80000004, encI(0x04, 8, 8, 2));
+    placeOp(h.bus, h.cop0, 0x80000008, encI(0x0D, 0, 9, 1));
+    placeOp(h.bus, h.cop0, 0x8000000C, encI(0x0D, 0, 10, 0xFFFF));
+    placeOp(h.bus, h.cop0, 0x80000010, encI(0x0D, 0, 11, 0x5555));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 6);
+    const t1: u32 = gprRead(h.regs, 9);
+    const t2: u32 = gprRead(h.regs, 10);
+    const t3: u32 = gprRead(h.regs, 11);
+    freeHarness(h);
+    return (t1 << 24) | (t2 << 16) | t3;
+}
+
+fn tJumpDelay() u32 {
+    var h: Harness = allocHarness();
+    const tgt: u32 = (0x80000020 >> 2) & 0x03FFFFFF;
+    placeOp(h.bus, h.cop0, 0x80000000, encJ(0x02, tgt));
+    placeOp(h.bus, h.cop0, 0x80000004, encI(0x0D, 0, 8, 1));
+    placeOp(h.bus, h.cop0, 0x80000008, encI(0x0D, 0, 9, 0xFFFF));
+    placeOp(h.bus, h.cop0, 0x80000020, encI(0x0D, 0, 9, 0xAA));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 6);
+    const t0: u32 = gprRead(h.regs, 8);
+    const t1: u32 = gprRead(h.regs, 9);
+    freeHarness(h);
+    return (t0 << 16) | t1;
+}
+
+fn tJalJr() u32 {
+    var h: Harness = allocHarness();
+    const tgt: u32 = (0x80000020 >> 2) & 0x03FFFFFF;
+    placeOp(h.bus, h.cop0, 0x80000000, encJ(0x03, tgt));
+    placeOp(h.bus, h.cop0, 0x80000004, encI(0x09, 0, 0, 0));
+    placeOp(h.bus, h.cop0, 0x80000008, encI(0x0D, 0, 11, 0x33));
+    placeOp(h.bus, h.cop0, 0x80000020, encI(0x0D, 0, 8, 0x42));
+    placeOp(h.bus, h.cop0, 0x80000024, encR(0x00, 31, 0, 0, 0, 0x08));
+    placeOp(h.bus, h.cop0, 0x80000028, encI(0x09, 0, 0, 0));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 12);
+    const t0: u32 = gprRead(h.regs, 8);
+    const t3: u32 = gprRead(h.regs, 11);
+    freeHarness(h);
+    return (t0 << 16) | t3;
+}
+
+fn tLwSw() u32 {
+    var h: Harness = allocHarness();
+    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0F, 0, 8, 0xDEAD));
+    placeOp(h.bus, h.cop0, 0x80000004, encI(0x0D, 8, 8, 0xBEEF));
+    placeOp(h.bus, h.cop0, 0x80000008, encI(0x0F, 0, 9, 0x8000));
+    placeOp(h.bus, h.cop0, 0x8000000C, encI(0x0D, 9, 9, 0x0100));
+    placeOp(h.bus, h.cop0, 0x80000010, encI(0x2B, 9, 8, 0));
+    placeOp(h.bus, h.cop0, 0x80000014, encI(0x23, 9, 10, 0));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    const v: u32 = gprRead(h.regs, 10);
+    freeHarness(h);
+    return v;
+}
+
+fn tLbSignExt() u32 {
+    var h: Harness = allocHarness();
+    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0D, 0, 8, 0x80));
+    placeOp(h.bus, h.cop0, 0x80000004, encI(0x0F, 0, 9, 0x8000));
+    placeOp(h.bus, h.cop0, 0x80000008, encI(0x0D, 9, 9, 0x0100));
+    placeOp(h.bus, h.cop0, 0x8000000C, encI(0x28, 9, 8, 0));
+    placeOp(h.bus, h.cop0, 0x80000010, encI(0x20, 9, 10, 0));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    const v: u32 = gprRead(h.regs, 10);
+    freeHarness(h);
+    return v;
+}
+
+fn tMultSigned() u64 {
+    var h: Harness = allocHarness();
+    placeOp(h.bus, h.cop0, 0x80000000, encI(0x09, 0, 8, 0xFFFF));
+    placeOp(h.bus, h.cop0, 0x80000004, encI(0x09, 0, 9, 2));
+    placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 0, 0, 0x18));
+    placeOp(h.bus, h.cop0, 0x8000000C, encR(0x00, 0, 0, 10, 0, 0x10));
+    placeOp(h.bus, h.cop0, 0x80000010, encR(0x00, 0, 0, 11, 0, 0x12));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    const hi: u64 = gprRead(h.regs, 10) as u64;
+    const lo: u64 = gprRead(h.regs, 11) as u64;
+    freeHarness(h);
+    return (hi << 32) | lo;
+}
+
+fn tDivu() u32 {
+    var h: Harness = allocHarness();
+    placeOp(h.bus, h.cop0, 0x80000000, encI(0x09, 0, 8, 100));
+    placeOp(h.bus, h.cop0, 0x80000004, encI(0x09, 0, 9, 7));
+    placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 0, 0, 0x1B));
+    placeOp(h.bus, h.cop0, 0x8000000C, encR(0x00, 0, 0, 10, 0, 0x12));
+    placeOp(h.bus, h.cop0, 0x80000010, encR(0x00, 0, 0, 11, 0, 0x10));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    const q: u32 = gprRead(h.regs, 10);
+    const r: u32 = gprRead(h.regs, 11);
+    freeHarness(h);
+    return (q << 16) | r;
+}
+
+fn tSumLoop() u32 {
+    var h: Harness = allocHarness();
+    placeOp(h.bus, h.cop0, 0x80000000, encI(0x09, 0, 8, 0));
+    placeOp(h.bus, h.cop0, 0x80000004, encI(0x09, 0, 9, 5));
+    placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 8, 0, 0x21));
+    placeOp(h.bus, h.cop0, 0x8000000C, encI(0x09, 9, 9, 0xFFFF));
+    placeOp(h.bus, h.cop0, 0x80000010, encI(0x05, 9, 0, 0xFFFD));
+    placeOp(h.bus, h.cop0, 0x80000014, encI(0x09, 0, 0, 0));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 64);
+    const v: u32 = gprRead(h.regs, 8);
+    freeHarness(h);
+    return v;
+}
+
+fn tCop0Roundtrip() u32 {
+    var h: Harness = allocHarness();
+    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0F, 0, 8, 0xDEAD));
+    placeOp(h.bus, h.cop0, 0x80000004, encR(0x10, 4, 8, 12, 0, 0));
+    placeOp(h.bus, h.cop0, 0x80000008, encR(0x10, 0, 9, 12, 0, 0));
+    placeOp(h.bus, h.cop0, 0x8000000C, encI(0x09, 0, 0, 0));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    const v: u32 = gprRead(h.regs, 9);
+    freeHarness(h);
+    return v;
+}
+
+fn tSyscallVector() u32 {
+    var h: Harness = allocHarness();
+    cop0Write(h.cop0, C0_SR, SR_BEV);
+    placeOp(h.bus, h.cop0, 0x80000000, encR(0x00, 0, 0, 0, 0, 0x0C));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 1);
+    const pc: u32 = h.cpu.pc;
+    freeHarness(h);
+    return pc;
+}
+
+fn tLoadDelay() u32 {
+    var h: Harness = allocHarness();
+    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0F, 0, 29, 0x8000));
+    placeOp(h.bus, h.cop0, 0x80000004, encI(0x0D, 29, 29, 0x0100));
+    placeOp(h.bus, h.cop0, 0x80000008, encI(0x0D, 0, 9, 42));
+    placeOp(h.bus, h.cop0, 0x8000000C, encI(0x2B, 29, 9, 0));
+    placeOp(h.bus, h.cop0, 0x80000010, encI(0x23, 29, 8, 0));
+    placeOp(h.bus, h.cop0, 0x80000014, encI(0x0D, 8, 10, 0));
+    placeOp(h.bus, h.cop0, 0x80000018, encI(0x0D, 8, 11, 0));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 16);
+    const t2: u32 = gprRead(h.regs, 10);
+    const t3: u32 = gprRead(h.regs, 11);
+    freeHarness(h);
+    return (t2 << 16) | t3;
+}
+
+fn tLwlLwr() u32 {
+    var h: Harness = allocHarness();
+    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0F, 0, 8, 0x1122));
+    placeOp(h.bus, h.cop0, 0x80000004, encI(0x0D, 8, 8, 0x3344));
+    placeOp(h.bus, h.cop0, 0x80000008, encI(0x0F, 0, 9, 0xAABB));
+    placeOp(h.bus, h.cop0, 0x8000000C, encI(0x0D, 9, 9, 0xCCDD));
+    placeOp(h.bus, h.cop0, 0x80000010, encI(0x0F, 0, 29, 0x8000));
+    placeOp(h.bus, h.cop0, 0x80000014, encI(0x0D, 29, 29, 0x0100));
+    placeOp(h.bus, h.cop0, 0x80000018, encI(0x2B, 29, 8, 0));
+    placeOp(h.bus, h.cop0, 0x8000001C, encI(0x2B, 29, 9, 4));
+    placeOp(h.bus, h.cop0, 0x80000020, encI(0x0D, 0, 10, 0));
+    placeOp(h.bus, h.cop0, 0x80000024, encI(0x22, 29, 10, 6));
+    placeOp(h.bus, h.cop0, 0x80000028, encI(0x26, 29, 10, 3));
+    placeOp(h.bus, h.cop0, 0x8000002C, encI(0x09, 0, 0, 0));
+    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 20);
+    const v: u32 = gprRead(h.regs, 10);
+    freeHarness(h);
+    return v;
+}
+
+tfn psxOriImm()         { assert(tOriImm(), 0x1234); }
+tfn psxLuiOri()         { assert(tLuiOri(), 0xABCDEF01); }
+tfn psxAdduChain()      { assert(tAdduChain(), 12); }
+tfn psxSltSigned()      { assert(tSltSigned(), 1); }
+tfn psxSltuSigned()     { assert(tSltuSigned(), 0); }
+tfn psxShiftSra()       { assert(tShiftSra(), 0xE0000000); }
+tfn psxAndOr()          { assert(tAndOr(), 0x00F0FFF0); }
+tfn psxBranchDelay()    { assert(tBranchDelay(), 0x01005555); }
+tfn psxJumpDelay()      { assert(tJumpDelay(), 0x000100AA); }
+tfn psxJalJr()          { assert(tJalJr(), 0x00420033); }
+tfn psxLwSw()           { assert(tLwSw(), 0xDEADBEEF); }
+tfn psxLbSignExt()      { assert(tLbSignExt(), 0xFFFFFF80); }
+tfn psxMultSigned()     { assert(tMultSigned(), 0xFFFFFFFFFFFFFFFE); }
+tfn psxDivu()           { assert(tDivu(), 0x000E0002); }
+tfn psxSumLoop()        { assert(tSumLoop(), 15); }
+tfn psxCop0Roundtrip()  { assert(tCop0Roundtrip(), 0xDEAD0000); }
+tfn psxSyscallVector()  { assert(tSyscallVector(), 0xBFC00180); }
+tfn psxLoadDelay()      { assert(tLoadDelay(), 0x0000002A); }
+tfn psxLwlLwr()         { assert(tLwlLwr(), 0xBBCCDD11); }

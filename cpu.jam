@@ -1,0 +1,1110 @@
+// MIPS R3000A core for the PSX.
+//
+// Covers the primary integer ISA: shifts (SLL/SRL/SRA/SLLV/SRLV/SRAV),
+// jumps and branches (J/JAL/JR/JALR/BEQ/BNE/BLEZ/BGTZ/BLTZ/BGEZ/BLTZAL/
+// BGEZAL), ALU R-type (ADD/ADDU/SUB/SUBU/AND/OR/XOR/NOR/SLT/SLTU),
+// ALU I-type (ADDI/ADDIU/ANDI/ORI/XORI/SLTI/SLTIU/LUI), MULT/MULTU/
+// DIV/DIVU, MFHI/MTHI/MFLO/MTLO, loads (LB/LBU/LH/LHU/LW/LWL/LWR),
+// stores (SB/SH/SW/SWL/SWR), COP0 MFC0/MTC0/RFE, SYSCALL/BREAK.
+//
+// Notably stubbed:
+//   - COP2 (GTE 3D math coprocessor) raises coprocessor-unusable on
+//     every access. For boot-and-trace this is correct; a real game
+//     will fault out as soon as it touches the GTE.
+//
+// The 32 GPRs and 16 COP0 registers live in their own `*mut[] u32`
+// heap buffers, threaded as separate arguments so the Cpu struct
+// stays small and cheap to copy. `Cpu` and `Bus` are declared
+// structurally in every module that names them in a function
+// signature — Jam v0.1.0 lacks reliable zero-arg type exports.
+
+const { busRead32, busRead16, busRead8,
+        busWrite32, busWrite16, busWrite8 } = import("bus");
+
+// Even though cpu.jam doesn't call into these directly, the module
+// resolver only registers pub prototypes from modules in the *root*
+// import set. Forcing an import here brings each device module's pub
+// fns into the codegen context so bus.jam's allocBus/dispatch helpers
+// resolve cleanly when cpu.jam is the root module.
+const { gpuAlloc } = import("gpu");
+const { dmaAlloc } = import("dma");
+const { irqAlloc } = import("irq");
+const { timerAlloc } = import("timer");
+
+pub extern fn malloc(size: u64) *mut[] u8;
+pub extern fn free(ptr: *mut[] u8);
+pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+pub extern fn putchar(c: i32) i32;
+
+const Bus = struct {
+    ram:  *mut[] u8,
+    bios: *mut[] u8,
+    spad: *mut[] u8,
+    io:   *mut[] u8,
+    vram: *mut[] u8,
+    gpu:   *mut[] u32,
+    dma:   *mut[] u32,
+    irq:   *mut[] u32,
+    timer: *mut[] u32,
+    biosLoaded: u8,
+};
+
+const Cpu = struct {
+    pc: u32,
+    nextPc: u32,
+    savedPc: u32,
+    hi: u32,
+    lo: u32,
+    // Pending load: the R3000 has a one-slot load-delay queue — a
+    // value read from memory becomes visible in the destination
+    // register only after the *next* instruction commits.
+    loadD: u32,
+    loadV: u32,
+    branch: u8,
+    delaySlot: u8,
+    branchTaken: u8,
+    halted: u8,
+    cycles: u64,
+};
+
+// COP0 register indices.
+const C0_BPC:      u32 = 3;
+const C0_BDA:      u32 = 5;
+const C0_JUMPDEST: u32 = 6;
+const C0_DCIC:     u32 = 7;
+const C0_BADVADDR: u32 = 8;
+const C0_BDAM:     u32 = 9;
+const C0_BPCM:     u32 = 11;
+const C0_SR:       u32 = 12;
+const C0_CAUSE:    u32 = 13;
+const C0_EPC:      u32 = 14;
+const C0_PRID:     u32 = 15;
+
+const SR_IEC: u32 = 0x00000001;
+const SR_ISC: u32 = 0x00010000;
+const SR_BEV: u32 = 0x00400000;
+
+// Cause codes, already pre-shifted into bits 6..2 of CAUSE.
+const CAUSE_INT:     u32 = 0x00;
+const CAUSE_ADEL:    u32 = 0x10;
+const CAUSE_ADES:    u32 = 0x14;
+const CAUSE_SYSCALL: u32 = 0x20;
+const CAUSE_BP:      u32 = 0x24;
+const CAUSE_RI:      u32 = 0x28;
+const CAUSE_CPU:     u32 = 0x2C;
+const CAUSE_OV:      u32 = 0x30;
+
+// ---------- register file ----------------------------------------------
+//
+// 32 GPRs + 16 COP0 registers — both live in heap-allocated `*mut[] u32`
+// buffers. The buffers are cast from malloc's `*mut[] u8` return; the
+// codegen now honours pointer-type-aware loads and stores so a 4-byte
+// read is a single `LDR` rather than the hand-rolled little-endian decode
+// the original implementation needed.
+
+pub fn allocRegFile(n: u32) *mut[] u32 {
+    const bytes: u64 = (n as u64) * @sizeOf(u32);
+    var raw: *mut[] u8 = malloc(bytes);
+    memset(raw, 0, bytes);
+    return raw as *mut[] u32;
+}
+
+pub fn freeRegFile(p: *mut[] u32) {
+    free(p as *mut[] u8);
+}
+
+pub fn gprRead(regs: *mut[] u32, idx: u32) u32 { return regs[idx]; }
+pub fn gprWrite(regs: *mut[] u32, idx: u32, val: u32) {
+    if (idx == 0) { return; }       // $0 is hardwired to zero
+    regs[idx] = val;
+}
+pub fn cop0Read(cop0: *mut[] u32, idx: u32) u32 { return cop0[idx]; }
+pub fn cop0Write(cop0: *mut[] u32, idx: u32, val: u32) { cop0[idx] = val; }
+
+pub fn freshCpu() Cpu {
+    var c: Cpu = {
+        pc: 0xBFC00000, nextPc: 0xBFC00004,
+        savedPc: 0, hi: 0, lo: 0,
+        loadD: 0, loadV: 0,
+        branch: 0, delaySlot: 0, branchTaken: 0, halted: 0,
+        cycles: 0,
+    };
+    return c;
+}
+
+// Build a Cpu with PC pointing into KSEG0 RAM (0x80000000) — used by the
+// unit tests so we don't fault out reading from an empty BIOS region.
+pub fn freshCpuAt(pc: u32) Cpu {
+    var c: Cpu = freshCpu();
+    c.pc = pc;
+    c.nextPc = pc + 4;
+    return c;
+}
+
+// ---------- sign-extension and signed compare helpers ------------------
+
+pub fn signExt16(v: u32) u32 {
+    if ((v & 0x8000) != 0) { return v | 0xFFFF0000; }
+    return v & 0x0000FFFF;
+}
+
+pub fn signExt8(v: u32) u32 {
+    if ((v & 0x80) != 0) { return v | 0xFFFFFF00; }
+    return v & 0x000000FF;
+}
+
+pub fn lessThanSigned(a: u32, b: u32) bool {
+    const sa: u32 = a & 0x80000000;
+    const sb: u32 = b & 0x80000000;
+    if (sa != sb) { return sa != 0; }
+    return a < b;
+}
+
+pub fn signedLtZero(a: u32) bool { return (a & 0x80000000) != 0; }
+pub fn signedGtZero(a: u32) bool { return a != 0 and (a & 0x80000000) == 0; }
+pub fn signedLeZero(a: u32) bool { return a == 0 or  (a & 0x80000000) != 0; }
+pub fn signedGeZero(a: u32) bool { return (a & 0x80000000) == 0; }
+
+// ---------- integer division -------------------------------------------
+//
+// Jam still has no `/` operator. Shift-and-subtract, 32 bits per pass.
+
+pub fn divU32(a: u32, b: u32) u32 {
+    if (b == 0) { return 0xFFFFFFFF; }
+    var q: u32 = 0;
+    var r: u32 = 0;
+    var i: u32 = 32;
+    while (i > 0) {
+        i = i - 1;
+        r = (r << 1) | ((a >> i) & 1);
+        if (r >= b) { r = r - b; q = q | (1 << i); }
+    }
+    return q;
+}
+
+pub fn modU32(a: u32, b: u32) u32 {
+    if (b == 0) { return a; }
+    const q: u32 = divU32(a, b);
+    return a - (q * b);
+}
+
+pub fn absI32(a: u32) u32 {
+    if ((a & 0x80000000) == 0) { return a; }
+    return (~a) + 1;
+}
+
+pub fn divI32(a: u32, b: u32) u32 {
+    if (b == 0) {
+        if ((a & 0x80000000) != 0) { return 1; }
+        return 0xFFFFFFFF;
+    }
+    const neg: bool = ((a ^ b) & 0x80000000) != 0;
+    const au: u32 = absI32(a);
+    const bu: u32 = absI32(b);
+    var q: u32 = divU32(au, bu);
+    if (neg) { q = (~q) + 1; }
+    return q;
+}
+
+pub fn modI32(a: u32, b: u32) u32 {
+    if (b == 0) { return a; }
+    const q: u32 = divI32(a, b);
+    return a - (q * b);
+}
+
+// ---------- exception machinery ----------------------------------------
+
+pub fn raiseException(c: Cpu, cop0: *mut[] u32, cause: u32) Cpu {
+    var nc: Cpu = c;
+    var sr: u32 = cop0Read(cop0, C0_SR);
+    var causeReg: u32 = cop0Read(cop0, C0_CAUSE);
+
+    causeReg = (causeReg & 0xFFFFFF80) | (cause & 0x7C);
+
+    var epc: u32 = nc.savedPc;
+    if (nc.delaySlot != 0) {
+        epc = epc - 4;
+        causeReg = causeReg | 0x80000000;
+    }
+    cop0Write(cop0, C0_EPC, epc);
+    cop0Write(cop0, C0_CAUSE, causeReg);
+
+    const mode: u32 = sr & 0x3F;
+    sr = (sr & 0xFFFFFFC0) | ((mode << 2) & 0x3F);
+    cop0Write(cop0, C0_SR, sr);
+
+    if ((sr & SR_BEV) != 0) { nc.pc = 0xBFC00180; }
+    else                    { nc.pc = 0x80000080; }
+    nc.nextPc = nc.pc + 4;
+    return nc;
+}
+
+pub fn cop0Rfe(cop0: *mut[] u32) {
+    var sr: u32 = cop0Read(cop0, C0_SR);
+    const mode: u32 = sr & 0x3F;
+    sr = (sr & 0xFFFFFFC0) | (mode >> 2);
+    cop0Write(cop0, C0_SR, sr);
+}
+
+// ---------- instruction-field accessors --------------------------------
+
+pub fn opPrim(opc: u32) u32 { return (opc >> 26) & 0x3F; }
+pub fn opRs  (opc: u32) u32 { return (opc >> 21) & 0x1F; }
+pub fn opRt  (opc: u32) u32 { return (opc >> 16) & 0x1F; }
+pub fn opRd  (opc: u32) u32 { return (opc >> 11) & 0x1F; }
+pub fn opSa  (opc: u32) u32 { return (opc >> 6)  & 0x1F; }
+pub fn opFn  (opc: u32) u32 { return opc & 0x3F; }
+pub fn opImm (opc: u32) u32 { return opc & 0xFFFF; }
+pub fn opImmS(opc: u32) u32 { return signExt16(opc & 0xFFFF); }
+pub fn opTgt (opc: u32) u32 { return opc & 0x03FFFFFF; }
+
+pub fn doBranch(c: Cpu, offsetShifted: u32) Cpu {
+    var nc: Cpu = c;
+    nc.nextPc = (nc.nextPc + offsetShifted) - 4;
+    nc.branch = 1;
+    nc.branchTaken = 1;
+    return nc;
+}
+
+// Commit any pending delayed load. Called by every instruction that
+// doesn't itself issue a new delayed load.
+pub fn commitLoad(c: Cpu, regs: *mut[] u32) Cpu {
+    var nc: Cpu = c;
+    if (nc.loadD != 0) {
+        gprWrite(regs, nc.loadD, nc.loadV);
+    }
+    nc.loadD = 0;
+    nc.loadV = 0;
+    return nc;
+}
+
+// ---------- instruction implementations --------------------------------
+
+pub fn iLui(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRt(opc), opImm(opc) << 16);
+    return nc;
+}
+
+pub fn iOri(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRt(opc), s | opImm(opc));
+    return nc;
+}
+
+pub fn iAndi(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRt(opc), s & opImm(opc));
+    return nc;
+}
+
+pub fn iXori(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRt(opc), s ^ opImm(opc));
+    return nc;
+}
+
+pub fn iAddiu(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRt(opc), s + opImmS(opc));
+    return nc;
+}
+
+pub fn iAddi(c: Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const imm: u32 = opImmS(opc);
+    var nc: Cpu = commitLoad(c, regs);
+    const r: u32 = s + imm;
+    const ovf: u32 = (s ^ r) & (imm ^ r);
+    if ((ovf & 0x80000000) != 0) {
+        return raiseException(nc, cop0, CAUSE_OV);
+    }
+    gprWrite(regs, opRt(opc), r);
+    return nc;
+}
+
+pub fn iSlti(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    var v: u32 = 0;
+    if (lessThanSigned(s, opImmS(opc))) { v = 1; }
+    gprWrite(regs, opRt(opc), v);
+    return nc;
+}
+
+pub fn iSltiu(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    var v: u32 = 0;
+    if (s < opImmS(opc)) { v = 1; }
+    gprWrite(regs, opRt(opc), v);
+    return nc;
+}
+
+// --- branches ---
+
+pub fn iJ(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    var nc: Cpu = commitLoad(c, regs);
+    nc.nextPc = (nc.nextPc & 0xF0000000) | (opTgt(opc) << 2);
+    nc.branch = 1;
+    nc.branchTaken = 1;
+    return nc;
+}
+
+pub fn iJal(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const ret: u32 = c.nextPc;
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, 31, ret);
+    nc.nextPc = (nc.nextPc & 0xF0000000) | (opTgt(opc) << 2);
+    nc.branch = 1;
+    nc.branchTaken = 1;
+    return nc;
+}
+
+pub fn iBeq(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    nc.branch = 1;
+    if (s == t) { return doBranch(nc, opImmS(opc) << 2); }
+    return nc;
+}
+
+pub fn iBne(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    nc.branch = 1;
+    if (s != t) { return doBranch(nc, opImmS(opc) << 2); }
+    return nc;
+}
+
+pub fn iBlez(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    nc.branch = 1;
+    if (signedLeZero(s)) { return doBranch(nc, opImmS(opc) << 2); }
+    return nc;
+}
+
+pub fn iBgtz(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    nc.branch = 1;
+    if (signedGtZero(s)) { return doBranch(nc, opImmS(opc) << 2); }
+    return nc;
+}
+
+// REGIMM family — split on rt(opc):
+//   0x00 BLTZ    0x01 BGEZ    0x10 BLTZAL    0x11 BGEZAL
+pub fn iRegimm(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const variant: u32 = opRt(opc);
+    var nc: Cpu = commitLoad(c, regs);
+    nc.branch = 1;
+
+    if (variant == 0x10 or variant == 0x11) {
+        gprWrite(regs, 31, nc.nextPc);
+    }
+
+    var take: bool = false;
+    if (variant == 0x00 or variant == 0x10) {
+        take = signedLtZero(s);
+    } else {
+        take = signedGeZero(s);
+    }
+    if (take) { return doBranch(nc, opImmS(opc) << 2); }
+    return nc;
+}
+
+// --- loads ---
+
+pub fn iLb(c: Cpu, opc: u32, bus: Bus, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const addr: u32 = s + opImmS(opc);
+    var nc: Cpu = c;
+    if (nc.loadD != opRt(opc)) { nc = commitLoad(nc, regs); }
+    nc.loadD = opRt(opc);
+    nc.loadV = signExt8(busRead8(bus, addr));
+    return nc;
+}
+
+pub fn iLbu(c: Cpu, opc: u32, bus: Bus, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const addr: u32 = s + opImmS(opc);
+    var nc: Cpu = c;
+    if (nc.loadD != opRt(opc)) { nc = commitLoad(nc, regs); }
+    nc.loadD = opRt(opc);
+    nc.loadV = busRead8(bus, addr) & 0xFF;
+    return nc;
+}
+
+pub fn iLh(c: Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const addr: u32 = s + opImmS(opc);
+    var nc: Cpu = c;
+    if (nc.loadD != opRt(opc)) { nc = commitLoad(nc, regs); }
+    if ((addr & 1) != 0) {
+        cop0Write(cop0, C0_BADVADDR, addr);
+        return raiseException(nc, cop0, CAUSE_ADEL);
+    }
+    nc.loadD = opRt(opc);
+    nc.loadV = signExt16(busRead16(bus, addr));
+    return nc;
+}
+
+pub fn iLhu(c: Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const addr: u32 = s + opImmS(opc);
+    var nc: Cpu = c;
+    if (nc.loadD != opRt(opc)) { nc = commitLoad(nc, regs); }
+    if ((addr & 1) != 0) {
+        cop0Write(cop0, C0_BADVADDR, addr);
+        return raiseException(nc, cop0, CAUSE_ADEL);
+    }
+    nc.loadD = opRt(opc);
+    nc.loadV = busRead16(bus, addr) & 0xFFFF;
+    return nc;
+}
+
+pub fn iLw(c: Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const addr: u32 = s + opImmS(opc);
+    var nc: Cpu = c;
+    if (nc.loadD != opRt(opc)) { nc = commitLoad(nc, regs); }
+    if ((addr & 3) != 0) {
+        cop0Write(cop0, C0_BADVADDR, addr);
+        return raiseException(nc, cop0, CAUSE_ADEL);
+    }
+    nc.loadD = opRt(opc);
+    nc.loadV = busRead32(bus, addr);
+    return nc;
+}
+
+pub fn iLwl(c: Cpu, opc: u32, bus: Bus, regs: *mut[] u32) Cpu {
+    const rt: u32 = opRt(opc);
+    const s: u32 = gprRead(regs, opRs(opc));
+    var t: u32 = gprRead(regs, rt);
+    const addr: u32 = s + opImmS(opc);
+    const aligned: u32 = busRead32(bus, addr & 0xFFFFFFFC);
+    var nc: Cpu = c;
+    if (nc.loadD == rt) { t = nc.loadV; }
+    else { nc = commitLoad(nc, regs); }
+    const shift: u32 = (addr & 3) * 8;
+    const mask: u32 = 0x00FFFFFF >> shift;
+    const value: u32 = (t & mask) | (aligned << (24 - shift));
+    nc.loadD = rt;
+    nc.loadV = value;
+    return nc;
+}
+
+pub fn iLwr(c: Cpu, opc: u32, bus: Bus, regs: *mut[] u32) Cpu {
+    const rt: u32 = opRt(opc);
+    const s: u32 = gprRead(regs, opRs(opc));
+    var t: u32 = gprRead(regs, rt);
+    const addr: u32 = s + opImmS(opc);
+    const aligned: u32 = busRead32(bus, addr & 0xFFFFFFFC);
+    var nc: Cpu = c;
+    if (nc.loadD == rt) { t = nc.loadV; }
+    else { nc = commitLoad(nc, regs); }
+    const shift: u32 = (addr & 3) * 8;
+    const mask: u32 = 0xFFFFFF00 << (24 - shift);
+    const value: u32 = (t & mask) | (aligned >> shift);
+    nc.loadD = rt;
+    nc.loadV = value;
+    return nc;
+}
+
+// --- stores ---
+
+pub fn iSb(c: Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    if ((cop0Read(cop0, C0_SR) & SR_ISC) != 0) { return nc; }
+    busWrite8(bus, cop0, s + opImmS(opc), t & 0xFF);
+    return nc;
+}
+
+pub fn iSh(c: Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    const addr: u32 = s + opImmS(opc);
+    var nc: Cpu = commitLoad(c, regs);
+    if ((cop0Read(cop0, C0_SR) & SR_ISC) != 0) { return nc; }
+    if ((addr & 1) != 0) {
+        cop0Write(cop0, C0_BADVADDR, addr);
+        return raiseException(nc, cop0, CAUSE_ADES);
+    }
+    busWrite16(bus, cop0, addr, t & 0xFFFF);
+    return nc;
+}
+
+pub fn iSw(c: Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    const addr: u32 = s + opImmS(opc);
+    var nc: Cpu = commitLoad(c, regs);
+    if ((cop0Read(cop0, C0_SR) & SR_ISC) != 0) { return nc; }
+    if ((addr & 3) != 0) {
+        cop0Write(cop0, C0_BADVADDR, addr);
+        return raiseException(nc, cop0, CAUSE_ADES);
+    }
+    busWrite32(bus, cop0, addr, t);
+    return nc;
+}
+
+pub fn iSwl(c: Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    const addr: u32 = s + opImmS(opc);
+    const aligned: u32 = addr & 0xFFFFFFFC;
+    const v0: u32 = busRead32(bus, aligned);
+    var v: u32 = v0;
+    const sel: u32 = addr & 3;
+    if (sel == 0) { v = (v0 & 0xFFFFFF00) | (t >> 24); }
+    if (sel == 1) { v = (v0 & 0xFFFF0000) | (t >> 16); }
+    if (sel == 2) { v = (v0 & 0xFF000000) | (t >> 8);  }
+    if (sel == 3) { v = t; }
+    busWrite32(bus, cop0, aligned, v);
+    return nc;
+}
+
+pub fn iSwr(c: Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    const addr: u32 = s + opImmS(opc);
+    const aligned: u32 = addr & 0xFFFFFFFC;
+    const v0: u32 = busRead32(bus, aligned);
+    var v: u32 = v0;
+    const sel: u32 = addr & 3;
+    if (sel == 0) { v = t; }
+    if (sel == 1) { v = (v0 & 0x000000FF) | (t << 8);  }
+    if (sel == 2) { v = (v0 & 0x0000FFFF) | (t << 16); }
+    if (sel == 3) { v = (v0 & 0x00FFFFFF) | (t << 24); }
+    busWrite32(bus, cop0, aligned, v);
+    return nc;
+}
+
+// --- SPECIAL family ---
+
+pub fn iSll(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRd(opc), t << opSa(opc));
+    return nc;
+}
+
+pub fn iSrl(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRd(opc), t >> opSa(opc));
+    return nc;
+}
+
+// SRA — arithmetic right shift. Jam's `>>` on u32 is logical; we
+// manually back-fill the vacated bits with the original sign bit.
+pub fn iSra(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const t: u32 = gprRead(regs, opRt(opc));
+    const sa: u32 = opSa(opc);
+    var nc: Cpu = commitLoad(c, regs);
+    var v: u32 = t >> sa;
+    if ((t & 0x80000000) != 0 and sa != 0) {
+        const fill: u32 = (0xFFFFFFFF << (32 - sa)) & 0xFFFFFFFF;
+        v = v | fill;
+    }
+    gprWrite(regs, opRd(opc), v);
+    return nc;
+}
+
+pub fn iSllv(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRd(opc), t << (s & 0x1F));
+    return nc;
+}
+
+pub fn iSrlv(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRd(opc), t >> (s & 0x1F));
+    return nc;
+}
+
+pub fn iSrav(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    const sa: u32 = s & 0x1F;
+    var nc: Cpu = commitLoad(c, regs);
+    var v: u32 = t >> sa;
+    if ((t & 0x80000000) != 0 and sa != 0) {
+        const fill: u32 = (0xFFFFFFFF << (32 - sa)) & 0xFFFFFFFF;
+        v = v | fill;
+    }
+    gprWrite(regs, opRd(opc), v);
+    return nc;
+}
+
+pub fn iJr(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    nc.nextPc = s;
+    nc.branch = 1;
+    nc.branchTaken = 1;
+    return nc;
+}
+
+pub fn iJalr(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const ret: u32 = c.nextPc;
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRd(opc), ret);
+    nc.nextPc = s;
+    nc.branch = 1;
+    nc.branchTaken = 1;
+    return nc;
+}
+
+pub fn iSyscall(c: Cpu, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    var nc: Cpu = commitLoad(c, regs);
+    return raiseException(nc, cop0, CAUSE_SYSCALL);
+}
+
+pub fn iBreak(c: Cpu, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    var nc: Cpu = commitLoad(c, regs);
+    return raiseException(nc, cop0, CAUSE_BP);
+}
+
+pub fn iMfhi(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRd(opc), nc.hi);
+    return nc;
+}
+
+pub fn iMflo(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRd(opc), nc.lo);
+    return nc;
+}
+
+pub fn iMthi(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    nc.hi = s;
+    return nc;
+}
+
+pub fn iMtlo(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    nc.lo = s;
+    return nc;
+}
+
+// MULT — signed 32×32 → 64. Sign-flip the operands to positive, do an
+// unsigned 32×32 → 64 with Jam's native u64, then sign-flip the result.
+pub fn umul64(a: u32, b: u32) u64 {
+    return (a as u64) * (b as u64);
+}
+
+pub fn negU64(v: u64) u64 { return (~v) + 1; }
+
+pub fn iMult(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    const neg: bool = ((s ^ t) & 0x80000000) != 0;
+    const au: u32 = absI32(s);
+    const bu: u32 = absI32(t);
+    var w: u64 = umul64(au, bu);
+    if (neg) { w = negU64(w); }
+    nc.lo = (w & 0xFFFFFFFF) as u32;
+    nc.hi = ((w >> 32) & 0xFFFFFFFF) as u32;
+    return nc;
+}
+
+pub fn iMultu(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    const w: u64 = umul64(s, t);
+    nc.lo = (w & 0xFFFFFFFF) as u32;
+    nc.hi = ((w >> 32) & 0xFFFFFFFF) as u32;
+    return nc;
+}
+
+pub fn iDiv(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    if (t == 0) {
+        nc.hi = s;
+        if (signedLtZero(s)) { nc.lo = 1; } else { nc.lo = 0xFFFFFFFF; }
+        return nc;
+    }
+    if (s == 0x80000000 and t == 0xFFFFFFFF) {
+        nc.hi = 0;
+        nc.lo = 0x80000000;
+        return nc;
+    }
+    nc.lo = divI32(s, t);
+    nc.hi = modI32(s, t);
+    return nc;
+}
+
+pub fn iDivu(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    if (t == 0) { nc.hi = s; nc.lo = 0xFFFFFFFF; return nc; }
+    nc.lo = divU32(s, t);
+    nc.hi = modU32(s, t);
+    return nc;
+}
+
+pub fn iAdd(c: Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    const r: u32 = s + t;
+    const ovf: u32 = (s ^ r) & (t ^ r);
+    if ((ovf & 0x80000000) != 0) {
+        return raiseException(nc, cop0, CAUSE_OV);
+    }
+    gprWrite(regs, opRd(opc), r);
+    return nc;
+}
+
+pub fn iAddu(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRd(opc), s + t);
+    return nc;
+}
+
+pub fn iSub(c: Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    const r: u32 = s - t;
+    const ovf: u32 = (s ^ t) & (s ^ r);
+    if ((ovf & 0x80000000) != 0) {
+        return raiseException(nc, cop0, CAUSE_OV);
+    }
+    gprWrite(regs, opRd(opc), r);
+    return nc;
+}
+
+pub fn iSubu(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRd(opc), s - t);
+    return nc;
+}
+
+pub fn iAnd(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRd(opc), s & t);
+    return nc;
+}
+
+pub fn iOr(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRd(opc), s | t);
+    return nc;
+}
+
+pub fn iXor(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRd(opc), s ^ t);
+    return nc;
+}
+
+pub fn iNor(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    gprWrite(regs, opRd(opc), ~(s | t));
+    return nc;
+}
+
+pub fn iSlt(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    var v: u32 = 0;
+    if (lessThanSigned(s, t)) { v = 1; }
+    gprWrite(regs, opRd(opc), v);
+    return nc;
+}
+
+pub fn iSltu(c: Cpu, opc: u32, regs: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    var v: u32 = 0;
+    if (s < t) { v = 1; }
+    gprWrite(regs, opRd(opc), v);
+    return nc;
+}
+
+// --- COP0 ---
+
+pub fn iMfc0(c: Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const v: u32 = cop0Read(cop0, opRd(opc));
+    var nc: Cpu = c;
+    if (nc.loadD != opRt(opc)) { nc = commitLoad(nc, regs); }
+    nc.loadD = opRt(opc);
+    nc.loadV = v;
+    return nc;
+}
+
+pub fn iMtc0(c: Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const t: u32 = gprRead(regs, opRt(opc));
+    var nc: Cpu = commitLoad(c, regs);
+    cop0Write(cop0, opRd(opc), t);
+    return nc;
+}
+
+pub fn iRfe(c: Cpu, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    var nc: Cpu = commitLoad(c, regs);
+    cop0Rfe(cop0);
+    return nc;
+}
+
+pub fn iCop2Unimpl(c: Cpu, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    var nc: Cpu = commitLoad(c, regs);
+    return raiseException(nc, cop0, CAUSE_CPU);
+}
+
+pub fn illegal(c: Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    var nc: Cpu = commitLoad(c, regs);
+    return raiseException(nc, cop0, CAUSE_RI);
+}
+
+// ---------- decode + dispatch ------------------------------------------
+
+pub fn dispatchSpecial(c: Cpu, opc: u32, bus: Bus,
+                      regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const f: u32 = opFn(opc);
+    if (f == 0x00) { return iSll(c, opc, regs); }
+    if (f == 0x02) { return iSrl(c, opc, regs); }
+    if (f == 0x03) { return iSra(c, opc, regs); }
+    if (f == 0x04) { return iSllv(c, opc, regs); }
+    if (f == 0x06) { return iSrlv(c, opc, regs); }
+    if (f == 0x07) { return iSrav(c, opc, regs); }
+    if (f == 0x08) { return iJr(c, opc, regs); }
+    if (f == 0x09) { return iJalr(c, opc, regs); }
+    if (f == 0x0C) { return iSyscall(c, regs, cop0); }
+    if (f == 0x0D) { return iBreak(c, regs, cop0); }
+    if (f == 0x10) { return iMfhi(c, opc, regs); }
+    if (f == 0x11) { return iMthi(c, opc, regs); }
+    if (f == 0x12) { return iMflo(c, opc, regs); }
+    if (f == 0x13) { return iMtlo(c, opc, regs); }
+    if (f == 0x18) { return iMult(c, opc, regs); }
+    if (f == 0x19) { return iMultu(c, opc, regs); }
+    if (f == 0x1A) { return iDiv(c, opc, regs); }
+    if (f == 0x1B) { return iDivu(c, opc, regs); }
+    if (f == 0x20) { return iAdd(c, opc, regs, cop0); }
+    if (f == 0x21) { return iAddu(c, opc, regs); }
+    if (f == 0x22) { return iSub(c, opc, regs, cop0); }
+    if (f == 0x23) { return iSubu(c, opc, regs); }
+    if (f == 0x24) { return iAnd(c, opc, regs); }
+    if (f == 0x25) { return iOr(c, opc, regs); }
+    if (f == 0x26) { return iXor(c, opc, regs); }
+    if (f == 0x27) { return iNor(c, opc, regs); }
+    if (f == 0x2A) { return iSlt(c, opc, regs); }
+    if (f == 0x2B) { return iSltu(c, opc, regs); }
+    return illegal(c, opc, regs, cop0);
+}
+
+pub fn dispatchCop0(c: Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    if (opRs(opc) == 0x10 and (opc & 0x3F) == 0x10) {
+        return iRfe(c, regs, cop0);
+    }
+    const rs: u32 = opRs(opc);
+    if (rs == 0x00) { return iMfc0(c, opc, regs, cop0); }
+    if (rs == 0x04) { return iMtc0(c, opc, regs, cop0); }
+    return illegal(c, opc, regs, cop0);
+}
+
+pub fn dispatch(c: Cpu, opc: u32, bus: Bus,
+                regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const p: u32 = opPrim(opc);
+    if (p == 0x00) { return dispatchSpecial(c, opc, bus, regs, cop0); }
+    if (p == 0x01) { return iRegimm(c, opc, regs); }
+    if (p == 0x02) { return iJ(c, opc, regs); }
+    if (p == 0x03) { return iJal(c, opc, regs); }
+    if (p == 0x04) { return iBeq(c, opc, regs); }
+    if (p == 0x05) { return iBne(c, opc, regs); }
+    if (p == 0x06) { return iBlez(c, opc, regs); }
+    if (p == 0x07) { return iBgtz(c, opc, regs); }
+    if (p == 0x08) { return iAddi(c, opc, regs, cop0); }
+    if (p == 0x09) { return iAddiu(c, opc, regs); }
+    if (p == 0x0A) { return iSlti(c, opc, regs); }
+    if (p == 0x0B) { return iSltiu(c, opc, regs); }
+    if (p == 0x0C) { return iAndi(c, opc, regs); }
+    if (p == 0x0D) { return iOri(c, opc, regs); }
+    if (p == 0x0E) { return iXori(c, opc, regs); }
+    if (p == 0x0F) { return iLui(c, opc, regs); }
+    if (p == 0x10) { return dispatchCop0(c, opc, regs, cop0); }
+    if (p == 0x12) { return iCop2Unimpl(c, regs, cop0); }
+    if (p == 0x20) { return iLb(c, opc, bus, regs); }
+    if (p == 0x21) { return iLh(c, opc, bus, regs, cop0); }
+    if (p == 0x22) { return iLwl(c, opc, bus, regs); }
+    if (p == 0x23) { return iLw(c, opc, bus, regs, cop0); }
+    if (p == 0x24) { return iLbu(c, opc, bus, regs); }
+    if (p == 0x25) { return iLhu(c, opc, bus, regs, cop0); }
+    if (p == 0x26) { return iLwr(c, opc, bus, regs); }
+    if (p == 0x28) { return iSb(c, opc, bus, regs, cop0); }
+    if (p == 0x29) { return iSh(c, opc, bus, regs, cop0); }
+    if (p == 0x2A) { return iSwl(c, opc, bus, regs, cop0); }
+    if (p == 0x2B) { return iSw(c, opc, bus, regs, cop0); }
+    if (p == 0x2E) { return iSwr(c, opc, bus, regs, cop0); }
+    if (p == 0x30 or p == 0x31 or p == 0x32 or p == 0x33 or
+        p == 0x38 or p == 0x39 or p == 0x3A or p == 0x3B) {
+        return iCop2Unimpl(c, regs, cop0);
+    }
+    return illegal(c, opc, regs, cop0);
+}
+
+// IRQ pending: true when SR.IEC is set and an enabled IRQ bit in the
+// pending mask matches an enabled bit in CAUSE. psxe checks against
+// CAUSE bits 8..10 (SW IRQs at 8/9, the consolidated external IRQ at
+// 10). The IC reevaluates CAUSE bit 10 whenever it sees a state change.
+pub fn cpuIrqPending(cop0: *mut[] u32) bool {
+    const sr: u32 = cop0Read(cop0, C0_SR);
+    if ((sr & SR_IEC) == 0) { return false; }
+    const cause: u32 = cop0Read(cop0, C0_CAUSE);
+    return (sr & cause & 0x00000700) != 0;
+}
+
+// One CPU cycle: latch PC, fetch, advance, dispatch.
+pub fn step(c: Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    var nc: Cpu = c;
+    nc.savedPc = nc.pc;
+    nc.delaySlot = nc.branch;
+    nc.branch = 0;
+    nc.branchTaken = 0;
+
+    if ((nc.savedPc & 3) != 0) {
+        cop0Write(cop0, C0_BADVADDR, nc.savedPc);
+        return raiseException(nc, cop0, CAUSE_ADEL);
+    }
+
+    // Take an external interrupt before issuing the next instruction —
+    // matches psxe's check at the top of psx_cpu_cycle, after fetch and
+    // before dispatch. CAUSE_INT has code 0 (already in CAUSE bits 6..2
+    // when raised), so we just trip the exception vector.
+    if (cpuIrqPending(cop0)) {
+        nc.pc = nc.nextPc;
+        nc.nextPc = nc.nextPc + 4;
+        return raiseException(nc, cop0, CAUSE_INT);
+    }
+
+    const opc: u32 = busRead32(bus, nc.pc);
+    nc.pc = nc.nextPc;
+    nc.nextPc = nc.nextPc + 4;
+    nc.cycles = nc.cycles + 2;
+
+    nc = dispatch(nc, opc, bus, regs, cop0);
+
+    if (nc.loadD == 0) { nc.loadV = 0; }
+    return nc;
+}
+
+pub fn run(c: Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
+           maxSteps: u32) Cpu {
+    var nc: Cpu = c;
+    var i: u32 = 0;
+    while (i < maxSteps and nc.halted == 0) {
+        nc = step(nc, bus, regs, cop0);
+        i = i + 1;
+    }
+    nc = commitLoad(nc, regs);
+    return nc;
+}
+
+// ---------- BIOS A/B-table hooks ---------------------------------------
+
+pub fn biosHook(c: Cpu, bus: Bus, regs: *mut[] u32) Cpu {
+    const pcMasked: u32 = c.pc & 0x3FFFFFFF;
+    if (pcMasked == 0xA0) {
+        const op: u32 = gprRead(regs, 9);
+        if (op == 0x09 or op == 0x3C) { putchar((gprRead(regs, 4) & 0xFF) as i32); }
+        if (op == 0x3E) {
+            var src: u32 = gprRead(regs, 4);
+            var ch: u32 = busRead8(bus, src);
+            while (ch != 0) {
+                putchar((ch & 0xFF) as i32);
+                src = src + 1;
+                ch = busRead8(bus, src);
+            }
+        }
+    }
+    if (pcMasked == 0xB0) {
+        const op: u32 = gprRead(regs, 9);
+        if (op == 0x3B or op == 0x3D) { putchar((gprRead(regs, 4) & 0xFF) as i32); }
+        if (op == 0x3F) {
+            var src: u32 = gprRead(regs, 4);
+            var ch: u32 = busRead8(bus, src);
+            while (ch != 0) {
+                putchar((ch & 0xFF) as i32);
+                src = src + 1;
+                ch = busRead8(bus, src);
+            }
+        }
+    }
+    return c;
+}
+
+pub fn runHooked(c: Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
+                 maxSteps: u32) Cpu {
+    var nc: Cpu = c;
+    var i: u32 = 0;
+    while (i < maxSteps and nc.halted == 0) {
+        nc = biosHook(nc, bus, regs);
+        nc = step(nc, bus, regs, cop0);
+        i = i + 1;
+    }
+    nc = commitLoad(nc, regs);
+    return nc;
+}
+
+// ---------- MIPS instruction encoders (for hand-assembling tests) ------
+
+pub fn encR(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, fn_: u32) u32 {
+    return ((op  & 0x3F) << 26)
+         | ((rs  & 0x1F) << 21)
+         | ((rt  & 0x1F) << 16)
+         | ((rd  & 0x1F) << 11)
+         | ((sa  & 0x1F) << 6)
+         |  (fn_ & 0x3F);
+}
+
+pub fn encI(op: u32, rs: u32, rt: u32, imm: u32) u32 {
+    return ((op & 0x3F) << 26)
+         | ((rs & 0x1F) << 21)
+         | ((rt & 0x1F) << 16)
+         |  (imm & 0xFFFF);
+}
+
+pub fn encJ(op: u32, target: u32) u32 {
+    return ((op & 0x3F) << 26) | (target & 0x03FFFFFF);
+}

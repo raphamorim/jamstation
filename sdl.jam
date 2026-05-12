@@ -1,0 +1,184 @@
+// SDL2 frontend.
+//
+// Wraps the few SDL2 functions we need to open a window, blit a
+// pixel buffer to a hardware-accelerated texture, and pump keyboard /
+// quit events. The PSX framebuffer (VRAM) is 1024 wide × 512 tall, 16
+// bits per pixel (RGB555 + mask bit). We expose it via SDL2's BGR555
+// pixel format so the host GPU does the conversion for us.
+//
+// macOS desktop only — set up via Homebrew's `sdl2` formula. Build
+// with the SDL2 linker flags via `make run`.
+
+extern fn malloc(size: u64) *mut[] u8;
+extern fn free(ptr: *mut[] u8);
+extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+
+// SDL_Init flags. We need video + events (and game-controller would
+// be nice but not required for this build).
+const SDL_INIT_VIDEO:  u32 = 0x00000020;
+const SDL_INIT_EVENTS: u32 = 0x00004000;
+
+// SDL_WindowFlags
+const SDL_WINDOW_SHOWN: u32 = 0x00000004;
+
+// SDL_PIXELFORMAT_BGR555: format SDL_DEFINE_PIXELFORMAT(SDL_PIXELTYPE_PACKED16,
+// SDL_PACKEDORDER_XBGR, SDL_PACKEDLAYOUT_1555, 16, 2) = 0x14110A02. Verified
+// against SDL_pixels.h; we use the same constant psxe does.
+const SDL_PIXELFORMAT_BGR555:  u32 = 0x14110A02;
+const SDL_PIXELFORMAT_ARGB8888: u32 = 0x16362004;
+const SDL_TEXTUREACCESS_STREAMING: i32 = 1;
+
+const SDL_RENDERER_ACCELERATED: u32 = 0x00000002;
+const SDL_RENDERER_PRESENTVSYNC: u32 = 0x00000004;
+
+// SDL_Event type constants we care about.
+const SDL_QUIT:       u32 = 0x100;
+const SDL_KEYDOWN:    u32 = 0x300;
+const SDL_KEYUP:      u32 = 0x301;
+
+// SDL2 surface — pointer-opaque handles, treated as `*mut[] u8` from Jam.
+extern fn SDL_Init(flags: u32) i32;
+extern fn SDL_Quit();
+extern fn SDL_CreateWindow(title: *const[] u8,
+                           x: i32, y: i32, w: i32, h: i32,
+                           flags: u32) *mut[] u8;
+extern fn SDL_DestroyWindow(window: *mut[] u8);
+extern fn SDL_CreateRenderer(window: *mut[] u8, index: i32, flags: u32) *mut[] u8;
+extern fn SDL_DestroyRenderer(renderer: *mut[] u8);
+extern fn SDL_CreateTexture(renderer: *mut[] u8, format: u32, access: i32,
+                            w: i32, h: i32) *mut[] u8;
+extern fn SDL_DestroyTexture(texture: *mut[] u8);
+extern fn SDL_UpdateTexture(texture: *mut[] u8, rect: *const[] u8,
+                            pixels: *const[] u8, pitch: i32) i32;
+extern fn SDL_RenderClear(renderer: *mut[] u8) i32;
+extern fn SDL_RenderCopy(renderer: *mut[] u8, texture: *mut[] u8,
+                         srcrect: *const[] u8, dstrect: *const[] u8) i32;
+extern fn SDL_RenderPresent(renderer: *mut[] u8);
+extern fn SDL_Delay(ms: u32);
+extern fn SDL_PollEvent(event: *mut[] u8) i32;
+extern fn SDL_GetTicks() u32;
+
+// Bundles the SDL2 window / renderer / texture so we can pass them
+// through one parameter.
+const Sdl = struct {
+    window:   *mut[] u8,
+    renderer: *mut[] u8,
+    texture:  *mut[] u8,
+    width:  i32,
+    height: i32,
+};
+
+// SDL_Event is a 56-byte union in v2.x; we don't decode the body, just
+// peek at the type field (offset 0, 4 bytes). Allocate 64 bytes to be
+// safe across SDL releases.
+const SDL_EVENT_SIZE: u32 = 64;
+
+pub fn sdlInit(title: []u8, width: i32, height: i32) Sdl {
+    SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
+    var win: *mut[] u8 = SDL_CreateWindow(title.ptr,
+        0x2FFF0000, 0x2FFF0000,   // SDL_WINDOWPOS_CENTERED on both axes
+        width * 2, height * 2,
+        SDL_WINDOW_SHOWN);
+    var ren: *mut[] u8 = SDL_CreateRenderer(win, -1,
+        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    var tex: *mut[] u8 = SDL_CreateTexture(ren,
+        SDL_PIXELFORMAT_BGR555, SDL_TEXTUREACCESS_STREAMING,
+        width, height);
+    var s: Sdl = {
+        window: win, renderer: ren, texture: tex,
+        width: width, height: height,
+    };
+    return s;
+}
+
+pub fn sdlQuit(s: Sdl) {
+    SDL_DestroyTexture(s.texture);
+    SDL_DestroyRenderer(s.renderer);
+    SDL_DestroyWindow(s.window);
+    SDL_Quit();
+}
+
+// Blit a VRAM-formatted buffer (BGR555 16bpp) to the SDL texture and
+// present it. `pixels` must point at a contiguous WxH 16-bit RGB555
+// stream; `pitch` is the byte stride (= width * 2 for the PSX VRAM
+// natural layout).
+//
+// Jam v0.1.0 can't synthesize a NULL pointer literal, so instead of
+// passing NULL for "rect = full texture", we heap-allocate a SDL_Rect
+// (16 bytes: x, y, w, h as i32) and fill it in with the texture's
+// dimensions.
+pub fn sdlBlit(s: Sdl, pixels: *mut[] u8, pitch: i32) {
+    var rect: *mut[] u8 = malloc(16);
+    // x=0, y=0, w=s.width, h=s.height — little-endian i32 quads.
+    rect[0] = 0;  rect[1] = 0;  rect[2] = 0;  rect[3] = 0;
+    rect[4] = 0;  rect[5] = 0;  rect[6] = 0;  rect[7] = 0;
+    rect[8]  = (s.width        & 0xFF) as u8;
+    rect[9]  = ((s.width >> 8) & 0xFF) as u8;
+    rect[10] = 0;
+    rect[11] = 0;
+    rect[12] = (s.height        & 0xFF) as u8;
+    rect[13] = ((s.height >> 8) & 0xFF) as u8;
+    rect[14] = 0;
+    rect[15] = 0;
+    SDL_UpdateTexture(s.texture, rect, pixels, pitch);
+    SDL_RenderClear(s.renderer);
+    SDL_RenderCopy(s.renderer, s.texture, rect, rect);
+    SDL_RenderPresent(s.renderer);
+    free(rect);
+}
+
+// Pump SDL events. Returns non-zero when the user has requested quit
+// (close button, Cmd-Q, ESC). Allocates the event buffer once per call
+// — fine for our 60 Hz cadence.
+pub fn sdlPump() u32 {
+    var ev: *mut[] u8 = malloc(SDL_EVENT_SIZE as u64);
+    memset(ev, 0, SDL_EVENT_SIZE as u64);
+    var quit: u32 = 0;
+    while (SDL_PollEvent(ev) != 0) {
+        const t: u32 = (ev[0] as u32)
+                     | ((ev[1] as u32) << 8)
+                     | ((ev[2] as u32) << 16)
+                     | ((ev[3] as u32) << 24);
+        if (t == SDL_QUIT) { quit = 1; }
+        // ESC key — keyboard event lays the scancode at offset 12 (a
+        // SDL_Keysym.scancode). Scancode 41 = SDL_SCANCODE_ESCAPE.
+        if (t == SDL_KEYDOWN) {
+            const scan: u32 = (ev[12] as u32)
+                            | ((ev[13] as u32) << 8)
+                            | ((ev[14] as u32) << 16)
+                            | ((ev[15] as u32) << 24);
+            if (scan == 41) { quit = 1; }
+        }
+    }
+    free(ev);
+    return quit;
+}
+
+pub fn sdlDelay(ms: u32) {
+    SDL_Delay(ms);
+}
+
+// Fill a 1024×512 RGB555 buffer with a debug pattern — vertical bands
+// that show colour and let us verify the SDL pipe is alive even before
+// the GPU emits its first pixel.
+pub fn fillTestPattern(buf: *mut[] u8) {
+    var y: u32 = 0;
+    while (y < 512) {
+        var x: u32 = 0;
+        while (x < 1024) {
+            const off: u32 = (y * 1024 + x) * 2;
+            // Pick a colour from x position: 5 bits R, 5 G, 5 B, packed
+            // little-endian as a u16. We sweep R left-to-right and add
+            // a G tint based on y. This produces a smooth gradient
+            // rectangle that's instantly recognisable as "not noise".
+            const r: u32 = (x >> 5) & 0x1F;            // 0..31 across the width
+            const g: u32 = (y >> 4) & 0x1F;            // 0..31 down the height
+            const b: u32 = ((x + y) >> 5) & 0x1F;
+            const px: u32 = (b << 10) | (g << 5) | r;
+            buf[off]     = (px & 0xFF) as u8;
+            buf[off + 1] = ((px >> 8) & 0xFF) as u8;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}

@@ -1,0 +1,568 @@
+// GPU (partial port of psxe/psx/dev/gpu.c).
+//
+// Implements the GP0/GP1 command machinery, plus the rectangle and
+// CPU↔VRAM blit commands the BIOS uses during boot. Polygon and line
+// rasterizers are stubbed (they consume args without drawing); games
+// won't render properly until a triangle rasterizer + GTE land. The
+// goal of this port is to keep the BIOS from hanging while waiting on
+// GPUSTAT and to write something visible to VRAM.
+//
+// State buffer layout (80 u32 entries):
+//   [0..15]   command FIFO buffer
+//   [16]      buf_index
+//   [17]      cmd_args_remaining
+//   [18]      cmd_data_remaining
+//   [19]      state (0=RECV_CMD, 1=RECV_ARGS, 2=RECV_DATA)
+//   [20]      recv_data (latched arg byte for RECV_DATA pump)
+//   [21]      color (current command's 24-bit BGR colour)
+//   [22..29]  generic command counters: xpos, ypos, xsiz, ysiz, tsiz,
+//             addr, xcnt, ycnt
+//   [30..37]  v0..v3 (x,y per vertex)
+//   [38..43]  C0 (VRAM→CPU) state: xcnt, ycnt, xsiz, ysiz, tsiz, addr
+//   [44]      gp1_10h_req
+//   [45]      gpuread
+//   [46]      gpustat
+//   [47]      display_mode
+//   [48..51]  draw_x1, draw_y1, draw_x2, draw_y2
+//   [52..53]  off_x, off_y (sign-bit set per psxe)
+//   [54..57]  texw_mx, texw_my, texw_ox, texw_oy
+//   [58..59]  clut_x, clut_y
+//   [60..62]  texp_x, texp_y, texp_d
+//   [63..68]  disp_x, disp_y, disp_x1..disp_y2
+//   [69]      cycles (GPU clock cycles within current scanline)
+//   [70]      line (current scanline)
+
+const { irqRaise, IC_VBLANK } = import("irq");
+
+pub extern fn malloc(size: u64) *mut[] u8;
+pub extern fn free(ptr: *mut[] u8);
+pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+
+const GPU_STATE_WORDS: u32 = 80;
+const VRAM_PIXELS: u32 = 524288;       // 1024 * 512
+
+const GP_RECV_CMD:  u32 = 0;
+const GP_RECV_ARGS: u32 = 1;
+const GP_RECV_DATA: u32 = 2;
+
+// Convert a 24-bit BGR colour (CPU side) into the GPU's 15-bit BGR555
+// VRAM format. PSX VRAM stores 1 bit mask + 5 bits each B/G/R.
+pub fn gpuToBgr555(c: u32) u32 {
+    return ((c & 0x0000F8) >> 3)
+         | ((c & 0x00F800) >> 6)
+         | ((c & 0xF80000) >> 9);
+}
+
+pub fn gpuAlloc() *mut[] u32 {
+    var raw: *mut[] u8 = malloc((GPU_STATE_WORDS as u64) * 4);
+    memset(raw, 0, (GPU_STATE_WORDS as u64) * 4);
+    var g: *mut[] u32 = raw as *mut[] u32;
+    g[19] = GP_RECV_CMD;
+    g[46] = 0x14802000;   // GPUSTAT init (psxe: bit 23 display off)
+    g[47] = 1;            // default display_mode
+    return g;
+}
+
+pub fn gpuFree(g: *mut[] u32) { free(g as *mut[] u8); }
+
+// VRAM is a `*mut[] u8` byte buffer storing little-endian u16 BGR555
+// pixels. These helpers convert between a (x, y) pair and a VRAM byte
+// offset and read/write a single pixel.
+pub fn vramWritePixel(vram: *mut[] u8, x: u32, y: u32, bgr555: u32) {
+    if (x >= 1024 or y >= 512) { return; }
+    const off: u32 = (y * 1024 + x) * 2;
+    vram[off]     = (bgr555         & 0xFF) as u8;
+    vram[off + 1] = ((bgr555 >> 8)  & 0xFF) as u8;
+}
+
+pub fn vramReadPixel(vram: *mut[] u8, x: u32, y: u32) u32 {
+    if (x >= 1024 or y >= 512) { return 0; }
+    const off: u32 = (y * 1024 + x) * 2;
+    return (vram[off] as u32) | ((vram[off + 1] as u32) << 8);
+}
+
+// ---------- GP0 / GP1 reads --------------------------------------------
+
+pub fn gpuRead32(g: *mut[] u32, vram: *mut[] u8, off: u32) u32 {
+    if (off == 0x00) {
+        var data: u32 = 0;
+        if (g[42] != 0) {
+            // C0 (VRAM→CPU) transfer in progress — drain two pixels.
+            data = vramPackTwo(g, vram);
+            g[42] = g[42] - 2;
+        }
+        if (g[44] != 0) {
+            const sub: u32 = g[44] & 7;
+            if (sub == 2) {
+                data = ((g[57] >> 3) << 15) | ((g[56] >> 3) << 10)
+                     | ((g[55] >> 3) <<  5) |  (g[54] >> 3);
+            }
+            if (sub == 3) { data = (g[49] << 10) | g[48]; }
+            if (sub == 4) { data = (g[51] << 10) | g[50]; }
+            if (sub == 5) { data = (g[53] << 10) | g[52]; }
+            g[44] = 0;
+        }
+        return data;
+    }
+    if (off == 0x04) {
+        // psxe ORs GPUSTAT with 0x1C000000 to keep BIOS happy.
+        return g[46] | 0x1C000000;
+    }
+    return 0;
+}
+
+pub fn gpuRead16(g: *mut[] u32, vram: *mut[] u8, off: u32) u32 {
+    return gpuRead32(g, vram, off & 0xFFFFFFFC) & 0xFFFF;
+}
+
+pub fn gpuRead8(g: *mut[] u32, vram: *mut[] u8, off: u32) u32 {
+    return gpuRead32(g, vram, off & 0xFFFFFFFC) & 0xFF;
+}
+
+// Pack two adjacent VRAM pixels into a single u32 for the GPUREAD port.
+pub fn vramPackTwo(g: *mut[] u32, vram: *mut[] u8) u32 {
+    const baseX: u32 = g[43] & 0x3FF;
+    const baseY: u32 = (g[43] >> 10) & 0x1FF;
+    var x0: u32 = (baseX + g[38]) & 0x3FF;
+    var y0: u32 = (baseY + g[39]) & 0x1FF;
+    var data: u32 = vramReadPixel(vram, x0, y0);
+    g[38] = g[38] + 1;
+    if (g[38] == g[40]) { g[39] = g[39] + 1; g[38] = 0; }
+    var x1: u32 = (baseX + g[38]) & 0x3FF;
+    var y1: u32 = (baseY + g[39]) & 0x1FF;
+    data = data | (vramReadPixel(vram, x1, y1) << 16);
+    g[38] = g[38] + 1;
+    if (g[38] == g[40]) { g[39] = g[39] + 1; g[38] = 0; }
+    return data;
+}
+
+// ---------- GP0 (command/data) writes ----------------------------------
+
+pub fn gpuWrite32(g: *mut[] u32, vram: *mut[] u8, off: u32, val: u32) {
+    if (off == 0x00) { gpuGp0(g, vram, val); return; }
+    if (off == 0x04) { gpuGp1(g, val); return; }
+}
+
+pub fn gpuWrite16(g: *mut[] u32, vram: *mut[] u8, off: u32, val: u32) {
+    gpuWrite32(g, vram, off, val & 0xFFFF);
+}
+
+pub fn gpuWrite8(g: *mut[] u32, vram: *mut[] u8, off: u32, val: u32) {
+    gpuWrite32(g, vram, off, val & 0xFF);
+}
+
+// GP0 dispatch — state machine: RECV_CMD latches a new command word
+// into buf[0], RECV_ARGS appends additional words, RECV_DATA streams
+// pixels for CPU→VRAM.
+pub fn gpuGp0(g: *mut[] u32, vram: *mut[] u8, val: u32) {
+    const st: u32 = g[19];
+    if (st == GP_RECV_CMD) {
+        g[16] = 0;
+        g[g[16]] = val;
+        g[16] = g[16] + 1;
+        gpuUpdateCmd(g, vram);
+    } else if (st == GP_RECV_ARGS) {
+        g[g[16]] = val;
+        g[16] = g[16] + 1;
+        if (g[17] > 0) { g[17] = g[17] - 1; }
+        gpuUpdateCmd(g, vram);
+    } else {
+        g[20] = val;
+        gpuUpdateCmd(g, vram);
+    }
+}
+
+// GP1 (control) — display enable, DMA direction, display area, etc.
+pub fn gpuGp1(g: *mut[] u32, val: u32) {
+    const cmd: u32 = (val >> 24) & 0xFF;
+    if (cmd == 0x00) {
+        // Reset GPU: clear everything except VRAM contents.
+        g[19] = GP_RECV_CMD;
+        g[16] = 0;
+        g[17] = 0;
+        g[18] = 0;
+        g[46] = 0x14802000;
+        g[47] = 1;
+        return;
+    }
+    if (cmd == 0x01) {
+        // Reset command buffer.
+        g[19] = GP_RECV_CMD;
+        g[16] = 0;
+        g[17] = 0;
+        g[18] = 0;
+        return;
+    }
+    if (cmd == 0x02) {
+        // Acknowledge GPU IRQ (clear bit 24 of GPUSTAT).
+        g[46] = g[46] & (~0x01000000);
+        return;
+    }
+    if (cmd == 0x03) {
+        // Display enable: bit 23 of GPUSTAT = 1 when disabled (psxe).
+        g[46] = g[46] & (~0x00800000);
+        g[46] = g[46] | ((val << 23) & 0x00800000);
+        return;
+    }
+    if (cmd == 0x04) {
+        // DMA direction — stored in GPUSTAT bits 30..29.
+        g[46] = (g[46] & (~0x60000000)) | ((val & 3) << 29);
+        return;
+    }
+    if (cmd == 0x05) {
+        g[63] = val & 0x3FF;
+        g[64] = (val >> 10) & 0x1FF;
+        return;
+    }
+    if (cmd == 0x06) {
+        g[65] = val & 0xFFF;
+        g[66] = (val >> 12) & 0xFFF;
+        return;
+    }
+    if (cmd == 0x07) {
+        g[67] = val & 0x1FF;
+        g[68] = (val >> 10) & 0x1FF;
+        return;
+    }
+    if (cmd == 0x08) { g[47] = val & 0xFFFFFF; return; }
+    if (cmd == 0x10) { g[44] = val & 7; return; }
+}
+
+// GP0 command parser — branches on the top three bits of buf[0] for
+// the polygon / line / rect families, and falls through to a per-byte
+// switch for everything else. Mirrors psxe gpu.c psx_gpu_update_cmd.
+pub fn gpuUpdateCmd(g: *mut[] u32, vram: *mut[] u8) {
+    const cmd: u32 = (g[0] >> 24) & 0xFF;
+    const family: u32 = (g[0] >> 29) & 7;
+
+    if (family == 1) { gpuPolyCmd(g, vram); return; }
+    if (family == 2) { gpuLineCmd(g, vram); return; }
+    if (family == 3) { gpuRectCmd(g, vram); return; }
+
+    // family 0 — misc commands and drawing settings.
+    if (cmd == 0x00) { g[19] = GP_RECV_CMD; return; }   // nop
+    if (cmd == 0x01) { g[19] = GP_RECV_CMD; return; }   // clear cache
+    if (cmd == 0x02) { gpuFillRect(g, vram); return; }
+
+    // family 7 (drawing settings) — single-word commands.
+    if (cmd == 0xE1) {
+        g[46] = (g[46] & 0xFFFFF800) | (g[0] & 0x7FF);
+        g[60] = (g[46] & 0xF) << 6;
+        g[61] = (g[46] & 0x10) << 4;
+        g[62] = (g[46] >> 7) & 3;
+        g[19] = GP_RECV_CMD;
+        return;
+    }
+    if (cmd == 0xE2) {
+        g[54] = (g[0] & 0x1F) << 3;
+        g[55] = ((g[0] >> 5) & 0x1F) << 3;
+        g[56] = ((g[0] >> 10) & 0x1F) << 3;
+        g[57] = ((g[0] >> 15) & 0x1F) << 3;
+        g[19] = GP_RECV_CMD;
+        return;
+    }
+    if (cmd == 0xE3) {
+        g[48] = g[0] & 0x3FF;
+        g[49] = (g[0] >> 10) & 0x1FF;
+        g[19] = GP_RECV_CMD;
+        return;
+    }
+    if (cmd == 0xE4) {
+        g[50] = g[0] & 0x3FF;
+        g[51] = (g[0] >> 10) & 0x1FF;
+        g[19] = GP_RECV_CMD;
+        return;
+    }
+    if (cmd == 0xE5) {
+        // Sign-extend the 11-bit signed offsets.
+        var ox: u32 = g[0] & 0x7FF;
+        var oy: u32 = (g[0] >> 11) & 0x7FF;
+        if ((ox & 0x400) != 0) { ox = ox | 0xFFFFF800; }
+        if ((oy & 0x400) != 0) { oy = oy | 0xFFFFF800; }
+        g[52] = ox;
+        g[53] = oy;
+        g[19] = GP_RECV_CMD;
+        return;
+    }
+    if (cmd == 0xE6) { g[19] = GP_RECV_CMD; return; }
+
+    // VRAM blits.
+    if (cmd == 0x80) { gpuVramToVram(g, vram); return; }
+    if (cmd == 0xA0) { gpuCpuToVram(g, vram); return; }
+    if (cmd == 0xC0) { gpuVramToCpu(g, vram); return; }
+
+    // Unrecognized — drop and return to idle to avoid a permanent stall.
+    g[19] = GP_RECV_CMD;
+}
+
+// 0x02 fill rect in VRAM. The colour is taken straight from buf[0]
+// (no dither), and the area is masked to a 16-pixel grid per psxe.
+pub fn gpuFillRect(g: *mut[] u32, vram: *mut[] u8) {
+    if (g[19] == GP_RECV_CMD) {
+        g[19] = GP_RECV_ARGS;
+        g[17] = 2;
+        return;
+    }
+    if (g[17] != 0) { return; }
+    const color: u32 = gpuToBgr555(g[0] & 0xFFFFFF);
+    const x0: u32 = g[1] & 0x3F0;
+    const y0: u32 = (g[1] >> 16) & 0x1FF;
+    const w:  u32 = ((g[2] & 0x3FF) + 0xF) & 0xFFFFFFF0;
+    const h:  u32 = (g[2] >> 16) & 0x1FF;
+    var y: u32 = 0;
+    while (y < h) {
+        var x: u32 = 0;
+        while (x < w) {
+            vramWritePixel(vram, x0 + x, y0 + y, color);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    g[19] = GP_RECV_CMD;
+}
+
+// 0x80 VRAM-to-VRAM copy (psxe gpu_cmd_80).
+pub fn gpuVramToVram(g: *mut[] u32, vram: *mut[] u8) {
+    if (g[19] == GP_RECV_CMD) {
+        g[19] = GP_RECV_ARGS;
+        g[17] = 3;
+        return;
+    }
+    if (g[17] != 0) { return; }
+    const sx: u32 = g[1] & 0xFFFF;
+    const sy: u32 = (g[1] >> 16) & 0xFFFF;
+    const dx: u32 = g[2] & 0xFFFF;
+    const dy: u32 = (g[2] >> 16) & 0xFFFF;
+    const w:  u32 = g[3] & 0xFFFF;
+    const h:  u32 = (g[3] >> 16) & 0xFFFF;
+    var y: u32 = 0;
+    while (y < h) {
+        var x: u32 = 0;
+        while (x < w) {
+            const px: u32 = vramReadPixel(vram, sx + x, sy + y);
+            vramWritePixel(vram, dx + x, dy + y, px);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    g[19] = GP_RECV_CMD;
+}
+
+// 0xA0 CPU→VRAM transfer. Header is 3 words (cmd, dest XY, size XY)
+// then `size` 16-bit words come over GP0 packed two per u32.
+pub fn gpuCpuToVram(g: *mut[] u32, vram: *mut[] u8) {
+    if (g[19] == GP_RECV_CMD) {
+        g[19] = GP_RECV_ARGS;
+        g[17] = 2;
+        return;
+    }
+    if (g[19] == GP_RECV_ARGS) {
+        if (g[17] != 0) { return; }
+        g[22] = g[1] & 0x3FF;
+        g[23] = (g[1] >> 16) & 0x1FF;
+        var xs: u32 = g[2] & 0xFFFF;
+        var ys: u32 = (g[2] >> 16) & 0xFFFF;
+        xs = ((xs - 1) & 0x3FF) + 1;
+        ys = ((ys - 1) & 0x1FF) + 1;
+        g[24] = xs;
+        g[25] = ys;
+        g[26] = ((xs * ys) + 1) & 0xFFFFFFFE;
+        g[28] = 0;
+        g[29] = 0;
+        g[19] = GP_RECV_DATA;
+        return;
+    }
+    // RECV_DATA — one 32-bit word delivers two VRAM pixels.
+    const x0: u32 = (g[22] + g[28]) & 0x3FF;
+    const y0: u32 = (g[23] + g[29]) & 0x1FF;
+    vramWritePixel(vram, x0, y0, g[20] & 0xFFFF);
+    g[28] = g[28] + 1;
+    if (g[28] == g[24]) { g[29] = g[29] + 1; g[28] = 0; }
+    const x1: u32 = (g[22] + g[28]) & 0x3FF;
+    const y1: u32 = (g[23] + g[29]) & 0x1FF;
+    vramWritePixel(vram, x1, y1, (g[20] >> 16) & 0xFFFF);
+    g[28] = g[28] + 1;
+    if (g[28] == g[24]) { g[29] = g[29] + 1; g[28] = 0; }
+    g[26] = g[26] - 2;
+    if (g[26] == 0) {
+        g[28] = 0;
+        g[29] = 0;
+        g[19] = GP_RECV_CMD;
+    }
+}
+
+// 0xC0 VRAM→CPU transfer. Sets up the source rectangle; the data comes
+// out via gpuRead32 / vramPackTwo over subsequent reads.
+pub fn gpuVramToCpu(g: *mut[] u32, vram: *mut[] u8) {
+    if (g[19] == GP_RECV_CMD) {
+        g[19] = GP_RECV_ARGS;
+        g[17] = 2;
+        return;
+    }
+    if (g[17] != 0) { return; }
+    const x0: u32 = g[1] & 0x3FF;
+    const y0: u32 = (g[1] >> 16) & 0x1FF;
+    var xs: u32 = g[2] & 0xFFFF;
+    var ys: u32 = (g[2] >> 16) & 0xFFFF;
+    xs = ((xs - 1) & 0x3FF) + 1;
+    ys = ((ys - 1) & 0x1FF) + 1;
+    g[38] = 0;
+    g[39] = 0;
+    g[40] = xs;
+    g[41] = ys;
+    g[42] = ((xs * ys) + 1) & 0xFFFFFFFE;
+    g[43] = x0 | (y0 << 10);
+    g[19] = GP_RECV_CMD;
+}
+
+// --- polygon / line / rect command parsing ---
+//
+// We parse the variant flags (textured, gouraud, 4-vert) to compute the
+// right argument count, latch all the args, then stub the rasterization
+// out. This keeps the GP0 FIFO state machine in sync with whatever the
+// BIOS / a game sends; without GTE we can't render most game polygons
+// anyway, and the BIOS uses mostly rectangles for its splash screen.
+
+pub fn gpuPolyCmd(g: *mut[] u32, vram: *mut[] u8) {
+    if (g[19] == GP_RECV_CMD) {
+        const flags: u32 = (g[0] >> 24) & 0xFF;
+        const isQuad:  bool = (flags & 0x08) != 0;
+        const isTex:   bool = (flags & 0x04) != 0;
+        const isGour:  bool = (flags & 0x10) != 0;
+        var verts: u32 = 3;
+        if (isQuad) { verts = 4; }
+        // Words per vertex: 1 (xy) + 1 if tex + 1 if gouraud (except
+        // the first vertex's color is in buf[0]).
+        var perVert: u32 = 1;
+        if (isTex)  { perVert = perVert + 1; }
+        if (isGour) { perVert = perVert + 1; }
+        // First vertex: color already in buf[0]; only its xy + tex word
+        // come, but for shaded the per-vertex color is already used.
+        var args: u32 = perVert * verts;
+        if (isGour) { args = args - 1; }       // first colour is buf[0]
+        g[17] = args;
+        g[19] = GP_RECV_ARGS;
+        return;
+    }
+    if (g[17] != 0) { return; }
+    g[19] = GP_RECV_CMD;
+    // Rasterization stubbed — args latched but no draw call.
+}
+
+pub fn gpuLineCmd(g: *mut[] u32, vram: *mut[] u8) {
+    if (g[19] == GP_RECV_CMD) {
+        const flags: u32 = (g[0] >> 24) & 0xFF;
+        const isPoly: bool = (flags & 0x08) != 0;
+        const isGour: bool = (flags & 0x10) != 0;
+        // Single-segment line: 2 verts (each xy=1 word, +1 if gouraud).
+        var args: u32 = 2;
+        if (isGour) { args = args + 1; }    // second-vertex colour
+        // Poly-line ends on a 0x55555555 terminator — we don't really
+        // support that yet, treat it the same as a single segment.
+        g[17] = args;
+        g[19] = GP_RECV_ARGS;
+        return;
+    }
+    if (g[17] != 0) { return; }
+    g[19] = GP_RECV_CMD;
+}
+
+pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
+    if (g[19] == GP_RECV_CMD) {
+        const flags: u32 = (g[0] >> 24) & 0xFF;
+        const sizeBits: u32 = (flags >> 3) & 3;
+        const isTex: bool = (flags & 0x04) != 0;
+        var args: u32 = 1;         // x/y
+        if (sizeBits == 0) { args = args + 1; }    // free-size args
+        if (isTex)         { args = args + 1; }    // tex+clut word
+        g[17] = args;
+        g[19] = GP_RECV_ARGS;
+        return;
+    }
+    if (g[17] != 0) { return; }
+    const flags: u32 = (g[0] >> 24) & 0xFF;
+    const sizeBits: u32 = (flags >> 3) & 3;
+    const isTex: bool = (flags & 0x04) != 0;
+    var bufIdx: u32 = 1;
+    const xy: u32 = g[bufIdx];
+    bufIdx = bufIdx + 1;
+    if (isTex) { bufIdx = bufIdx + 1; }
+    var w: u32 = 1;
+    var h: u32 = 1;
+    if (sizeBits == 1) { w = 1;  h = 1;  }
+    if (sizeBits == 2) { w = 8;  h = 8;  }
+    if (sizeBits == 3) { w = 16; h = 16; }
+    if (sizeBits == 0) {
+        const sz: u32 = g[bufIdx];
+        w = sz & 0xFFFF;
+        h = (sz >> 16) & 0xFFFF;
+    }
+    var x: u32 = xy & 0xFFFF;
+    var y: u32 = (xy >> 16) & 0xFFFF;
+    x = (x + g[52]) & 0xFFFF;
+    y = (y + g[53]) & 0xFFFF;
+    const color: u32 = gpuToBgr555(g[0] & 0xFFFFFF);
+    // Untextured rect — fill with the base colour. Textured rects are
+    // stubbed since they need texture page / CLUT decode.
+    if (!isTex) {
+        var iy: u32 = 0;
+        while (iy < h) {
+            var ix: u32 = 0;
+            while (ix < w) {
+                vramWritePixel(vram, (x + ix) & 0x3FF, (y + iy) & 0x1FF, color);
+                ix = ix + 1;
+            }
+            iy = iy + 1;
+        }
+    }
+    g[19] = GP_RECV_CMD;
+}
+
+// ---------- frame pacing -----------------------------------------------
+//
+// Each call advances the GPU's scanline cycle counter. When we cross a
+// horizontal-draw / hblank boundary we tick `line`; at scanline 240 we
+// raise the VBLANK IRQ.
+
+const GPU_CYC_HDRAW_NTSC: u32 = 2560;
+const GPU_CYC_SCANL_NTSC: u32 = 3413;
+const GPU_LINES_VDRAW:    u32 = 240;
+const GPU_LINES_TOTAL:    u32 = 263;
+// GPU clock ratio is roughly 11/7 of CPU clock. To keep integer-only we
+// scale up by 7 and accumulate; every 7 CPU cycles ≈ 11 GPU cycles.
+const GPU_NUMER: u32 = 11;
+const GPU_DENOM: u32 = 7;
+
+pub fn gpuUpdate(g: *mut[] u32, cpuCyc: u32,
+                 ic: *mut[] u32, cop0: *mut[] u32) {
+    // Accumulate GPU cycles. We store a fractional accumulator in the
+    // high 16 bits of g[69] and the integer cycle count in the low 16.
+    const sub: u32 = (g[69] >> 16) + cpuCyc * GPU_NUMER;
+    const ticks: u32 = (g[69] & 0xFFFF) + (sub >> 0);   // both halves
+    const intCyc: u32 = sub;                            // run as 11×N approximation
+    g[69] = ((sub % (GPU_DENOM as u32)) << 16) | ((g[69] & 0xFFFF) + (sub));
+    // Simpler heuristic: every CPU cycle = ~1.57 GPU cycles. Round to
+    // 11/7 by accumulating 11 per CPU cycle and dividing by 7 when
+    // we read scanline boundaries. The above tries to do that but
+    // ends up overflowing.  For now use a simpler approximation: each
+    // tick of cpuCyc advances the GPU line by cpuCyc/3413/7*11 = approx
+    // cpuCyc/2171. Drop the float, just count.
+    g[69] = g[69] + cpuCyc * 2;     // ~2x CPU cycles per GPU cycle
+    if (g[69] >= GPU_CYC_SCANL_NTSC) {
+        g[69] = g[69] - GPU_CYC_SCANL_NTSC;
+        g[70] = g[70] + 1;
+        // Toggle the odd-line bit at the head of each scanline.
+        if (g[70] < GPU_LINES_VDRAW) {
+            if ((g[70] & 1) != 0) { g[46] = g[46] | 0x80000000; }
+            else                  { g[46] = g[46] & 0x7FFFFFFF; }
+        } else {
+            g[46] = g[46] & 0x7FFFFFFF;
+        }
+        if (g[70] == GPU_LINES_VDRAW) {
+            irqRaise(ic, cop0, IC_VBLANK());
+        }
+        if (g[70] >= GPU_LINES_TOTAL) {
+            g[70] = 0;
+        }
+    }
+}

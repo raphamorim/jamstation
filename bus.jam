@@ -1,0 +1,284 @@
+// PSX memory bus (port of psxe/psx/bus.c).
+//
+// Routes word / halfword / byte reads and writes through the masked
+// physical address. Owns the RAM / BIOS / scratchpad / flat-IO / VRAM
+// buffers and the four device state buffers (gpu, dma, irq, timer).
+//
+// IO addresses are dispatched to the matching device module's handler;
+// everything else falls through to the flat byte buffers. The device
+// modules don't import bus.jam in turn — they take whichever raw
+// pointers they need as arguments — so the import graph stays acyclic.
+
+const { gpuRead32, gpuRead16, gpuRead8,
+        gpuWrite32, gpuWrite16, gpuWrite8, gpuAlloc, gpuFree } = import("gpu");
+const { dmaRead32, dmaRead16, dmaRead8,
+        dmaWrite32, dmaWrite16, dmaWrite8, dmaAlloc, dmaFree } = import("dma");
+const { irqRead32, irqRead16, irqRead8,
+        irqWrite32, irqWrite16, irqWrite8, irqAlloc, irqFree } = import("irq");
+const { timerRead32, timerRead16, timerRead8,
+        timerWrite32, timerWrite16, timerWrite8, timerAlloc, timerFree } = import("timer");
+
+pub extern fn malloc(size: u64) *mut[] u8;
+pub extern fn free(ptr: *mut[] u8);
+pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+
+// The Bus struct holds every piece of state we route through the
+// memory bus: raw buffers (RAM, BIOS, scratchpad, flat-IO fallback,
+// VRAM) plus the device-state pointers. Other modules redeclare this
+// shape structurally — Jam v0.1.0 doesn't reliably export struct types
+// across modules.
+const Bus = struct {
+    ram:  *mut[] u8,
+    bios: *mut[] u8,
+    spad: *mut[] u8,
+    io:   *mut[] u8,
+    vram: *mut[] u8,
+    gpu:   *mut[] u32,
+    dma:   *mut[] u32,
+    irq:   *mut[] u32,
+    timer: *mut[] u32,
+    biosLoaded: u8,
+};
+
+const BusRoute = struct {
+    kind: u8,
+    off: u32,
+};
+
+const RAM_SIZE:  u32 = 0x200000;
+const BIOS_SIZE: u32 = 0x80000;
+const SPAD_SIZE: u32 = 0x400;
+const IO_SIZE:   u32 = 0x2000;
+const VRAM_SIZE: u32 = 0x100000;
+
+pub fn regionMask(addr: u32) u32 {
+    const seg: u32 = (addr >> 29) & 7;
+    if (seg == 4) { return 0x7FFFFFFF; }
+    if (seg == 5) { return 0x1FFFFFFF; }
+    return 0xFFFFFFFF;
+}
+
+pub fn bufRead32(buf: *mut[] u8, off: u32) u32 {
+    return  (buf[off]       as u32)
+         | ((buf[off + 1]    as u32) << 8)
+         | ((buf[off + 2]    as u32) << 16)
+         | ((buf[off + 3]    as u32) << 24);
+}
+
+pub fn bufRead16(buf: *mut[] u8, off: u32) u32 {
+    return  (buf[off]       as u32)
+         | ((buf[off + 1]    as u32) << 8);
+}
+
+pub fn bufRead8(buf: *mut[] u8, off: u32) u32 {
+    return buf[off] as u32;
+}
+
+pub fn bufWrite32(buf: *mut[] u8, off: u32, val: u32) {
+    buf[off]     = (val         & 0xFF) as u8;
+    buf[off + 1] = ((val >> 8)  & 0xFF) as u8;
+    buf[off + 2] = ((val >> 16) & 0xFF) as u8;
+    buf[off + 3] = ((val >> 24) & 0xFF) as u8;
+}
+
+pub fn bufWrite16(buf: *mut[] u8, off: u32, val: u32) {
+    buf[off]     = (val        & 0xFF) as u8;
+    buf[off + 1] = ((val >> 8) & 0xFF) as u8;
+}
+
+pub fn bufWrite8(buf: *mut[] u8, off: u32, val: u32) {
+    buf[off] = (val & 0xFF) as u8;
+}
+
+// Per-region routing. Same as psxe's static IO-base/size table inlined
+// into an address comparator.
+pub fn route(paddr: u32) BusRoute {
+    if (paddr < 0x00800000) {
+        var r: BusRoute = { kind: 1, off: paddr & 0x001FFFFF };
+        return r;
+    }
+    if (paddr >= 0x1F800000 and paddr < 0x1F800400) {
+        var r: BusRoute = { kind: 3, off: paddr - 0x1F800000 };
+        return r;
+    }
+    if (paddr >= 0x1F801000 and paddr < 0x1F803000) {
+        var r: BusRoute = { kind: 4, off: paddr - 0x1F801000 };
+        return r;
+    }
+    if (paddr >= 0x1FC00000 and paddr < 0x1FC80000) {
+        var r: BusRoute = { kind: 2, off: paddr - 0x1FC00000 };
+        return r;
+    }
+    if (paddr >= 0xFFFE0130 and paddr < 0xFFFE0134) {
+        var r: BusRoute = { kind: 4, off: 0x1F00 + (paddr - 0xFFFE0130) };
+        return r;
+    }
+    var r: BusRoute = { kind: 0, off: 0 };
+    return r;
+}
+
+// ---------- public surface ---------------------------------------------
+
+pub fn allocBus() Bus {
+    var ram:  *mut[] u8 = malloc(RAM_SIZE  as u64);
+    var bios: *mut[] u8 = malloc(BIOS_SIZE as u64);
+    var spad: *mut[] u8 = malloc(SPAD_SIZE as u64);
+    var io:   *mut[] u8 = malloc(IO_SIZE   as u64);
+    var vram: *mut[] u8 = malloc(VRAM_SIZE as u64);
+    memset(ram,  0, RAM_SIZE  as u64);
+    memset(bios, 0, BIOS_SIZE as u64);
+    memset(spad, 0, SPAD_SIZE as u64);
+    memset(io,   0, IO_SIZE   as u64);
+    memset(vram, 0, VRAM_SIZE as u64);
+    var b: Bus = {
+        ram: ram, bios: bios, spad: spad, io: io, vram: vram,
+        gpu:   gpuAlloc(),
+        dma:   dmaAlloc(),
+        irq:   irqAlloc(),
+        timer: timerAlloc(),
+        biosLoaded: 0,
+    };
+    return b;
+}
+
+pub fn freeBus(b: Bus) {
+    free(b.ram);
+    free(b.bios);
+    free(b.spad);
+    free(b.io);
+    free(b.vram);
+    gpuFree(b.gpu);
+    dmaFree(b.dma);
+    irqFree(b.irq);
+    timerFree(b.timer);
+}
+
+// Dispatch an IO-region address to the right device. The offset is
+// relative to 0x1F801000 (i.e. r.off from the BusRoute).
+pub fn ioRead32(bus: Bus, off: u32) u32 {
+    if (off >= 0x070 and off < 0x080) { return irqRead32(bus.irq, off - 0x070); }
+    if (off >= 0x080 and off < 0x100) { return dmaRead32(bus.dma, off - 0x080); }
+    if (off >= 0x100 and off < 0x130) { return timerRead32(bus.timer, off - 0x100); }
+    if (off >= 0x810 and off < 0x818) { return gpuRead32(bus.gpu, bus.vram, off - 0x810); }
+    if (off == 0x814) { return 0x1C000000; }
+    if (off >= IO_SIZE) { return 0; }
+    return bufRead32(bus.io, off);
+}
+
+pub fn ioRead16(bus: Bus, off: u32) u32 {
+    if (off >= 0x070 and off < 0x080) { return irqRead16(bus.irq, off - 0x070); }
+    if (off >= 0x080 and off < 0x100) { return dmaRead16(bus.dma, off - 0x080); }
+    if (off >= 0x100 and off < 0x130) { return timerRead16(bus.timer, off - 0x100); }
+    if (off >= 0x810 and off < 0x818) { return gpuRead16(bus.gpu, bus.vram, off - 0x810); }
+    if (off == 0x054) { return 0x05; }
+    if (off == 0x05A) { return 0; }
+    if (off >= IO_SIZE) { return 0; }
+    return bufRead16(bus.io, off);
+}
+
+pub fn ioRead8(bus: Bus, off: u32) u32 {
+    if (off >= 0x070 and off < 0x080) { return irqRead8(bus.irq, off - 0x070); }
+    if (off >= 0x080 and off < 0x100) { return dmaRead8(bus.dma, off - 0x080); }
+    if (off >= 0x100 and off < 0x130) { return timerRead8(bus.timer, off - 0x100); }
+    if (off >= 0x810 and off < 0x818) { return gpuRead8(bus.gpu, bus.vram, off - 0x810); }
+    if (off >= IO_SIZE) { return 0; }
+    return bufRead8(bus.io, off);
+}
+
+// Write dispatch — same table for writes. Note that DMA writes need
+// the Bus (for memory access during a triggered transfer) and timer /
+// irq writes need cop0 to keep the COP0 cause register coherent. We
+// require those parameters at the outer interface.
+pub fn ioWrite32(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
+    if (off >= 0x070 and off < 0x080) { irqWrite32(bus.irq, cop0, off - 0x070, val); return; }
+    if (off >= 0x080 and off < 0x100) { dmaWrite32(bus.dma, bus, off - 0x080, val); return; }
+    if (off >= 0x100 and off < 0x130) { timerWrite32(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
+    if (off >= 0x810 and off < 0x818) { gpuWrite32(bus.gpu, bus.vram, off - 0x810, val); return; }
+    if (off >= IO_SIZE) { return; }
+    bufWrite32(bus.io, off, val);
+}
+
+pub fn ioWrite16(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
+    if (off >= 0x070 and off < 0x080) { irqWrite16(bus.irq, cop0, off - 0x070, val); return; }
+    if (off >= 0x080 and off < 0x100) { dmaWrite16(bus.dma, bus, off - 0x080, val); return; }
+    if (off >= 0x100 and off < 0x130) { timerWrite16(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
+    if (off >= 0x810 and off < 0x818) { gpuWrite16(bus.gpu, bus.vram, off - 0x810, val); return; }
+    if (off >= IO_SIZE) { return; }
+    bufWrite16(bus.io, off, val);
+}
+
+pub fn ioWrite8(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
+    if (off >= 0x070 and off < 0x080) { irqWrite8(bus.irq, cop0, off - 0x070, val); return; }
+    if (off >= 0x080 and off < 0x100) { dmaWrite8(bus.dma, bus, off - 0x080, val); return; }
+    if (off >= 0x100 and off < 0x130) { timerWrite8(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
+    if (off >= 0x810 and off < 0x818) { gpuWrite8(bus.gpu, bus.vram, off - 0x810, val); return; }
+    if (off >= IO_SIZE) { return; }
+    bufWrite8(bus.io, off, val);
+}
+
+// `busRead/Write` is the public memory-access surface — `cop0` is only
+// needed when the access target is an IO region that may update the
+// COP0 cause register; a wrapper that hardcodes cop0=NULL would be
+// unsound, so we always thread it through.
+pub fn busRead32(bus: Bus, addr: u32) u32 {
+    const paddr: u32 = addr & regionMask(addr);
+    const r: BusRoute = route(paddr);
+    if (r.kind == 1) { return bufRead32(bus.ram,  r.off & (RAM_SIZE  - 1)); }
+    if (r.kind == 2) { return bufRead32(bus.bios, r.off & (BIOS_SIZE - 1)); }
+    if (r.kind == 3) { return bufRead32(bus.spad, r.off & (SPAD_SIZE - 1)); }
+    if (r.kind == 4) { return ioRead32(bus, r.off); }
+    return 0;
+}
+
+pub fn busRead16(bus: Bus, addr: u32) u32 {
+    const paddr: u32 = addr & regionMask(addr);
+    const r: BusRoute = route(paddr);
+    if (r.kind == 1) { return bufRead16(bus.ram,  r.off & (RAM_SIZE  - 1)); }
+    if (r.kind == 2) { return bufRead16(bus.bios, r.off & (BIOS_SIZE - 1)); }
+    if (r.kind == 3) { return bufRead16(bus.spad, r.off & (SPAD_SIZE - 1)); }
+    if (r.kind == 4) { return ioRead16(bus, r.off); }
+    return 0;
+}
+
+pub fn busRead8(bus: Bus, addr: u32) u32 {
+    const paddr: u32 = addr & regionMask(addr);
+    const r: BusRoute = route(paddr);
+    if (r.kind == 1) { return bufRead8(bus.ram,  r.off & (RAM_SIZE  - 1)); }
+    if (r.kind == 2) { return bufRead8(bus.bios, r.off & (BIOS_SIZE - 1)); }
+    if (r.kind == 3) { return bufRead8(bus.spad, r.off & (SPAD_SIZE - 1)); }
+    if (r.kind == 4) { return ioRead8(bus, r.off); }
+    return 0;
+}
+
+pub fn busWrite32(bus: Bus, cop0: *mut[] u32, addr: u32, val: u32) {
+    const paddr: u32 = addr & regionMask(addr);
+    const r: BusRoute = route(paddr);
+    if (r.kind == 1) { bufWrite32(bus.ram,  r.off & (RAM_SIZE  - 1), val); return; }
+    if (r.kind == 3) { bufWrite32(bus.spad, r.off & (SPAD_SIZE - 1), val); return; }
+    if (r.kind == 4) { ioWrite32(bus, cop0, r.off, val); return; }
+}
+
+pub fn busWrite16(bus: Bus, cop0: *mut[] u32, addr: u32, val: u32) {
+    const paddr: u32 = addr & regionMask(addr);
+    const r: BusRoute = route(paddr);
+    if (r.kind == 1) { bufWrite16(bus.ram,  r.off & (RAM_SIZE  - 1), val); return; }
+    if (r.kind == 3) { bufWrite16(bus.spad, r.off & (SPAD_SIZE - 1), val); return; }
+    if (r.kind == 4) { ioWrite16(bus, cop0, r.off, val); return; }
+}
+
+pub fn busWrite8(bus: Bus, cop0: *mut[] u32, addr: u32, val: u32) {
+    const paddr: u32 = addr & regionMask(addr);
+    const r: BusRoute = route(paddr);
+    if (r.kind == 1) { bufWrite8(bus.ram,  r.off & (RAM_SIZE  - 1), val); return; }
+    if (r.kind == 3) { bufWrite8(bus.spad, r.off & (SPAD_SIZE - 1), val); return; }
+    if (r.kind == 4) { ioWrite8(bus, cop0, r.off, val); return; }
+}
+
+// Direct buffer accessors.
+pub fn busRamPtr(bus: Bus)  *mut[] u8 { return bus.ram;  }
+pub fn busBiosPtr(bus: Bus) *mut[] u8 { return bus.bios; }
+pub fn busVramPtr(bus: Bus) *mut[] u8 { return bus.vram; }
+pub fn busGpuPtr(bus: Bus) *mut[] u32 { return bus.gpu; }
+pub fn busDmaPtr(bus: Bus) *mut[] u32 { return bus.dma; }
+pub fn busIrqPtr(bus: Bus) *mut[] u32 { return bus.irq; }
+pub fn busTimerPtr(bus: Bus) *mut[] u32 { return bus.timer; }

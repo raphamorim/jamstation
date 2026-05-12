@@ -1,0 +1,313 @@
+// PSX emulator — SDL2 frontend.
+//
+// Glues bus.jam + cpu.jam + sdl.jam together, loads BIOS and (optional)
+// PSX-EXE, then drives the CPU inside a 60 Hz SDL2 frame loop. Each
+// frame runs ~565K CPU cycles (≈ 33.87 MHz / 60 Hz) and presents the
+// PSX VRAM as a 1024×512 BGR555 texture.
+//
+// Pure-CPU unit tests live in tests.jam — keep them there so this
+// file doesn't have to link SDL2 just to run them.
+
+const {
+    allocBus, freeBus,
+    busRead32, busRead16, busRead8,
+    busWrite32, busWrite16, busWrite8,
+    busRamPtr, busBiosPtr, busVramPtr
+} = import("bus");
+
+// Force device modules into main.jam's codegen context.
+const { gpuAlloc, gpuUpdate } = import("gpu");
+const { dmaAlloc, dmaUpdate } = import("dma");
+const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
+const {
+    timerAlloc, timerUpdate,
+    timerHblankBegin, timerHblankEnd,
+    timerVblankBegin, timerVblankEnd
+} = import("timer");
+
+const {
+    freshCpu, freshCpuAt,
+    allocRegFile, freeRegFile,
+    gprRead, gprWrite,
+    cop0Read, cop0Write,
+    run, runHooked,
+    encR, encI, encJ
+} = import("cpu");
+
+const {
+    sdlInit, sdlQuit, sdlBlit, sdlPump, sdlDelay
+} = import("sdl");
+
+extern fn malloc(size: u64) *mut[] u8;
+extern fn free(ptr: *mut[] u8);
+extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+extern fn printf(format: *const[] u8, ...) i32;
+extern fn write(fd: i32, buf: *const[] u8, count: u64) i64;
+extern fn putchar(c: i32) i32;
+extern fn fopen(path: *const[] u8, mode: *const[] u8) *mut[] u8;
+extern fn fclose(file: *mut[] u8) i32;
+extern fn fread(buf: *mut[] u8, size: u64, n: u64, file: *mut[] u8) u64;
+extern fn fseek(file: *mut[] u8, off: i64, whence: i32) i32;
+extern fn access(path: *const[] u8, mode: i32) i32;
+extern fn fflush(stream: u64) i32;
+
+// SDL2 externs need to be re-declared here so the codegen for sdl.jam's
+// pub wrappers (which lives in this module's compilation context) can
+// resolve them.
+extern fn SDL_Init(flags: u32) i32;
+extern fn SDL_Quit();
+extern fn SDL_CreateWindow(title: *const[] u8,
+                           x: i32, y: i32, w: i32, h: i32,
+                           flags: u32) *mut[] u8;
+extern fn SDL_DestroyWindow(window: *mut[] u8);
+extern fn SDL_CreateRenderer(window: *mut[] u8, index: i32, flags: u32) *mut[] u8;
+extern fn SDL_DestroyRenderer(renderer: *mut[] u8);
+extern fn SDL_CreateTexture(renderer: *mut[] u8, format: u32, access: i32,
+                            w: i32, h: i32) *mut[] u8;
+extern fn SDL_DestroyTexture(texture: *mut[] u8);
+extern fn SDL_UpdateTexture(texture: *mut[] u8, rect: *const[] u8,
+                            pixels: *const[] u8, pitch: i32) i32;
+extern fn SDL_RenderClear(renderer: *mut[] u8) i32;
+extern fn SDL_RenderCopy(renderer: *mut[] u8, texture: *mut[] u8,
+                         srcrect: *const[] u8, dstrect: *const[] u8) i32;
+extern fn SDL_RenderPresent(renderer: *mut[] u8);
+extern fn SDL_Delay(ms: u32);
+extern fn SDL_PollEvent(event: *mut[] u8) i32;
+extern fn SDL_GetTicks() u32;
+
+const STDOUT: i32 = 1;
+
+fn fileExists(path: []u8) bool {
+    return access(path.ptr, 0) == 0;
+}
+
+// Locally-redeclared shapes matching bus.jam / cpu.jam / sdl.jam.
+const Bus = struct {
+    ram:  *mut[] u8,
+    bios: *mut[] u8,
+    spad: *mut[] u8,
+    io:   *mut[] u8,
+    vram: *mut[] u8,
+    gpu:   *mut[] u32,
+    dma:   *mut[] u32,
+    irq:   *mut[] u32,
+    timer: *mut[] u32,
+    biosLoaded: u8,
+};
+
+const Cpu = struct {
+    pc: u32,
+    nextPc: u32,
+    savedPc: u32,
+    hi: u32,
+    lo: u32,
+    loadD: u32,
+    loadV: u32,
+    branch: u8,
+    delaySlot: u8,
+    branchTaken: u8,
+    halted: u8,
+    cycles: u64,
+};
+
+const Sdl = struct {
+    window:   *mut[] u8,
+    renderer: *mut[] u8,
+    texture:  *mut[] u8,
+    width:  i32,
+    height: i32,
+};
+
+const C0_SR:    u32 = 12;
+const C0_PRID:  u32 = 15;
+
+// PSX clock: 33.8688 MHz. At 60 fps that's ~564480 cycles per frame.
+const CYCLES_PER_FRAME: u32 = 564480;
+const VRAM_WIDTH:  i32 = 1024;
+const VRAM_HEIGHT: i32 = 512;
+const VRAM_PITCH:  i32 = 2048;        // bytes per row at 16 bpp
+
+// ---------- PSX-EXE loader ---------------------------------------------
+
+fn readU32At(buf: *mut[] u8, off: u32) u32 {
+    return  (buf[off]       as u32)
+         | ((buf[off + 1]    as u32) << 8)
+         | ((buf[off + 2]    as u32) << 16)
+         | ((buf[off + 3]    as u32) << 24);
+}
+
+fn loadExe(path: []u8, bus: Bus, regs: *mut[] u32, c: Cpu) Cpu {
+    var modeRb: []u8 = "rb";
+    var f: *mut[] u8 = fopen(path.ptr, modeRb.ptr);
+    var hdr: *mut[] u8 = malloc(0x800);
+    memset(hdr, 0, 0x800);
+    const hdrBytes: u64 = fread(hdr, 1, 0x800, f);
+    if (hdrBytes < 0x800) {
+        free(hdr);
+        fclose(f);
+        var msg: []u8 = "loadExe: header read failed\n";
+        write(STDOUT, msg.ptr, msg.len);
+        return c;
+    }
+
+    const initPc:  u32 = readU32At(hdr, 0x10);
+    const initGp:  u32 = readU32At(hdr, 0x14);
+    const ramDest: u32 = readU32At(hdr, 0x18);
+    const fileSz:  u32 = readU32At(hdr, 0x1C);
+    const spBase:  u32 = readU32At(hdr, 0x30);
+    const spOff:   u32 = readU32At(hdr, 0x34);
+
+    // Copy the executable body byte-by-byte into RAM. Jam doesn't have
+    // pointer arithmetic on many-item pointers, so we stream through a
+    // temp buffer and copy.
+    var body: *mut[] u8 = malloc(fileSz as u64);
+    fread(body, 1, fileSz as u64, f);
+    const dst: u32 = ramDest & 0x001FFFFF;
+    var ram: *mut[] u8 = busRamPtr(bus);
+    var i: u32 = 0;
+    while (i < fileSz) {
+        ram[dst + i] = body[i];
+        i = i + 1;
+    }
+    free(body);
+    free(hdr);
+    fclose(f);
+
+    var nc: Cpu = c;
+    nc.pc = initPc;
+    nc.nextPc = nc.pc + 4;
+    gprWrite(regs, 28, initGp);
+    if (spBase != 0) {
+        const sp: u32 = spBase + spOff;
+        gprWrite(regs, 29, sp);
+        gprWrite(regs, 30, sp);
+    }
+
+    var fmt: []u8 = "Loaded EXE: PC=%08X SP=%08X GP=%08X size=%u dest=%08X\n";
+    printf(fmt.ptr, nc.pc, gprRead(regs, 29), gprRead(regs, 28),
+           fileSz, ramDest);
+    return nc;
+}
+
+fn loadBios(path: []u8, bus: Bus) u64 {
+    var modeRb: []u8 = "rb";
+    var f: *mut[] u8 = fopen(path.ptr, modeRb.ptr);
+    var biosBuf: *mut[] u8 = busBiosPtr(bus);
+    const got: u64 = fread(biosBuf, 1, 0x80000, f);
+    fclose(f);
+    return got;
+}
+
+// Run one full NTSC frame (263 scanlines × ~2175 CPU cycles each).
+// Between scanlines we tick the timers' hblank/vblank machinery; on
+// entry to vblank (line 240) we raise IRQ 0 and notify timer 1.
+const CYCLES_PER_SCANLINE: u32 = 2175;
+const SCANLINES_VDRAW: u32 = 240;
+const SCANLINES_TOTAL: u32 = 263;
+
+fn runOneFrame(c: Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    var nc: Cpu = c;
+    var line: u32 = 0;
+    while (line < SCANLINES_TOTAL) {
+        nc = runHooked(nc, bus, regs, cop0, CYCLES_PER_SCANLINE);
+        timerHblankBegin(bus.timer, bus.irq, cop0);
+        timerHblankEnd(bus.timer);
+        if (line == SCANLINES_VDRAW) {
+            timerVblankBegin(bus.timer, bus.irq, cop0);
+            irqRaise(bus.irq, cop0, IC_VBLANK());
+        }
+        line = line + 1;
+    }
+    timerVblankEnd(bus.timer);
+    timerUpdate(bus.timer, bus.irq, cop0);
+    dmaUpdate(bus.dma, bus.irq, cop0);
+    return nc;
+}
+
+// Pre-fill VRAM with a soft gradient so the user sees the SDL pipe is
+// alive even before the GPU emits a single pixel.
+// (the prime helper is gone; main() inlines a memset for now since the
+//  gradient version is too slow in unoptimized builds — see issue
+//  notes in the README.)
+
+// ---------- main --------------------------------------------------------
+
+// Force printf to flush immediately so progress messages survive a
+// downstream crash. `fflush(NULL)` flushes every open stream.
+fn flushAll() {
+    fflush(0);
+}
+
+fn main() {
+    var regs: *mut[] u32 = allocRegFile(32);
+    var cop0: *mut[] u32 = allocRegFile(16);
+    var bus: Bus = allocBus();
+    var c: Cpu = freshCpu();
+
+    // Match psxe's initial COP0 state. The 0x10900000 value seeds COP0
+    // SR with CU0 enabled, BEV set, and a few breakpoint controls.
+    cop0Write(cop0, C0_SR,   0x10900000);
+    cop0Write(cop0, C0_PRID, 0x00000002);
+
+    var biosPath: []u8 = "./SCPH1001.BIN";
+    if (fileExists(biosPath)) {
+        const got: u64 = loadBios(biosPath, bus);
+        var fmt: []u8 = "Loaded BIOS: %llu bytes from SCPH1001.BIN\n";
+        printf(fmt.ptr, got);
+        flushAll();
+    } else {
+        var msg: []u8 = "No SCPH1001.BIN — booting from EXE only\n";
+        write(STDOUT, msg.ptr, msg.len);
+    }
+
+    var exePath: []u8 = "./demo.exe";
+    if (fileExists(exePath)) {
+        c = loadExe(exePath, bus, regs, c);
+        flushAll();
+    } else {
+        var msg: []u8 = "No demo.exe — running from BIOS reset vector only\n";
+        write(STDOUT, msg.ptr, msg.len);
+    }
+
+    // SDL window + texture. We render the full 1024×512 VRAM as a BGR555
+    // texture, which matches the PSX's natural framebuffer format. A
+    // future GPU implementation pokes pixels into VRAM; until then this
+    // is a debug pattern.
+    var preMsg: []u8 = "Initializing SDL2...\n";
+    write(STDOUT, preMsg.ptr, preMsg.len);
+    var title: []u8 = "psone-jam";
+    var sdl: Sdl = sdlInit(title, VRAM_WIDTH, VRAM_HEIGHT);
+    var postMsg: []u8 = "SDL2 ready. Priming VRAM...\n";
+    write(STDOUT, postMsg.ptr, postMsg.len);
+    // Skip the gradient test pattern for now — the nested 1024x512 loop
+    // is slow in debug builds. Memset the VRAM to a solid dark gray so
+    // the window is visibly populated.
+    var vp: *mut[] u8 = busVramPtr(bus);
+    memset(vp, 0x18, 0x100000);          // 0x1818 → muted blue-grey in BGR555
+
+    var msg: []u8 = "Running — Esc or close to quit\n";
+    write(STDOUT, msg.ptr, msg.len);
+
+    var frames: u32 = 0;
+    var quit: u32 = 0;
+    while (quit == 0) {
+        c = runOneFrame(c, bus, regs, cop0);
+        var vram: *mut[] u8 = busVramPtr(bus);
+        sdlBlit(sdl, vram, VRAM_PITCH);
+        quit = sdlPump();
+        frames = frames + 1;
+        // Bail after a long-but-finite session if no quit event comes —
+        // protects users from a runaway window when there's no controller
+        // input wired up yet.
+        if (frames > 3600) { quit = 1; }
+    }
+
+    var fmtState: []u8 = "Stopped after %u frames: PC=%08X SP=%08X RA=%08X cycles=%llu\n";
+    printf(fmtState.ptr, frames,
+        c.pc, gprRead(regs, 29), gprRead(regs, 31), c.cycles);
+
+    sdlQuit(sdl);
+    freeRegFile(regs);
+    freeRegFile(cop0);
+    freeBus(bus);
+}
