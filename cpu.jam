@@ -888,9 +888,39 @@ pub fn iRfe(c: Cpu, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
     return nc;
 }
 
-pub fn iCop2Unimpl(c: Cpu, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
-    var nc: Cpu = commitLoad(c, regs);
-    return raiseException(nc, cop0, CAUSE_CPU);
+// COP2 (GTE) stub. Faulting on every GTE access made the BIOS skip its
+// 3D boot animation entirely; absorbing the access without faulting at
+// least lets the kernel proceed, with the side-effect that any GTE-
+// projected vertices come out as zero. The full math port is a project
+// of its own (~3 kLOC of fixed-point with saturation flags) and lives
+// behind this stub.
+//
+// Layout:
+//   MFC2 (rs=0x00): load delay slot picks up `0`
+//   CFC2 (rs=0x02): load delay slot picks up `0`
+//   MTC2 (rs=0x04): swallow
+//   CTC2 (rs=0x06): swallow
+//   COP2 imm (rs >= 0x10): swallow
+pub fn iCop2Unimpl(c: Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const rs: u32 = opRs(opc);
+    if (rs == 0x00 or rs == 0x02) {
+        // GTE register read — produce 0 via the load-delay slot so the
+        // caller's MFLO-style usage doesn't observe stale data.
+        var nc: Cpu = c;
+        if (nc.loadD != opRt(opc)) { nc = commitLoad(nc, regs); }
+        nc.loadD = opRt(opc);
+        nc.loadV = 0;
+        return nc;
+    }
+    // MTC2 / CTC2 / COP2 math — silently absorb.
+    return commitLoad(c, regs);
+}
+
+// LWC2 / SWC2 (primary 0x32 / 0x3A) — same swallow semantics. These
+// load/store a single COP2 data register from/to memory and the BIOS
+// scaffolding uses them around RTPS calls.
+pub fn iCop2Mem(c: Cpu, regs: *mut[] u32) Cpu {
+    return commitLoad(c, regs);
 }
 
 pub fn illegal(c: Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
@@ -964,7 +994,7 @@ pub fn dispatch(c: Cpu, opc: u32, bus: Bus,
     if (p == 0x0E) { return iXori(c, opc, regs); }
     if (p == 0x0F) { return iLui(c, opc, regs); }
     if (p == 0x10) { return dispatchCop0(c, opc, regs, cop0); }
-    if (p == 0x12) { return iCop2Unimpl(c, regs, cop0); }
+    if (p == 0x12) { return iCop2Unimpl(c, opc, regs, cop0); }
     if (p == 0x20) { return iLb(c, opc, bus, regs); }
     if (p == 0x21) { return iLh(c, opc, bus, regs, cop0); }
     if (p == 0x22) { return iLwl(c, opc, bus, regs); }
@@ -977,9 +1007,13 @@ pub fn dispatch(c: Cpu, opc: u32, bus: Bus,
     if (p == 0x2A) { return iSwl(c, opc, bus, regs, cop0); }
     if (p == 0x2B) { return iSw(c, opc, bus, regs, cop0); }
     if (p == 0x2E) { return iSwr(c, opc, bus, regs, cop0); }
-    if (p == 0x30 or p == 0x31 or p == 0x32 or p == 0x33 or
-        p == 0x38 or p == 0x39 or p == 0x3A or p == 0x3B) {
-        return iCop2Unimpl(c, regs, cop0);
+    // COPx load/store opcodes (LWC0/1/2/3, SWC0/1/2/3). COP2 (the GTE)
+    // gets the swallow stub; the other coprocessors don't exist on the
+    // PSX, so we raise coprocessor-unusable as before.
+    if (p == 0x32 or p == 0x3A) { return iCop2Mem(c, regs); }
+    if (p == 0x30 or p == 0x31 or p == 0x33 or
+        p == 0x38 or p == 0x39 or p == 0x3B) {
+        return iCop2Unimpl(c, opc, regs, cop0);
     }
     return illegal(c, opc, regs, cop0);
 }

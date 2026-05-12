@@ -16,7 +16,7 @@ const {
 } = import("bus");
 
 // Force device modules into main.jam's codegen context.
-const { gpuAlloc, gpuUpdate } = import("gpu");
+const { gpuAlloc, gpuUpdate, gpuFamilyCount } = import("gpu");
 const { dmaAlloc, dmaUpdate } = import("dma");
 const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
 const {
@@ -368,7 +368,7 @@ fn main() {
         // Bail after a long-but-finite session if no quit event comes —
         // protects users from a runaway window when there's no controller
         // input wired up yet.
-        if (frames > 3600) { quit = 1; }
+        if (frames > 180) { quit = 1; }
     }
 
     var fmtState: []u8 = "Stopped after %u frames: PC=%08X SP=%08X RA=%08X cycles=%llu\n";
