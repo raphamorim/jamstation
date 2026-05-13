@@ -95,7 +95,7 @@ fn placeOp(bus: Bus, cop0: *mut[] u32, addr: u32, opc: u32) {
 fn tOriImm() u32 {
     var h: Harness = allocHarness();
     placeOp(h.bus, h.cop0, 0x80000000, encI(0x0D, 0, 8, 0x1234));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 4);
+    run(h.cpu, h.bus, h.regs, h.cop0, 4);
     const v: u32 = gprRead(h.regs, 8);
     freeHarness(h);
     return v;
@@ -105,7 +105,7 @@ fn tLuiOri() u32 {
     var h: Harness = allocHarness();
     placeOp(h.bus, h.cop0, 0x80000000, encI(0x0F, 0, 9, 0xABCD));
     placeOp(h.bus, h.cop0, 0x80000004, encI(0x0D, 9, 9, 0xEF01));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 4);
+    run(h.cpu, h.bus, h.regs, h.cop0, 4);
     const v: u32 = gprRead(h.regs, 9);
     freeHarness(h);
     return v;
@@ -116,7 +116,7 @@ fn tAdduChain() u32 {
     placeOp(h.bus, h.cop0, 0x80000000, encI(0x09, 0, 8, 7));
     placeOp(h.bus, h.cop0, 0x80000004, encI(0x09, 0, 9, 5));
     placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 10, 0, 0x21));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    run(h.cpu, h.bus, h.regs, h.cop0, 8);
     const v: u32 = gprRead(h.regs, 10);
     freeHarness(h);
     return v;
@@ -127,7 +127,7 @@ fn tSltSigned() u32 {
     placeOp(h.bus, h.cop0, 0x80000000, encI(0x09, 0, 8, 0xFFFF));
     placeOp(h.bus, h.cop0, 0x80000004, encI(0x09, 0, 9, 1));
     placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 10, 0, 0x2A));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    run(h.cpu, h.bus, h.regs, h.cop0, 8);
     const v: u32 = gprRead(h.regs, 10);
     freeHarness(h);
     return v;
@@ -138,7 +138,7 @@ fn tSltuSigned() u32 {
     placeOp(h.bus, h.cop0, 0x80000000, encI(0x09, 0, 8, 0xFFFF));
     placeOp(h.bus, h.cop0, 0x80000004, encI(0x09, 0, 9, 1));
     placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 10, 0, 0x2B));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    run(h.cpu, h.bus, h.regs, h.cop0, 8);
     const v: u32 = gprRead(h.regs, 10);
     freeHarness(h);
     return v;
@@ -148,7 +148,7 @@ fn tShiftSra() u32 {
     var h: Harness = allocHarness();
     placeOp(h.bus, h.cop0, 0x80000000, encI(0x0F, 0, 8, 0x8000));
     placeOp(h.bus, h.cop0, 0x80000004, encR(0x00, 0, 8, 9, 2, 0x03));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 4);
+    run(h.cpu, h.bus, h.regs, h.cop0, 4);
     const v: u32 = gprRead(h.regs, 9);
     freeHarness(h);
     return v;
@@ -160,7 +160,7 @@ fn tAndOr() u32 {
     placeOp(h.bus, h.cop0, 0x80000004, encI(0x0D, 0, 9, 0x0FF0));
     placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 10, 0, 0x24));
     placeOp(h.bus, h.cop0, 0x8000000C, encR(0x00, 8, 9, 11, 0, 0x25));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    run(h.cpu, h.bus, h.regs, h.cop0, 8);
     const a: u32 = gprRead(h.regs, 10);
     const o: u32 = gprRead(h.regs, 11);
     freeHarness(h);
@@ -174,7 +174,7 @@ fn tBranchDelay() u32 {
     placeOp(h.bus, h.cop0, 0x80000008, encI(0x0D, 0, 9, 1));
     placeOp(h.bus, h.cop0, 0x8000000C, encI(0x0D, 0, 10, 0xFFFF));
     placeOp(h.bus, h.cop0, 0x80000010, encI(0x0D, 0, 11, 0x5555));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 6);
+    run(h.cpu, h.bus, h.regs, h.cop0, 6);
     const t1: u32 = gprRead(h.regs, 9);
     const t2: u32 = gprRead(h.regs, 10);
     const t3: u32 = gprRead(h.regs, 11);
@@ -189,7 +189,7 @@ fn tJumpDelay() u32 {
     placeOp(h.bus, h.cop0, 0x80000004, encI(0x0D, 0, 8, 1));
     placeOp(h.bus, h.cop0, 0x80000008, encI(0x0D, 0, 9, 0xFFFF));
     placeOp(h.bus, h.cop0, 0x80000020, encI(0x0D, 0, 9, 0xAA));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 6);
+    run(h.cpu, h.bus, h.regs, h.cop0, 6);
     const t0: u32 = gprRead(h.regs, 8);
     const t1: u32 = gprRead(h.regs, 9);
     freeHarness(h);
@@ -205,7 +205,7 @@ fn tJalJr() u32 {
     placeOp(h.bus, h.cop0, 0x80000020, encI(0x0D, 0, 8, 0x42));
     placeOp(h.bus, h.cop0, 0x80000024, encR(0x00, 31, 0, 0, 0, 0x08));
     placeOp(h.bus, h.cop0, 0x80000028, encI(0x09, 0, 0, 0));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 12);
+    run(h.cpu, h.bus, h.regs, h.cop0, 12);
     const t0: u32 = gprRead(h.regs, 8);
     const t3: u32 = gprRead(h.regs, 11);
     freeHarness(h);
@@ -220,7 +220,7 @@ fn tLwSw() u32 {
     placeOp(h.bus, h.cop0, 0x8000000C, encI(0x0D, 9, 9, 0x0100));
     placeOp(h.bus, h.cop0, 0x80000010, encI(0x2B, 9, 8, 0));
     placeOp(h.bus, h.cop0, 0x80000014, encI(0x23, 9, 10, 0));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    run(h.cpu, h.bus, h.regs, h.cop0, 8);
     const v: u32 = gprRead(h.regs, 10);
     freeHarness(h);
     return v;
@@ -233,7 +233,7 @@ fn tLbSignExt() u32 {
     placeOp(h.bus, h.cop0, 0x80000008, encI(0x0D, 9, 9, 0x0100));
     placeOp(h.bus, h.cop0, 0x8000000C, encI(0x28, 9, 8, 0));
     placeOp(h.bus, h.cop0, 0x80000010, encI(0x20, 9, 10, 0));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    run(h.cpu, h.bus, h.regs, h.cop0, 8);
     const v: u32 = gprRead(h.regs, 10);
     freeHarness(h);
     return v;
@@ -246,7 +246,7 @@ fn tMultSigned() u64 {
     placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 0, 0, 0x18));
     placeOp(h.bus, h.cop0, 0x8000000C, encR(0x00, 0, 0, 10, 0, 0x10));
     placeOp(h.bus, h.cop0, 0x80000010, encR(0x00, 0, 0, 11, 0, 0x12));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    run(h.cpu, h.bus, h.regs, h.cop0, 8);
     const hi: u64 = gprRead(h.regs, 10) as u64;
     const lo: u64 = gprRead(h.regs, 11) as u64;
     freeHarness(h);
@@ -260,7 +260,7 @@ fn tDivu() u32 {
     placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 0, 0, 0x1B));
     placeOp(h.bus, h.cop0, 0x8000000C, encR(0x00, 0, 0, 10, 0, 0x12));
     placeOp(h.bus, h.cop0, 0x80000010, encR(0x00, 0, 0, 11, 0, 0x10));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    run(h.cpu, h.bus, h.regs, h.cop0, 8);
     const q: u32 = gprRead(h.regs, 10);
     const r: u32 = gprRead(h.regs, 11);
     freeHarness(h);
@@ -275,7 +275,7 @@ fn tSumLoop() u32 {
     placeOp(h.bus, h.cop0, 0x8000000C, encI(0x09, 9, 9, 0xFFFF));
     placeOp(h.bus, h.cop0, 0x80000010, encI(0x05, 9, 0, 0xFFFD));
     placeOp(h.bus, h.cop0, 0x80000014, encI(0x09, 0, 0, 0));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 64);
+    run(h.cpu, h.bus, h.regs, h.cop0, 64);
     const v: u32 = gprRead(h.regs, 8);
     freeHarness(h);
     return v;
@@ -287,7 +287,7 @@ fn tCop0Roundtrip() u32 {
     placeOp(h.bus, h.cop0, 0x80000004, encR(0x10, 4, 8, 12, 0, 0));
     placeOp(h.bus, h.cop0, 0x80000008, encR(0x10, 0, 9, 12, 0, 0));
     placeOp(h.bus, h.cop0, 0x8000000C, encI(0x09, 0, 0, 0));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 8);
+    run(h.cpu, h.bus, h.regs, h.cop0, 8);
     const v: u32 = gprRead(h.regs, 9);
     freeHarness(h);
     return v;
@@ -297,7 +297,7 @@ fn tSyscallVector() u32 {
     var h: Harness = allocHarness();
     cop0Write(h.cop0, C0_SR, SR_BEV);
     placeOp(h.bus, h.cop0, 0x80000000, encR(0x00, 0, 0, 0, 0, 0x0C));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 1);
+    run(h.cpu, h.bus, h.regs, h.cop0, 1);
     const pc: u32 = h.cpu.pc;
     freeHarness(h);
     return pc;
@@ -312,7 +312,7 @@ fn tLoadDelay() u32 {
     placeOp(h.bus, h.cop0, 0x80000010, encI(0x23, 29, 8, 0));
     placeOp(h.bus, h.cop0, 0x80000014, encI(0x0D, 8, 10, 0));
     placeOp(h.bus, h.cop0, 0x80000018, encI(0x0D, 8, 11, 0));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 16);
+    run(h.cpu, h.bus, h.regs, h.cop0, 16);
     const t2: u32 = gprRead(h.regs, 10);
     const t3: u32 = gprRead(h.regs, 11);
     freeHarness(h);
@@ -333,7 +333,7 @@ fn tLwlLwr() u32 {
     placeOp(h.bus, h.cop0, 0x80000024, encI(0x22, 29, 10, 6));
     placeOp(h.bus, h.cop0, 0x80000028, encI(0x26, 29, 10, 3));
     placeOp(h.bus, h.cop0, 0x8000002C, encI(0x09, 0, 0, 0));
-    h.cpu = run(h.cpu, h.bus, h.regs, h.cop0, 20);
+    run(h.cpu, h.bus, h.regs, h.cop0, 20);
     const v: u32 = gprRead(h.regs, 10);
     freeHarness(h);
     return v;
