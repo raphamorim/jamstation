@@ -1,0 +1,484 @@
+// CD-ROM controller — minimal port of psxe `psx/dev/cdrom/*.c` covering
+// the BIOS-boot subset of commands plus the FIFO + IRQ + state-machine
+// plumbing every command depends on. Audio (CDDA / XA-ADPCM) and disc
+// reading are not in this pass; the goal is to get the BIOS through the
+// `CdlTest(0x20)` / `CdlGetstat` sequence that gates the 3D logo.
+//
+// Register map at 0x1F801800..0x1F801803 — every register is bank-
+// selected: writes to address 0x800 set bits 0-1 of the bank index,
+// then addresses 0x801..0x803 take different meanings per bank. The
+// dispatch table mirrors psxe (psx_cdrom_write8 / cdrom_read8):
+//
+//   bank read 0x800  status (busy/parm-empty/resp-empty/...)
+//   bank read 0x801  pop one byte from the response FIFO
+//   bank read 0x802  pop one byte from the data FIFO (sector buffer)
+//   bank read 0x803  index 0/2 → IER, index 1/3 → IFR | 0xE0
+//
+//   bank 0 write 0x801  command byte (triggers state machine)
+//   bank 0 write 0x802  push parameter byte
+//   bank 0 write 0x803  request register (bit 7 = data req)
+//   bank 1 write 0x802  IER
+//   bank 1 write 0x803  IFR ack (clears bits in IFR that are set in val)
+//   (other banks are mostly volume / unused for boot)
+//
+// Acknowledge protocol: each command schedules a response that fires
+// after `CD_DELAY_FR` CPU cycles. When the delay elapses, the response
+// handler pushes bytes to the response FIFO, sets IFR to a 1..7 INT
+// number, and raises IC_CDROM. The BIOS handler reads response bytes
+// then writes 0x07 to IFR to ack — the FIFO and IFR stay sticky until
+// then, so the BIOS can re-read responses without races.
+
+pub extern fn malloc(size: u64) *mut[] u8;
+pub extern fn free(ptr: *mut[] u8);
+pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+pub extern fn printf(format: *const[] u8, ...) i32;
+
+const { irqRaise, IC_CDROM } = import("irq");
+
+// State block — single u8 buffer with byte offsets. Total ~256 bytes.
+//
+//   [0x00] index          (u8)  bank select, 0-3
+//   [0x01] ifr            (u8)  interrupt flag register, low 5 bits
+//   [0x02] ier            (u8)  interrupt enable register
+//   [0x03] busy           (u8)  command in progress
+//   [0x04] state          (u8)  CD_STATE_*
+//   [0x05] prev_state     (u8)
+//   [0x06] pending_cmd    (u8)
+//   [0x07] data_req       (u8)  request register bit 7
+//   [0x08] mode           (u8)
+//   [0x09] disc_type      (u8)  0=licensed, 1=audio, 2=unlicensed
+//   [0x0A] region         (u8)  0=Japan, 1=America, 2=Europe
+//   [0x0B] version        (u8)  CDR_VERSION_* index into cdrom_version_id
+//   [0x10..0x13] delay    (u32 LE) cycles until next state transition
+//   [0x14..0x17] lba      (u32 LE)
+//   [0x18..0x1B] pending_lba (u32 LE)
+//   [0x40..0x5F] param fifo (32 byte ring)
+//   [0x60] param_r        (u8)
+//   [0x61] param_w        (u8)
+//   [0x80..0x9F] response fifo (32 byte ring)
+//   [0xA0] resp_r         (u8)
+//   [0xA1] resp_w         (u8)
+//   [0xB0] cmd_pending    (u8)  set by command-write, cleared after queueing
+//
+// Data FIFO (sector buffer) is 2352 bytes and lives separately to keep
+// the header buffer small. For phase-1 boot we never push data.
+const STATE_SIZE: u32 = 256;
+
+const C_INDEX:       u32 = 0x00;
+const C_IFR:         u32 = 0x01;
+const C_IER:         u32 = 0x02;
+const C_BUSY:        u32 = 0x03;
+const C_STATE:       u32 = 0x04;
+const C_PREV_STATE:  u32 = 0x05;
+const C_PENDING_CMD: u32 = 0x06;
+const C_DATA_REQ:    u32 = 0x07;
+const C_MODE:        u32 = 0x08;
+const C_DISC_TYPE:   u32 = 0x09;
+const C_REGION:      u32 = 0x0A;
+const C_VERSION:     u32 = 0x0B;
+const C_DELAY:       u32 = 0x10;
+const C_LBA:         u32 = 0x14;
+const C_PENDING_LBA: u32 = 0x18;
+const C_HAS_DISC:    u32 = 0x1C;
+const C_CMD_PENDING: u32 = 0x1D;
+const C_PARAM_BUF:   u32 = 0x40;
+const C_PARAM_R:     u32 = 0x60;
+const C_PARAM_W:     u32 = 0x61;
+const C_RESP_BUF:    u32 = 0x80;
+const C_RESP_R:      u32 = 0xA0;
+const C_RESP_W:      u32 = 0xA1;
+
+// State machine states (psxe enum: IDLE/TX_RESP1/TX_RESP2/READ/PLAY).
+const CD_STATE_IDLE:      u32 = 0;
+const CD_STATE_TX_RESP1:  u32 = 1;
+const CD_STATE_TX_RESP2:  u32 = 2;
+const CD_STATE_READ:      u32 = 3;
+const CD_STATE_PLAY:      u32 = 4;
+
+// psxe's CD_DELAY_FR / CD_DELAY_INIT_FR — measured in CPU cycles.
+const CD_DELAY_FR:      u32 = 50401;
+const CD_DELAY_INIT_FR: u32 = 81102;
+
+// Command codes (matches CDL_* in cdrom.h).
+const CDL_GETSTAT:  u32 = 0x01;
+const CDL_SETLOC:   u32 = 0x02;
+const CDL_PAUSE:    u32 = 0x09;
+const CDL_INIT:     u32 = 0x0A;
+const CDL_MUTE:     u32 = 0x0B;
+const CDL_DEMUTE:   u32 = 0x0C;
+const CDL_SETMODE:  u32 = 0x0E;
+const CDL_SEEKL:    u32 = 0x15;
+const CDL_TEST:     u32 = 0x19;
+const CDL_GETID:    u32 = 0x1A;
+const CDL_RESET:    u32 = 0x1C;
+
+// Status byte bits (CD_STAT_*).
+const CD_STAT_PLAY:      u32 = 0x80;
+const CD_STAT_SEEK:      u32 = 0x40;
+const CD_STAT_READ:      u32 = 0x20;
+const CD_STAT_SHELLOPEN: u32 = 0x10;
+const CD_STAT_IDERROR:   u32 = 0x08;
+const CD_STAT_SEEKERROR: u32 = 0x04;
+const CD_STAT_SPINDLE:   u32 = 0x02;
+const CD_STAT_ERROR:     u32 = 0x01;
+
+// Error codes (CD_ERR_*).
+const CD_ERR_NO_DISC:          u32 = 0x80;
+const CD_ERR_INVALID_COMMAND:  u32 = 0x40;
+const CD_ERR_WRONG_PARAM_CNT:  u32 = 0x20;
+const CD_ERR_INVALID_SUBFUNC:  u32 = 0x10;
+
+pub fn cdromAlloc() *mut[] u8 {
+    var raw: *mut[] u8 = malloc(STATE_SIZE as u64);
+    memset(raw, 0, STATE_SIZE as u64);
+    // psxe defaults: version C0A (index 1 in the table), region America.
+    raw[C_VERSION] = 1;
+    raw[C_REGION] = 1;
+    raw[C_HAS_DISC] = 0;     // no disc inserted
+    return raw;
+}
+
+pub fn cdromFree(d: *mut[] u8) { free(d); }
+
+// ---------- FIFO helpers ------------------------------------------------
+
+pub fn qSize(d: *mut[] u8, rOff: u32, wOff: u32) u32 {
+    return ((d[wOff] as u32) - (d[rOff] as u32)) & 0x1F;
+}
+
+pub fn qEmpty(d: *mut[] u8, rOff: u32, wOff: u32) u32 {
+    if (d[rOff] == d[wOff]) { return 1; }
+    return 0;
+}
+
+pub fn qFull(d: *mut[] u8, rOff: u32, wOff: u32) u32 {
+    if (qSize(d, rOff, wOff) == 16) { return 1; }
+    return 0;
+}
+
+pub fn qPush(d: *mut[] u8, bufOff: u32, rOff: u32, wOff: u32, v: u32) {
+    const idx: u32 = d[wOff] as u32 & 0x1F;
+    d[bufOff + idx] = (v & 0xFF) as u8;
+    d[wOff] = ((d[wOff] as u32 + 1) & 0xFF) as u8;
+}
+
+pub fn qPop(d: *mut[] u8, bufOff: u32, rOff: u32, wOff: u32) u32 {
+    if (d[rOff] == d[wOff]) { return 0; }
+    const idx: u32 = d[rOff] as u32 & 0x1F;
+    const v: u8 = d[bufOff + idx];
+    d[rOff] = ((d[rOff] as u32 + 1) & 0xFF) as u8;
+    return v as u32;
+}
+
+pub fn qClear(d: *mut[] u8, rOff: u32, wOff: u32) {
+    d[rOff] = 0;
+    d[wOff] = 0;
+}
+
+// ---------- 32-bit field helpers ---------------------------------------
+
+pub fn cdGetU32(d: *mut[] u8, off: u32) u32 {
+    return (d[off] as u32)
+         | ((d[off + 1] as u32) << 8)
+         | ((d[off + 2] as u32) << 16)
+         | ((d[off + 3] as u32) << 24);
+}
+
+pub fn cdSetU32(d: *mut[] u8, off: u32, v: u32) {
+    d[off]     = (v        & 0xFF) as u8;
+    d[off + 1] = ((v >>  8) & 0xFF) as u8;
+    d[off + 2] = ((v >> 16) & 0xFF) as u8;
+    d[off + 3] = ((v >> 24) & 0xFF) as u8;
+}
+
+// ---------- status byte -------------------------------------------------
+
+// `cdrom_get_stat` in psxe: SPINDLE | (shell-open if no disc).
+pub fn cdromGetStat(d: *mut[] u8) u32 {
+    var s: u32 = CD_STAT_SPINDLE;
+    if (d[C_HAS_DISC] == 0) { s = s | CD_STAT_SHELLOPEN; }
+    return s;
+}
+
+// ---------- register I/O ------------------------------------------------
+
+// Read the status register (always at address 0, regardless of bank).
+// Mirrors psxe `cdrom_read_status` bit-for-bit:
+//   bit 0-1 index, bit 2 xa_playing, bit 3 param_empty, bit 4 !param_full,
+//   bit 5 !resp_empty, bit 6 !data_empty, bit 7 busy.
+// XA playback and data FIFO drain aren't implemented yet, so bits 2 and
+// 6 always read 0 — but we still construct the value using the same
+// formula psxe does so the wire format matches exactly.
+pub fn cdromReadStatus(d: *mut[] u8) u32 {
+    var r: u32 = d[C_INDEX] as u32 & 0x3;
+    // bit 2: xa_playing — always 0 (no audio implementation).
+    // bit 3: parameter FIFO empty.
+    if (qEmpty(d, C_PARAM_R, C_PARAM_W) != 0) { r = r | 0x08; }
+    // bit 4: parameter FIFO not full.
+    if (qFull(d, C_PARAM_R, C_PARAM_W) == 0)  { r = r | 0x10; }
+    // bit 5: response FIFO not empty.
+    if (qEmpty(d, C_RESP_R, C_RESP_W) == 0)   { r = r | 0x20; }
+    // bit 6: data FIFO not empty AND data_req set — always 0 here.
+    // bit 7: busy.
+    if (d[C_BUSY] != 0) { r = r | 0x80; }
+    return r;
+}
+
+pub fn cdromRead8(d: *mut[] u8, off: u32) u32 {
+    if (off == 0) { return cdromReadStatus(d); }
+    if (off == 1) {
+        return qPop(d, C_RESP_BUF, C_RESP_R, C_RESP_W);
+    }
+    if (off == 2) {
+        // Data FIFO pop — return 0 for now (no sector reads).
+        return 0;
+    }
+    if (off == 3) {
+        // Index 0/2 → IER; index 1/3 → IFR with high bits set to 0xE0.
+        const i: u32 = d[C_INDEX] as u32 & 0x3;
+        if ((i & 1) != 0) {
+            return 0xE0 | (d[C_IFR] as u32);
+        }
+        return d[C_IER] as u32;
+    }
+    return 0;
+}
+
+pub fn cdromRead16(d: *mut[] u8, off: u32) u32 {
+    // psxe asserts on 16-bit reads but falls through to two 8-bit reads.
+    return cdromRead8(d, off) | (cdromRead8(d, off + 1) << 8);
+}
+
+pub fn cdromRead32(d: *mut[] u8, off: u32) u32 {
+    return cdromRead8(d, off)
+         | (cdromRead8(d, off + 1) << 8)
+         | (cdromRead8(d, off + 2) << 16)
+         | (cdromRead8(d, off + 3) << 24);
+}
+
+pub fn cdromWrite8(d: *mut[] u8, off: u32, val: u32) {
+    const bank: u32 = (d[C_INDEX] as u32 & 0x3);
+    const slot: u32 = (bank << 2) | (off & 0x3);
+    // Slot 0/4/8/12: write index (any bank).
+    if (off == 0) {
+        d[C_INDEX] = (val & 0x3) as u8;
+        return;
+    }
+    // Bank 0
+    if (slot == 1) {
+        // Command byte — schedule state-machine entry.
+        if (d[0x1E] < 20) {
+            var fmt: []u8 = "CD cmd 0x%02X (#%u)\n";
+            printf(fmt.ptr, val & 0xFF, d[0x1E] as u32);
+            d[0x1E] = d[0x1E] + 1;
+        }
+        d[C_PENDING_CMD] = (val & 0xFF) as u8;
+        d[C_CMD_PENDING] = 1;
+        d[C_PREV_STATE]  = d[C_STATE];
+        d[C_STATE]       = CD_STATE_TX_RESP1 as u8;
+        var delay: u32 = CD_DELAY_FR;
+        if ((val & 0xFF) == CDL_INIT) { delay = CD_DELAY_INIT_FR; }
+        cdSetU32(d, C_DELAY, delay);
+        return;
+    }
+    if (slot == 2) {
+        // Push parameter byte.
+        qPush(d, C_PARAM_BUF, C_PARAM_R, C_PARAM_W, val);
+        return;
+    }
+    if (slot == 3) {
+        // Request register — bit 7 = BFRD (data req).
+        d[C_DATA_REQ] = ((val >> 7) & 1) as u8;
+        return;
+    }
+    // Bank 1
+    if (slot == 6) {
+        d[C_IER] = (val & 0x1F) as u8;
+        return;
+    }
+    if (slot == 7) {
+        // IFR ack: clear bits in IFR that are set in val (psxe also
+        // clears the parameter FIFO when bit 6 of val is set).
+        if ((val & 0x40) != 0) { qClear(d, C_PARAM_R, C_PARAM_W); }
+        d[C_IFR] = (d[C_IFR] as u32 & (~(val & 0x1F))) as u8;
+        return;
+    }
+    // Bank 2 / 3 — volume registers. Not needed for BIOS boot;
+    // silently absorb so we don't fault on writes.
+}
+
+pub fn cdromWrite16(d: *mut[] u8, off: u32, val: u32) {
+    cdromWrite8(d, off, val & 0xFF);
+    cdromWrite8(d, off + 1, (val >> 8) & 0xFF);
+}
+
+pub fn cdromWrite32(d: *mut[] u8, off: u32, val: u32) {
+    cdromWrite8(d, off, val & 0xFF);
+    cdromWrite8(d, off + 1, (val >> 8) & 0xFF);
+    cdromWrite8(d, off + 2, (val >> 16) & 0xFF);
+    cdromWrite8(d, off + 3, (val >> 24) & 0xFF);
+}
+
+// ---------- state-machine tick -----------------------------------------
+
+// cdrom_version_id table (psxe), 4 bytes per version. Index 1 = C0A.
+pub fn cdromVersionByte(v: u32, n: u32) u32 {
+    // Default to version 1 (C0A: 0x94 0x09 0x19 0xC0).
+    if (n == 0) { return 0x94; }
+    if (n == 1) { return 0x09; }
+    if (n == 2) { return 0x19; }
+    return 0xC0;
+}
+
+// Handle the command response — equivalent to psxe's
+// `cdrom_cmd_table[cmd](cdrom)` running after the TX_RESP1 delay.
+pub fn cdromExecuteCommand(d: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32) {
+    const cmd: u32 = d[C_PENDING_CMD] as u32;
+    d[C_BUSY] = 0;
+    // CdlTest is the smallest path — read the subfunction byte and
+    // respond with the 4-byte version ID for subfunc 0x20.
+    if (cmd == CDL_TEST) {
+        const subf: u32 = qPop(d, C_PARAM_BUF, C_PARAM_R, C_PARAM_W);
+        if (subf == 0x20) {
+            d[C_IFR] = 3;
+            const v: u32 = d[C_VERSION] as u32;
+            qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromVersionByte(v, 0));
+            qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromVersionByte(v, 1));
+            qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromVersionByte(v, 2));
+            qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromVersionByte(v, 3));
+            d[C_STATE] = d[C_PREV_STATE];
+            return;
+        }
+        // Other subfunctions: respond with INT5 error.
+        cdromError(d, CD_STAT_SPINDLE, CD_ERR_INVALID_SUBFUNC);
+        return;
+    }
+    // All single-INT3 status commands (Getstat / Mute / Demute /
+    // Setmode / Reset / Pause-without-disc / etc.). psxe's
+    // cdrom_cmd_getstat / mute / demute / setmode all just push a
+    // stat byte and set INT3.
+    if (cmd == CDL_GETSTAT or cmd == CDL_MUTE or cmd == CDL_DEMUTE or
+        cmd == CDL_SETMODE or cmd == CDL_RESET or cmd == CDL_PAUSE or
+        cmd == CDL_SETLOC) {
+        if (cmd == CDL_SETMODE) {
+            d[C_MODE] = qPop(d, C_PARAM_BUF, C_PARAM_R, C_PARAM_W) as u8;
+        }
+        if (cmd == CDL_SETLOC) {
+            const m: u32 = qPop(d, C_PARAM_BUF, C_PARAM_R, C_PARAM_W);
+            const s: u32 = qPop(d, C_PARAM_BUF, C_PARAM_R, C_PARAM_W);
+            const f: u32 = qPop(d, C_PARAM_BUF, C_PARAM_R, C_PARAM_W);
+            // BCD → LBA: lba = (((m*60) + s) * 75) + f - 150
+            const mB: u32 = (m & 0x0F) + ((m >> 4) & 0x0F) * 10;
+            const sB: u32 = (s & 0x0F) + ((s >> 4) & 0x0F) * 10;
+            const fB: u32 = (f & 0x0F) + ((f >> 4) & 0x0F) * 10;
+            cdSetU32(d, C_PENDING_LBA, (((mB * 60) + sB) * 75) + fB - 150);
+        }
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        d[C_STATE] = d[C_PREV_STATE];
+        return;
+    }
+    // CdlInit: psxe responds INT3+stat first, then a delayed INT2+stat.
+    // We approximate with the same two-stage protocol via TX_RESP2.
+    if (cmd == CDL_INIT) {
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        d[C_STATE] = CD_STATE_TX_RESP2 as u8;
+        cdSetU32(d, C_DELAY, CD_DELAY_INIT_FR);
+        return;
+    }
+    if (cmd == CDL_SEEKL) {
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        d[C_STATE] = CD_STATE_TX_RESP2 as u8;
+        cdSetU32(d, C_DELAY, CD_DELAY_FR);
+        return;
+    }
+    if (cmd == CDL_GETID) {
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        d[C_STATE] = CD_STATE_TX_RESP2 as u8;
+        cdSetU32(d, C_DELAY, CD_DELAY_FR);
+        return;
+    }
+    // Unknown command — invalid.
+    cdromError(d, CD_STAT_SPINDLE, CD_ERR_INVALID_COMMAND);
+}
+
+// Second-phase response for two-stage commands (Init / GetID / Seek).
+pub fn cdromExecuteResp2(d: *mut[] u8) {
+    const cmd: u32 = d[C_PENDING_CMD] as u32;
+    if (cmd == CDL_INIT) {
+        d[C_IFR] = 2;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        d[C_STATE] = CD_STATE_IDLE as u8;
+        return;
+    }
+    if (cmd == CDL_SEEKL) {
+        d[C_IFR] = 2;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        d[C_STATE] = CD_STATE_IDLE as u8;
+        return;
+    }
+    if (cmd == CDL_GETID) {
+        // No disc → INT5(0x08, 0x40, 0x00, 0x00) per psxe cdrom_cd_getid
+        // table, "Unlicensed/no disc" entry. With disc, push licensed
+        // disc info; we don't have a disc yet so always take the
+        // no-disc branch.
+        d[C_IFR] = 5;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0x08);
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0x40);
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0x00);
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0x00);
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0x00);
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0x00);
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0x00);
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0x00);
+        d[C_STATE] = CD_STATE_IDLE as u8;
+        return;
+    }
+    d[C_STATE] = CD_STATE_IDLE as u8;
+}
+
+// Emit an INT5 error response — matches psxe's cdrom_error.
+pub fn cdromError(d: *mut[] u8, stat: u32, err: u32) {
+    qClear(d, C_PARAM_R, C_PARAM_W);
+    qClear(d, C_RESP_R, C_RESP_W);
+    d[C_IFR] = 5;
+    var s: u32 = CD_STAT_ERROR | stat;
+    if ((stat & CD_STAT_IDERROR) != 0)   { s = stat; }
+    if ((stat & CD_STAT_SEEKERROR) != 0) { s = stat; }
+    qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, s);
+    qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, err);
+    d[C_PREV_STATE]  = CD_STATE_IDLE as u8;
+    d[C_STATE]       = CD_STATE_IDLE as u8;
+    d[C_PENDING_CMD] = 0;
+    d[C_BUSY]        = 0;
+}
+
+// Per-scanline tick. Mirror of psxe's psx_cdrom_update.
+pub fn cdromUpdate(d: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
+    var delay: u32 = cdGetU32(d, C_DELAY);
+    if (delay > 0) {
+        if (delay > cyc) { cdSetU32(d, C_DELAY, delay - cyc); return; }
+        cdSetU32(d, C_DELAY, 0);
+        delay = 0;
+    }
+    if (d[C_STATE] == CD_STATE_IDLE as u8) { return; }
+    if (d[C_STATE] == CD_STATE_PLAY as u8) { return; }
+    // Hold off until BIOS acks the previous INT.
+    if ((d[C_IFR] as u32 & 0x1F) != 0) {
+        cdSetU32(d, C_DELAY, 2);
+        return;
+    }
+    if (d[C_STATE] == CD_STATE_TX_RESP1 as u8) {
+        cdromExecuteCommand(d, ic, cop0);
+    } else {
+        if (d[C_STATE] == CD_STATE_TX_RESP2 as u8) {
+            cdromExecuteResp2(d);
+        }
+    }
+    // Only raise CPU IRQ if the corresponding IER bit is enabled.
+    if ((d[C_IFR] as u32 & d[C_IER] as u32 & 0x1F) == 0) { return; }
+    irqRaise(ic, cop0, IC_CDROM());
+}

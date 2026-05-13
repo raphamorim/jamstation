@@ -248,7 +248,8 @@ pub fn raiseException(c: Cpu, cop0: *mut[] u32, cause: u32) Cpu {
 pub fn cop0Rfe(cop0: *mut[] u32) {
     var sr: u32 = cop0Read(cop0, C0_SR);
     const mode: u32 = sr & 0x3F;
-    sr = (sr & 0xFFFFFFC0) | (mode >> 2);
+    // Match psxe: clear only bits 0-3, preserve bits 4-5 (old-mode pair).
+    sr = (sr & 0xFFFFFFF0) | (mode >> 2);
     cop0Write(cop0, C0_SR, sr);
 }
 
@@ -1129,6 +1130,8 @@ pub fn run(c: Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
 
 pub fn biosHook(c: Cpu, bus: Bus, regs: *mut[] u32) Cpu {
     const pcMasked: u32 = c.pc & 0x3FFFFFFF;
+    // BIOS-call trace removed — was eating ~80% of CPU time printing
+    // ~50 chars per BIOS call. Re-enable when diffing against psxe.
     if (pcMasked == 0xA0) {
         const op: u32 = gprRead(regs, 9);
         if (op == 0x09 or op == 0x3C) { putchar((gprRead(regs, 4) & 0xFF) as i32); }

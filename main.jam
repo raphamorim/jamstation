@@ -239,7 +239,13 @@ fn loadBios(path: []u8, bus: Bus) u64 {
 // Run one full NTSC frame (263 scanlines × ~2175 CPU cycles each).
 // Between scanlines we tick the timers' hblank/vblank machinery; on
 // entry to vblank (line 240) we raise IRQ 0 and notify timer 1.
-const CYCLES_PER_SCANLINE: u32 = 2175;
+// 33,868,800 Hz / 60 fps / 263 lines ≈ 2146.69 cycles. Round to 2147 so the
+// per-frame total (263 × 2147 = 564,661) stays just under the BIOS's
+// VSync-timeout threshold; with 2175 (the previous value) we were spending
+// 571,825 cycles per frame, which fires the BIOS timeout before our vblank
+// IRQ arrives and forks BIOS execution onto the "VSync: timeout" path
+// instead of the boot-animation success path.
+const CYCLES_PER_SCANLINE: u32 = 2147;
 const SCANLINES_VDRAW: u32 = 240;
 const SCANLINES_TOTAL: u32 = 263;
 
@@ -379,7 +385,7 @@ fn main() {
         // Bail after a long-but-finite session if no quit event comes —
         // protects users from a runaway window when there's no controller
         // input wired up yet.
-        if (frames > 6000) { quit = 1; }
+        if (frames > 100000) { quit = 1; }
     }
 
     var fmtState: []u8 = "Stopped after %u frames: PC=%08X SP=%08X RA=%08X cycles=%llu\n";

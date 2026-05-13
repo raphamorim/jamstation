@@ -594,6 +594,13 @@ pub fn gpuFlatTriangle(g: *mut[] u32, vram: *mut[] u8,
 // Polygon dispatcher — reads the command flags and triggers one or
 // two triangles. Handles monochrome and textured variants; gouraud
 // shading falls back to flat-shaded with the base colour.
+// Decode a shaded polygon's per-vertex colour. For shaded prims each
+// vertex has an RGB byte triple stored in the low 24 bits of a buffer
+// word; we extract by index.
+pub fn gpuShadeColor(g: *mut[] u32, idx: u32) u32 {
+    return g[idx] & 0xFFFFFF;
+}
+
 pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
     const flags: u32 = (g[0] >> 24) & 0xFF;
     const isQuad: bool = (flags & 0x08) != 0;
@@ -622,12 +629,48 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
     var uu1: u32 = 0;  var vv1: u32 = 0;
     var uu2: u32 = 0;  var vv2: u32 = 0;
     var uu3: u32 = 0;  var vv3: u32 = 0;
+    // Per-vertex shaded colours. For non-gouraud prims c0/c1/c2/c3 are
+    // identical to the base colour, which lets the rasterizer use the
+    // same code path for both.
+    var c0: u32 = g[0] & 0xFFFFFF;
+    var c1: u32 = c0;
+    var c2: u32 = c0;
+    var c3: u32 = c0;
     var clutX: u32 = 0;  var clutY: u32 = 0;
     var tpx: u32 = g[60];
     var tpy: u32 = g[61];
     var depth: u32 = g[62];
 
-    if (isTex and !isGour) {
+    // Decode the four PSX polygon-command shapes:
+    //   mono flat       buf[0]=cmd+col, buf[1..n]=xy
+    //   tex flat        buf[0]=cmd+col, then per-vert (xy, page/clut+uv)
+    //   mono shaded     buf[0]=col0+cmd, then per-vert (xy, colN+pad)
+    //   tex shaded      buf[0]=col0+cmd, then per-vert (xy, page/clut+uv, colN)
+    // The shaded textured layout matches psxe gpu_cmd_3c.
+    if (isTex and isGour) {
+        // texture + gouraud (cmd 0x34, 0x3C, 0x3E)
+        v0x = gpuVertX(g[1]); v0y = gpuVertY(g[1]);
+        uu0 = g[2] & 0xFF;  vv0 = (g[2] >> 8) & 0xFF;
+        const clut: u32 = (g[2] >> 16) & 0xFFFF;
+        clutX = (clut & 0x3F) << 4;
+        clutY = (clut >> 6) & 0x1FF;
+        c1 = g[3] & 0xFFFFFF;
+        v1x = gpuVertX(g[4]); v1y = gpuVertY(g[4]);
+        uu1 = g[5] & 0xFF;  vv1 = (g[5] >> 8) & 0xFF;
+        const page: u32 = (g[5] >> 16) & 0xFFFF;
+        tpx = (page & 0xF) << 6;
+        tpy = (page & 0x10) << 4;
+        depth = (page >> 7) & 3;
+        c2 = g[6] & 0xFFFFFF;
+        v2x = gpuVertX(g[7]); v2y = gpuVertY(g[7]);
+        uu2 = g[8] & 0xFF;  vv2 = (g[8] >> 8) & 0xFF;
+        if (isQuad) {
+            c3 = g[9] & 0xFFFFFF;
+            v3x = gpuVertX(g[10]); v3y = gpuVertY(g[10]);
+            uu3 = g[11] & 0xFF;  vv3 = (g[11] >> 8) & 0xFF;
+        }
+    } else if (isTex) {
+        // textured flat (cmd 0x24, 0x25, 0x26, 0x27, 0x2C, 0x2D, 0x2E, 0x2F)
         v0x = gpuVertX(g[1]); v0y = gpuVertY(g[1]);
         uu0 = g[2] & 0xFF;  vv0 = (g[2] >> 8) & 0xFF;
         const clut: u32 = (g[2] >> 16) & 0xFFFF;
@@ -645,18 +688,24 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
             v3x = gpuVertX(g[7]); v3y = gpuVertY(g[7]);
             uu3 = g[8] & 0xFF;  vv3 = (g[8] >> 8) & 0xFF;
         }
-    } else {
-        // Monochrome (or fall-through gouraud).
-        var off0: u32 = 1;
-        if (isGour) { off0 = 2; }
-        var stride: u32 = 1;
-        if (isGour) { stride = stride + 1; }
-        v0x = gpuVertX(g[off0]); v0y = gpuVertY(g[off0]);
-        v1x = gpuVertX(g[off0 + stride]); v1y = gpuVertY(g[off0 + stride]);
-        v2x = gpuVertX(g[off0 + 2 * stride]); v2y = gpuVertY(g[off0 + 2 * stride]);
+    } else if (isGour) {
+        // gouraud flat (cmd 0x30, 0x32, 0x38, 0x3A) — col0 already in c0
+        v0x = gpuVertX(g[1]); v0y = gpuVertY(g[1]);
+        c1  = g[2] & 0xFFFFFF;
+        v1x = gpuVertX(g[3]); v1y = gpuVertY(g[3]);
+        c2  = g[4] & 0xFFFFFF;
+        v2x = gpuVertX(g[5]); v2y = gpuVertY(g[5]);
         if (isQuad) {
-            v3x = gpuVertX(g[off0 + 3 * stride]);
-            v3y = gpuVertY(g[off0 + 3 * stride]);
+            c3  = g[6] & 0xFFFFFF;
+            v3x = gpuVertX(g[7]); v3y = gpuVertY(g[7]);
+        }
+    } else {
+        // monochrome flat (cmd 0x20, 0x22, 0x28, 0x2A)
+        v0x = gpuVertX(g[1]); v0y = gpuVertY(g[1]);
+        v1x = gpuVertX(g[2]); v1y = gpuVertY(g[2]);
+        v2x = gpuVertX(g[3]); v2y = gpuVertY(g[3]);
+        if (isQuad) {
+            v3x = gpuVertX(g[4]); v3y = gpuVertY(g[4]);
         }
     }
 
@@ -672,16 +721,16 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
         transpMode = (page >> 5) & 3;
     }
 
-    gpuRasterTri(g, vram, isTex, isRaw, isTransp, transpMode,
-        v0x, v0y, uu0, vv0,
-        v1x, v1y, uu1, vv1,
-        v2x, v2y, uu2, vv2,
+    gpuRasterTri(g, vram, isTex, isRaw, isTransp, transpMode, isGour,
+        v0x, v0y, uu0, vv0, c0,
+        v1x, v1y, uu1, vv1, c1,
+        v2x, v2y, uu2, vv2, c2,
         tpx, tpy, clutX, clutY, depth, baseColor);
     if (isQuad) {
-        gpuRasterTri(g, vram, isTex, isRaw, isTransp, transpMode,
-            v1x, v1y, uu1, vv1,
-            v2x, v2y, uu2, vv2,
-            v3x, v3y, uu3, vv3,
+        gpuRasterTri(g, vram, isTex, isRaw, isTransp, transpMode, isGour,
+            v1x, v1y, uu1, vv1, c1,
+            v2x, v2y, uu2, vv2, c2,
+            v3x, v3y, uu3, vv3, c3,
             tpx, tpy, clutX, clutY, depth, baseColor);
     }
 }
@@ -692,10 +741,10 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
 // page at the barycentric-interpolated uv.
 pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
                     isTex: bool, isRaw: bool, isTransp: bool,
-                    transpMode: u32,
-                    ax0: u32, ay0: u32, au: u32, av: u32,
-                    bx0: u32, by0: u32, bu: u32, bv: u32,
-                    cx0: u32, cy0: u32, cu: u32, cv: u32,
+                    transpMode: u32, isGour: bool,
+                    ax0: u32, ay0: u32, au: u32, av: u32, ac: u32,
+                    bx0: u32, by0: u32, bu: u32, bv: u32, bc: u32,
+                    cx0: u32, cy0: u32, cu: u32, cv: u32, cc: u32,
                     tpx: u32, tpy: u32, clutX: u32, clutY: u32,
                     depth: u32, baseColor: u32) {
     const ox: u32 = g[52];
@@ -706,9 +755,12 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
     var by: u32 = by0 + oy;
     var cx: u32 = cx0 + ox;
     var cy: u32 = cy0 + oy;
-    // UV stays unswapped when we flip winding (per psxe).
+    // UV and per-vertex colour stay paired with their vertex when we
+    // flip winding (per psxe).
     var bu2: u32 = bu;  var bv2: u32 = bv;
     var cu2: u32 = cu;  var cv2: u32 = cv;
+    var bc2: u32 = bc;
+    var cc2: u32 = cc;
 
     const area: i64 = gpuEdge(ax, ay, bx, by, cx, cy);
     if (area == 0) { return; }
@@ -718,6 +770,8 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
         const tu: u32 = bu2; const tv: u32 = bv2;
         bu2 = cu2; bv2 = cv2;
         cu2 = tu;  cv2 = tv;
+        const tc: u32 = bc2;
+        bc2 = cc2; cc2 = tc;
     }
 
     const xmin: u32 = gpuMin3(ax, bx, cx);
@@ -774,7 +828,38 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
                             color = gpuBlend(color, back, transpMode);
                         }
                     } else {
-                        color = gpuToBgr555(baseColor);
+                        // Untextured: gouraud-interpolate the three
+                        // per-vertex colours by barycentric weights, or
+                        // use the base colour if not shaded. Matches
+                        // psxe `gpu_render_triangle` shaded path, with
+                        // the same 4x4 ordered dither kernel applied
+                        // pre-clamp for gradient banding suppression.
+                        var rgb: u32 = baseColor;
+                        if (isGour) {
+                            const ar: i64 = (ac as i64) & 0xFF;
+                            const ag: i64 = ((ac as i64) >> 8) & 0xFF;
+                            const ab: i64 = ((ac as i64) >> 16) & 0xFF;
+                            const br: i64 = (bc2 as i64) & 0xFF;
+                            const bg: i64 = ((bc2 as i64) >> 8) & 0xFF;
+                            const bb: i64 = ((bc2 as i64) >> 16) & 0xFF;
+                            const cr: i64 = (cc2 as i64) & 0xFF;
+                            const cg: i64 = ((cc2 as i64) >> 8) & 0xFF;
+                            const cb: i64 = ((cc2 as i64) >> 16) & 0xFF;
+                            // Unrounded barycentric numerator (z·c sum).
+                            const nr: i64 = z0 * ar + z1 * br + z2 * cr;
+                            const ng: i64 = z0 * ag + z1 * bg + z2 * cg;
+                            const nb: i64 = z0 * ab + z1 * bb + z2 * cb;
+                            // psxe dither offset from a 4x4 kernel indexed by
+                            // (x - xmin) & 3 and (y - ymin) & 3.
+                            const dx: u32 = (x - xmin) & 3;
+                            const dy: u32 = (y - ymin) & 3;
+                            const dith: i64 = gpuDitherKernel((dy * 4) + dx);
+                            const ir: u32 = gpuSatChan(nr, absArea, dith);
+                            const ig: u32 = gpuSatChan(ng, absArea, dith);
+                            const ib: u32 = gpuSatChan(nb, absArea, dith);
+                            rgb = ir | (ig << 8) | (ib << 16);
+                        }
+                        color = gpuToBgr555(rgb);
                         if (isTransp) {
                             const back: u32 = vramReadPixel(vram,
                                 x & 0x3FF, y & 0x1FF);
@@ -793,6 +878,41 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
 pub fn gpuAbsI64(v: i64) i64 {
     if (v < 0) { return -v; }
     return v;
+}
+
+// 4x4 ordered dither kernel from psxe (`g_psx_gpu_dither_kernel`).
+// Indexed by `dy * 4 + dx` where `dx = (x - xmin) & 3`, `dy = (y - ymin) & 3`.
+// Values added to each interpolated channel before clamping reduce visible
+// banding on gouraud gradients (the BIOS's diamond logo uses this heavily).
+pub fn gpuDitherKernel(idx: u32) i64 {
+    if (idx == 0)  { return -4; }
+    if (idx == 1)  { return 0; }
+    if (idx == 2)  { return -3; }
+    if (idx == 3)  { return 1; }
+    if (idx == 4)  { return 2; }
+    if (idx == 5)  { return -2; }
+    if (idx == 6)  { return 3; }
+    if (idx == 7)  { return -1; }
+    if (idx == 8)  { return -3; }
+    if (idx == 9)  { return 1; }
+    if (idx == 10) { return -4; }
+    if (idx == 11) { return 0; }
+    if (idx == 12) { return 3; }
+    if (idx == 13) { return -1; }
+    if (idx == 14) { return 2; }
+    return -2;
+}
+
+// Saturate one shaded channel: divide the barycentric numerator by the
+// triangle area, apply the dither offset, then clamp to [0, 0xFF].
+// Match psxe's order: divide first, dither, clamp.
+pub fn gpuSatChan(num: i64, area: i64, dith: i64) u32 {
+    if (area == 0) { return 0; }
+    var quot: i64 = gpuDivClamp(num, area, 0xFFFFFFFF) as i64;
+    quot = quot + dith;
+    if (quot < 0)   { quot = 0; }
+    if (quot > 255) { quot = 255; }
+    return quot as u32;
 }
 
 // Divide an i64 dividend by a (positive) i64 divisor, clamping the
