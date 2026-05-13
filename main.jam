@@ -507,15 +507,53 @@ fn main() {
             const dy: i32 = bus.gpu[64] as i32;
             const dm: u32 = bus.gpu[47];
             printf(fpsFmt.ptr, fpsFrames, elapsed, c.pc, f1, f3, f5, dx, dy, dm);
+            // If PC has settled inside the loaded EXE, print the 6
+            // instructions around it so we can identify the wait loop.
+            if (c.pc >= 0x80010000 and c.pc < 0x80080000) {
+                var iFmt: []u8 = "  pc-24..+12: %08X %08X %08X %08X %08X %08X [PC] %08X %08X %08X %08X\n";
+                const off: u32 = c.pc & 0x001FFFFF;
+                var ram: *mut[] u8 = busRamPtr(bus);
+                printf(iFmt.ptr,
+                    readU32At(ram, off - 24),
+                    readU32At(ram, off - 20),
+                    readU32At(ram, off - 16),
+                    readU32At(ram, off - 12),
+                    readU32At(ram, off - 8),
+                    readU32At(ram, off - 4),
+                    readU32At(ram, off),
+                    readU32At(ram, off + 4),
+                    readU32At(ram, off + 8),
+                    readU32At(ram, off + 12));
+                // Musashi's wait loop dereferences a pointer stored at
+                // 0x8006CF4C — print the pointer and the byte it
+                // points to so we can identify the polled register.
+                const ptrLow: u32 = readU32At(ram, 0x6CF4C);
+                var pFmt: []u8 = "  [0x8006CF4C]=%08X  [0x8006CF90]=%08X  gpr$v0=%08X $v1=%08X $a0=%08X\n";
+                printf(pFmt.ptr, ptrLow,
+                    readU32At(ram, 0x6CF90),
+                    gprRead(regs, 2), gprRead(regs, 3), gprRead(regs, 4));
+            }
             flushAll();
             winStartMs = nowMs;
             winStartFrames = frames;
         }
-        // One-shot VRAM snapshot at ~10s in so we can inspect the
-        // current screen contents even if the process is killed before
-        // a clean exit. The end-of-run dump still fires on normal close.
+        // VRAM snapshots at key boot milestones so we can inspect each
+        // visible stage offline (SCE diamond, PS logo, BIOS shell,
+        // game-time). End-of-run dump still fires on clean close.
+        if (frames == 120) {
+            var snap: []u8 = "./vram-120.ppm";
+            dumpVramPpm(snap, vram);
+        }
+        if (frames == 300) {
+            var snap: []u8 = "./vram-300.ppm";
+            dumpVramPpm(snap, vram);
+        }
         if (frames == 600) {
-            var snap: []u8 = "./vram.ppm";
+            var snap: []u8 = "./vram-600.ppm";
+            dumpVramPpm(snap, vram);
+        }
+        if (frames == 1200) {
+            var snap: []u8 = "./vram-1200.ppm";
             dumpVramPpm(snap, vram);
         }
         // Bail after a long-but-finite session if no quit event comes —

@@ -256,7 +256,13 @@ pub fn cdromReadStatus(d: *mut[] u8) u32 {
     if (qFull(d, C_PARAM_R, C_PARAM_W) == 0)  { r = r | 0x10; }
     // bit 5: response FIFO not empty.
     if (qEmpty(d, C_RESP_R, C_RESP_W) == 0)   { r = r | 0x20; }
-    // bit 6: data FIFO not empty AND data_req set — always 0 here.
+    // bit 6: data FIFO not empty (sector data available). psxe checks
+    // `read_index != 12 + 0x924`; we equivalently compare ridx vs wend.
+    // Without this Musashi spins at 0x80045128 polling for data after
+    // the bootloader's last ReadN/Pause.
+    const rIdx: u32 = cdGetU32(d, C_DATA_RIDX);
+    const wIdx: u32 = cdGetU32(d, C_DATA_WIDX);
+    if (rIdx < wIdx) { r = r | 0x40; }
     // bit 7: busy.
     if (d[C_BUSY] != 0) { r = r | 0x80; }
     return r;

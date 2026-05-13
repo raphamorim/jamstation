@@ -219,6 +219,11 @@ pub fn gpuGp1(g: *mut[] u32, val: u32) {
     if (cmd == 0x05) {
         g[63] = val & 0x3FF;
         g[64] = (val >> 10) & 0x1FF;
+        if (g[71] < 30) {
+            var fmt: []u8 = "GP1 05 disp_area val=%08X x=%u y=%u\n";
+            printf(fmt.ptr, val, g[63], g[64]);
+            g[71] = g[71] + 1;
+        }
         return;
     }
     if (cmd == 0x06) {
