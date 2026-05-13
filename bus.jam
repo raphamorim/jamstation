@@ -18,6 +18,9 @@ const { irqRead32, irqRead16, irqRead8,
 const { timerRead32, timerRead16, timerRead8,
         timerWrite32, timerWrite16, timerWrite8, timerAlloc, timerFree } = import("timer");
 const { gteAlloc, gteFree } = import("gte");
+const { cdromRead32, cdromRead16, cdromRead8,
+        cdromWrite32, cdromWrite16, cdromWrite8,
+        cdromAlloc, cdromFree } = import("cdrom");
 
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
@@ -39,6 +42,7 @@ const Bus = struct {
     irq:   *mut[] u32,
     timer: *mut[] u32,
     gte:   *mut[] u32,
+    cdrom: *mut[] u8,
     biosLoaded: u8,
 };
 
@@ -139,6 +143,7 @@ pub fn allocBus() Bus {
         irq:   irqAlloc(),
         timer: timerAlloc(),
         gte:   gteAlloc(),
+        cdrom: cdromAlloc(),
         biosLoaded: 0,
     };
     return b;
@@ -155,6 +160,7 @@ pub fn freeBus(b: Bus) {
     irqFree(b.irq);
     timerFree(b.timer);
     gteFree(b.gte);
+    cdromFree(b.cdrom);
 }
 
 // Dispatch an IO-region address to the right device. The offset is
@@ -163,6 +169,7 @@ pub fn ioRead32(bus: Bus, off: u32) u32 {
     if (off >= 0x070 and off < 0x080) { return irqRead32(bus.irq, off - 0x070); }
     if (off >= 0x080 and off < 0x100) { return dmaRead32(bus.dma, off - 0x080); }
     if (off >= 0x100 and off < 0x130) { return timerRead32(bus.timer, off - 0x100); }
+    if (off >= 0x800 and off < 0x804) { return cdromRead32(bus.cdrom, off - 0x800); }
     if (off >= 0x810 and off < 0x818) { return gpuRead32(bus.gpu, bus.vram, off - 0x810); }
     if (off == 0x814) { return 0x1C000000; }
     if (off >= IO_SIZE) { return 0; }
@@ -173,6 +180,7 @@ pub fn ioRead16(bus: Bus, off: u32) u32 {
     if (off >= 0x070 and off < 0x080) { return irqRead16(bus.irq, off - 0x070); }
     if (off >= 0x080 and off < 0x100) { return dmaRead16(bus.dma, off - 0x080); }
     if (off >= 0x100 and off < 0x130) { return timerRead16(bus.timer, off - 0x100); }
+    if (off >= 0x800 and off < 0x804) { return cdromRead16(bus.cdrom, off - 0x800); }
     if (off >= 0x810 and off < 0x818) { return gpuRead16(bus.gpu, bus.vram, off - 0x810); }
     if (off == 0x054) { return 0x05; }
     if (off == 0x05A) { return 0; }
@@ -184,6 +192,7 @@ pub fn ioRead8(bus: Bus, off: u32) u32 {
     if (off >= 0x070 and off < 0x080) { return irqRead8(bus.irq, off - 0x070); }
     if (off >= 0x080 and off < 0x100) { return dmaRead8(bus.dma, off - 0x080); }
     if (off >= 0x100 and off < 0x130) { return timerRead8(bus.timer, off - 0x100); }
+    if (off >= 0x800 and off < 0x804) { return cdromRead8(bus.cdrom, off - 0x800); }
     if (off >= 0x810 and off < 0x818) { return gpuRead8(bus.gpu, bus.vram, off - 0x810); }
     if (off >= IO_SIZE) { return 0; }
     return bufRead8(bus.io, off);
@@ -197,6 +206,7 @@ pub fn ioWrite32(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     if (off >= 0x070 and off < 0x080) { irqWrite32(bus.irq, cop0, off - 0x070, val); return; }
     if (off >= 0x080 and off < 0x100) { dmaWrite32(bus.dma, bus, off - 0x080, val); return; }
     if (off >= 0x100 and off < 0x130) { timerWrite32(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
+    if (off >= 0x800 and off < 0x804) { cdromWrite32(bus.cdrom, off - 0x800, val); return; }
     if (off >= 0x810 and off < 0x818) { gpuWrite32(bus.gpu, bus.vram, off - 0x810, val); return; }
     if (off >= IO_SIZE) { return; }
     bufWrite32(bus.io, off, val);
@@ -206,6 +216,7 @@ pub fn ioWrite16(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     if (off >= 0x070 and off < 0x080) { irqWrite16(bus.irq, cop0, off - 0x070, val); return; }
     if (off >= 0x080 and off < 0x100) { dmaWrite16(bus.dma, bus, off - 0x080, val); return; }
     if (off >= 0x100 and off < 0x130) { timerWrite16(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
+    if (off >= 0x800 and off < 0x804) { cdromWrite16(bus.cdrom, off - 0x800, val); return; }
     if (off >= 0x810 and off < 0x818) { gpuWrite16(bus.gpu, bus.vram, off - 0x810, val); return; }
     if (off >= IO_SIZE) { return; }
     bufWrite16(bus.io, off, val);
@@ -215,6 +226,7 @@ pub fn ioWrite8(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     if (off >= 0x070 and off < 0x080) { irqWrite8(bus.irq, cop0, off - 0x070, val); return; }
     if (off >= 0x080 and off < 0x100) { dmaWrite8(bus.dma, bus, off - 0x080, val); return; }
     if (off >= 0x100 and off < 0x130) { timerWrite8(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
+    if (off >= 0x800 and off < 0x804) { cdromWrite8(bus.cdrom, off - 0x800, val); return; }
     if (off >= 0x810 and off < 0x818) { gpuWrite8(bus.gpu, bus.vram, off - 0x810, val); return; }
     if (off >= IO_SIZE) { return; }
     bufWrite8(bus.io, off, val);

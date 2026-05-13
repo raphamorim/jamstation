@@ -32,6 +32,7 @@ const { irqAlloc } = import("irq");
 const { timerAlloc } = import("timer");
 const { gteAlloc, gteDataRead, gteDataWrite,
         gteCtrlRead, gteCtrlWrite, gteExec } = import("gte");
+const { cdromAlloc } = import("cdrom");
 
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
@@ -50,6 +51,7 @@ const Bus = struct {
     irq:   *mut[] u32,
     timer: *mut[] u32,
     gte:   *mut[] u32,
+    cdrom: *mut[] u8,
     biosLoaded: u8,
 };
 

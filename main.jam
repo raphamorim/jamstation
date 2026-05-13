@@ -18,6 +18,7 @@ const {
 // Force device modules into main.jam's codegen context.
 const { gpuAlloc, gpuUpdate, gpuFamilyCount } = import("gpu");
 const { gteAlloc } = import("gte");
+const { cdromAlloc, cdromUpdate } = import("cdrom");
 const { dmaAlloc, dmaUpdate } = import("dma");
 const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
 const {
@@ -94,6 +95,7 @@ const Bus = struct {
     irq:   *mut[] u32,
     timer: *mut[] u32,
     gte:   *mut[] u32,
+    cdrom: *mut[] u8,
     biosLoaded: u8,
 };
 
@@ -254,6 +256,7 @@ fn runOneFrame(c: Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
         // even fires.
         timerUpdateCyc(bus.timer, bus.irq, cop0, CYCLES_PER_SCANLINE);
         dmaUpdate(bus.dma, bus.irq, cop0);
+        cdromUpdate(bus.cdrom, bus.irq, cop0, CYCLES_PER_SCANLINE);
         timerHblankBegin(bus.timer, bus.irq, cop0);
         timerHblankEnd(bus.timer);
         if (line == SCANLINES_VDRAW) {

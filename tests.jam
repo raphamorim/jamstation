@@ -24,6 +24,7 @@ const {
 // allocBus body (which calls gpuAlloc / dmaAlloc / etc.) resolves.
 const { gpuAlloc } = import("gpu");
 const { gteAlloc } = import("gte");
+const { cdromAlloc } = import("cdrom");
 const { dmaAlloc } = import("dma");
 const { irqAlloc } = import("irq");
 const { timerAlloc } = import("timer");
@@ -44,6 +45,7 @@ const Bus = struct {
     irq:   *mut[] u32,
     timer: *mut[] u32,
     gte:   *mut[] u32,
+    cdrom: *mut[] u8,
     biosLoaded: u8,
 };
 
