@@ -1,0 +1,87 @@
+// CD-ROM disc image (Mode2/2352 .bin reader).
+//
+// Owns a `FILE*` handle to the data track and exposes one operation —
+// `discRead(disc, lba, buf)` — that reads one 2352-byte sector at the
+// requested LBA. The CD-ROM controller in `cdrom.jam` calls into this
+// during the `CdlReadN` / `CdlReadS` state machine.
+//
+// LBA convention follows the PSX BIOS / psxe:
+//   LBA = 150 → start of track 1 data (00:02:00 on the disc)
+//   LBA = 150 + N → Nth sector of the data track in the .bin file
+// We subtract the 150-sector lead-in when seeking inside the .bin —
+// real discs prefix the data with 2 seconds (150 sectors) of pregap
+// that's not part of the image file.
+//
+// The .cue file isn't parsed here — for now we open the .bin path
+// directly. Multi-track / audio reads will need a CUE parser later
+// (Brave Fencer Musashi has three CDDA tracks after the data track,
+// but those only matter for music playback which we don't have).
+
+pub extern fn malloc(size: u64) *mut[] u8;
+pub extern fn free(ptr: *mut[] u8);
+pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+pub extern fn fopen(path: *const[] u8, mode: *const[] u8) *mut[] u8;
+pub extern fn fclose(file: *mut[] u8) i32;
+pub extern fn fread(buf: *mut[] u8, size: u64, n: u64, file: *mut[] u8) u64;
+pub extern fn fseek(file: *mut[] u8, off: i64, whence: i32) i32;
+pub extern fn printf(format: *const[] u8, ...) i32;
+pub extern fn access(path: *const[] u8, mode: i32) i32;
+
+const SECTOR_SIZE: u32 = 2352;
+const LEAD_IN_SECTORS: u32 = 150;
+
+const Disc = struct {
+    file: *mut[] u8,   // libc FILE* (opaque)
+    loaded: u8,        // 1 once discOpen succeeds
+    pad0: u8,
+    pad1: u8,
+    pad2: u8,
+};
+
+pub fn discAlloc() *mut[] Disc {
+    var raw: *mut[] u8 = malloc(16);
+    memset(raw, 0, 16);
+    return raw as *mut[] Disc;
+}
+
+pub fn discFree(d: *mut[] Disc) {
+    if (d[0].loaded != 0) { fclose(d[0].file); }
+    free(d as *mut[] u8);
+}
+
+// Open `path` as the Mode2/2352 .bin for track 1. Returns 1 on success.
+pub fn discOpen(d: *mut[] Disc, path: []u8) i32 {
+    // access() with mode=4 checks read permission; we use it as a
+    // null-pointer-free way to validate the path before fopen, since
+    // Jam currently can't cast `*mut[] u8` to an integer for NULL checks.
+    if (access(path.ptr, 4) != 0) { return 0; }
+    var mode: []u8 = "rb";
+    var f: *mut[] u8 = fopen(path.ptr, mode.ptr);
+    d[0].file = f;
+    d[0].loaded = 1;
+    var fmt: []u8 = "Opened disc image: %s\n";
+    printf(fmt.ptr, path.ptr);
+    return 1;
+}
+
+// Read one 2352-byte sector at `lba` (absolute, including lead-in) into
+// `buf`. Returns 1 on success, 0 on out-of-range or no-disc.
+pub fn discRead(d: *mut[] Disc, lba: u32, buf: *mut[] u8) i32 {
+    if (d[0].loaded == 0) { return 0; }
+    if (lba < LEAD_IN_SECTORS) {
+        // Pre-gap: real CDs have 2 sec of silence here; we return zeros
+        // so the BIOS sees a "blank" sector and doesn't fault.
+        memset(buf, 0, SECTOR_SIZE as u64);
+        return 1;
+    }
+    const off: i64 = ((lba - LEAD_IN_SECTORS) as i64) * (SECTOR_SIZE as i64);
+    fseek(d[0].file, off, 0);
+    const got: u64 = fread(buf, 1, SECTOR_SIZE as u64, d[0].file);
+    if (got != SECTOR_SIZE as u64) { return 0; }
+    return 1;
+}
+
+pub fn discLoaded(d: *mut[] Disc) i32 {
+    if (d[0].loaded == 0) { return 0; }
+    return 1;
+}

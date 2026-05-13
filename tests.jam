@@ -25,7 +25,9 @@ const {
 const { gpuAlloc } = import("gpu");
 const { gteAlloc } = import("gte");
 const { cdromAlloc } = import("cdrom");
+const { discAlloc } = import("disc");
 const { dmaAlloc } = import("dma");
+const { padAlloc } = import("pad");
 const { irqAlloc } = import("irq");
 const { timerAlloc } = import("timer");
 
@@ -34,6 +36,14 @@ const SR_BEV: u32 = 0x00400000;
 
 // Re-declare the same shapes as bus.jam / cpu.jam — structural equality
 // lets us pass values across module boundaries.
+const Disc = struct {
+    file: *mut[] u8,
+    loaded: u8,
+    pad0: u8,
+    pad1: u8,
+    pad2: u8,
+};
+
 const Bus = struct {
     ram:  *mut[] u8,
     bios: *mut[] u8,
@@ -46,6 +56,8 @@ const Bus = struct {
     timer: *mut[] u32,
     gte:   *mut[] u32,
     cdrom: *mut[] u8,
+    disc:  *mut[] Disc,
+    pad:   *mut[] u8,
     biosLoaded: u8,
 };
 

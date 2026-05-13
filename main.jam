@@ -18,8 +18,10 @@ const {
 // Force device modules into main.jam's codegen context.
 const { gpuAlloc, gpuUpdate, gpuFamilyCount } = import("gpu");
 const { gteAlloc } = import("gte");
-const { cdromAlloc, cdromUpdate } = import("cdrom");
+const { cdromAlloc, cdromUpdate, cdromAttachDisc } = import("cdrom");
+const { discAlloc, discOpen } = import("disc");
 const { dmaAlloc, dmaUpdate } = import("dma");
+const { padAlloc, padUpdate } = import("pad");
 const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
 const {
     timerAlloc, timerUpdate, timerUpdateCyc,
@@ -52,6 +54,7 @@ extern fn fread(buf: *mut[] u8, size: u64, n: u64, file: *mut[] u8) u64;
 extern fn fseek(file: *mut[] u8, off: i64, whence: i32) i32;
 extern fn access(path: *const[] u8, mode: i32) i32;
 extern fn fflush(stream: u64) i32;
+extern fn fwrite(buf: *const[] u8, size: u64, n: u64, file: *mut[] u8) u64;
 
 // SDL2 externs need to be re-declared here so the codegen for sdl.jam's
 // pub wrappers (which lives in this module's compilation context) can
@@ -84,6 +87,14 @@ fn fileExists(path: []u8) bool {
 }
 
 // Locally-redeclared shapes matching bus.jam / cpu.jam / sdl.jam.
+const Disc = struct {
+    file: *mut[] u8,
+    loaded: u8,
+    pad0: u8,
+    pad1: u8,
+    pad2: u8,
+};
+
 const Bus = struct {
     ram:  *mut[] u8,
     bios: *mut[] u8,
@@ -96,6 +107,8 @@ const Bus = struct {
     timer: *mut[] u32,
     gte:   *mut[] u32,
     cdrom: *mut[] u8,
+    disc:  *mut[] Disc,
+    pad:   *mut[] u8,
     biosLoaded: u8,
 };
 
@@ -258,7 +271,8 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         // even fires.
         timerUpdateCyc(bus.timer, bus.irq, cop0, CYCLES_PER_SCANLINE);
         dmaUpdate(bus.dma, bus.irq, cop0);
-        cdromUpdate(bus.cdrom, bus.irq, cop0, CYCLES_PER_SCANLINE);
+        cdromUpdate(bus.cdrom, bus.disc, bus.irq, cop0, CYCLES_PER_SCANLINE);
+        padUpdate(bus.pad, bus.irq, cop0, CYCLES_PER_SCANLINE);
         timerHblankBegin(bus.timer, bus.irq, cop0);
         timerHblankEnd(bus.timer);
         if (line == SCANLINES_VDRAW) {
@@ -275,6 +289,43 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
 // (the prime helper is gone; main() inlines a memset for now since the
 //  gradient version is too slow in unoptimized builds — see issue
 //  notes in the README.)
+
+// Dump the full 1024x512 VRAM as a binary PPM (P6 / 24-bit RGB) at
+// `path`. BGR555 → RGB888 expansion is done inline so the output is
+// viewable with any image viewer. Used as an end-of-run diagnostic so
+// we can confirm what the BIOS/game actually rendered without staring
+// at the SDL window.
+fn dumpVramPpm(path: []u8, vram: *mut[] u8) {
+    var modeWb: []u8 = "wb";
+    var f: *mut[] u8 = fopen(path.ptr, modeWb.ptr);
+    var hdr: []u8 = "P6\n1024 512\n255\n";
+    fwrite(hdr.ptr, 1, hdr.len, f);
+    var row: *mut[] u8 = malloc(1024 * 3);
+    var y: u32 = 0;
+    while (y < 512) {
+        var x: u32 = 0;
+        while (x < 1024) {
+            const off: u32 = (y * 1024 + x) * 2;
+            const lo: u32 = vram[off] as u32;
+            const hi: u32 = vram[off + 1] as u32;
+            const px: u32 = lo | (hi << 8);
+            const r: u32 = ((px      ) & 0x1F) << 3;
+            const g: u32 = ((px >> 5 ) & 0x1F) << 3;
+            const b: u32 = ((px >> 10) & 0x1F) << 3;
+            const di: u32 = x * 3;
+            row[di]     = r as u8;
+            row[di + 1] = g as u8;
+            row[di + 2] = b as u8;
+            x = x + 1;
+        }
+        fwrite(row, 1, 1024 * 3, f);
+        y = y + 1;
+    }
+    free(row);
+    fclose(f);
+    var msg: []u8 = "Wrote VRAM dump: %s\n";
+    printf(msg.ptr, path.ptr);
+}
 
 // ---------- main --------------------------------------------------------
 
@@ -315,7 +366,17 @@ fn main() {
     // psxe uses for the same handoff).
     var demoPath: []u8 = "./demo.exe";
     var gamePath: []u8 = "./game.exe";
+    var discPath: []u8 = "./game.bin";
     var pendingGameExe: bool = false;
+    // Attach a CD-ROM image at ./game.bin if present so the BIOS shell
+    // can read sectors via CdlReadN — this is the path that lets the
+    // BIOS bootstrap a real PS-X EXE off the disc instead of needing
+    // game.exe to be extracted manually.
+    if (fileExists(discPath)) {
+        if (discOpen(bus.disc, discPath) != 0) {
+            cdromAttachDisc(bus.cdrom, bus.disc);
+        }
+    }
     if (fileExists(demoPath)) {
         loadExe(demoPath, bus, regs, c);
         flushAll();
@@ -375,16 +436,42 @@ fn main() {
     // the SDL window close to flush state.
     var winStartMs: u32 = SDL_GetTicks();
     var winStartFrames: u32 = 0;
+    // Idle-loop fallback for game.exe — when no disc is attached the
+    // BIOS shell renders, then sits in its main poll loop forever.
+    // We detect "BIOS finished drawing" by watching the GPU polygon
+    // counter: once it's been stable for ~3s of wall-clock with at
+    // least some content drawn, we sideload game.exe.
+    var idleFrames: u32 = 0;
+    var lastPoly: u32 = 0;
+    const IDLE_TRIGGER: u32 = 180;     // ~3s at 60 fps
+    const MIN_POLY_DRAWN: u32 = 200;   // boot animation + shell minimum
     while (quit == 0) {
-        // Game-EXE side-load. Trigger once when PC enters the BIOS shell
-        // region (0x80030000-0x80030FFF). We check by range because a
-        // per-frame poll misses the exact transit through 0x80030000
-        // — the shell entry is reached for one instruction then control
-        // moves on.
+        // Game-EXE side-load. Two trigger paths:
+        //   1. BIOS jumps to 0x80030000 (real-disc boot handoff).
+        //   2. BIOS shell is parked at the kernel idle loop with no disc;
+        //      after IDLE_TRIGGER frames stuck there we sideload.
         if (pendingGameExe and c.pc >= 0x80030000 and c.pc < 0x80031000) {
             loadExe(gamePath, bus, regs, c);
             pendingGameExe = false;
+            idleFrames = 0;
             flushAll();
+        }
+        if (pendingGameExe) {
+            const curPoly: u32 = gpuFamilyCount(bus.gpu, 1);
+            if (curPoly == lastPoly and curPoly >= MIN_POLY_DRAWN) {
+                idleFrames = idleFrames + 1;
+                if (idleFrames >= IDLE_TRIGGER) {
+                    var msg: []u8 = "BIOS shell idle — sideloading game.exe fallback\n";
+                    write(STDOUT, msg.ptr, msg.len);
+                    loadExe(gamePath, bus, regs, c);
+                    pendingGameExe = false;
+                    idleFrames = 0;
+                    flushAll();
+                }
+            } else {
+                idleFrames = 0;
+                lastPoly = curPoly;
+            }
         }
         runOneFrame(c, bus, regs, cop0);
         var vram: *mut[] u8 = busVramPtr(bus);
@@ -411,11 +498,25 @@ fn main() {
         if (nowMs - winStartMs >= 1000) {
             const fpsFrames: u32 = frames - winStartFrames;
             const elapsed: u32 = nowMs - winStartMs;
-            var fpsFmt: []u8 = "[fps] %u frames in %u ms (%llu cycles total)\n";
-            printf(fpsFmt.ptr, fpsFrames, elapsed, c.cycles);
+            const f1: u32 = gpuFamilyCount(bus.gpu, 1);   // polygons
+            const f2: u32 = gpuFamilyCount(bus.gpu, 2);   // lines
+            const f3: u32 = gpuFamilyCount(bus.gpu, 3);   // rects
+            const f5: u32 = gpuFamilyCount(bus.gpu, 5);   // CPU→VRAM blits
+            var fpsFmt: []u8 = "[fps] %u f/%ums PC=%08X gp:poly=%u rect=%u blit=%u disp=(%d,%d) dm=%08X\n";
+            const dx: i32 = bus.gpu[63] as i32;
+            const dy: i32 = bus.gpu[64] as i32;
+            const dm: u32 = bus.gpu[47];
+            printf(fpsFmt.ptr, fpsFrames, elapsed, c.pc, f1, f3, f5, dx, dy, dm);
             flushAll();
             winStartMs = nowMs;
             winStartFrames = frames;
+        }
+        // One-shot VRAM snapshot at ~10s in so we can inspect the
+        // current screen contents even if the process is killed before
+        // a clean exit. The end-of-run dump still fires on normal close.
+        if (frames == 600) {
+            var snap: []u8 = "./vram.ppm";
+            dumpVramPpm(snap, vram);
         }
         // Bail after a long-but-finite session if no quit event comes —
         // protects users from a runaway window when there's no controller
@@ -426,6 +527,11 @@ fn main() {
     var fmtState: []u8 = "Stopped after %u frames: PC=%08X SP=%08X RA=%08X cycles=%llu\n";
     printf(fmtState.ptr, frames,
         c.pc, gprRead(regs, 29), gprRead(regs, 31), c.cycles);
+
+    // Snapshot VRAM so we can see what's on the BIOS / game screen even
+    // when SDL window inspection isn't available.
+    var dumpPath: []u8 = "./vram.ppm";
+    dumpVramPpm(dumpPath, busVramPtr(bus));
 
     sdlQuit(sdl);
     freeRegFile(regs);

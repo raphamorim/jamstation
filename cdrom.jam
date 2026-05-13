@@ -34,6 +34,17 @@ pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 pub extern fn printf(format: *const[] u8, ...) i32;
 
 const { irqRaise, IC_CDROM } = import("irq");
+const { discRead, discLoaded } = import("disc");
+
+// Disc struct redeclaration (same shape as disc.jam) so we can hold a
+// `*mut[] Disc` pointer here without an explicit Disc import.
+const Disc = struct {
+    file: *mut[] u8,
+    loaded: u8,
+    pad0: u8,
+    pad1: u8,
+    pad2: u8,
+};
 
 // State block — single u8 buffer with byte offsets. Total ~256 bytes.
 //
@@ -60,9 +71,10 @@ const { irqRaise, IC_CDROM } = import("irq");
 //   [0xA1] resp_w         (u8)
 //   [0xB0] cmd_pending    (u8)  set by command-write, cleared after queueing
 //
-// Data FIFO (sector buffer) is 2352 bytes and lives separately to keep
-// the header buffer small. For phase-1 boot we never push data.
-const STATE_SIZE: u32 = 256;
+// Header (0x00..0xFF) + data FIFO (0x100..0xA50, 2352 bytes for one
+// Mode2/2352 sector). 2880 bytes round.
+const STATE_SIZE: u32 = 2880;
+const SECTOR_BYTES: u32 = 2352;
 
 const C_INDEX:       u32 = 0x00;
 const C_IFR:         u32 = 0x01;
@@ -76,17 +88,27 @@ const C_MODE:        u32 = 0x08;
 const C_DISC_TYPE:   u32 = 0x09;
 const C_REGION:      u32 = 0x0A;
 const C_VERSION:     u32 = 0x0B;
+const C_READ_ONGOING: u32 = 0x0C;   // set while the sector pump is active
 const C_DELAY:       u32 = 0x10;
 const C_LBA:         u32 = 0x14;
 const C_PENDING_LBA: u32 = 0x18;
 const C_HAS_DISC:    u32 = 0x1C;
 const C_CMD_PENDING: u32 = 0x1D;
+const C_DATA_RIDX:   u32 = 0x20;    // u32 LE — data FIFO read cursor
+const C_DATA_WIDX:   u32 = 0x24;    // u32 LE — data FIFO write cursor
 const C_PARAM_BUF:   u32 = 0x40;
 const C_PARAM_R:     u32 = 0x60;
 const C_PARAM_W:     u32 = 0x61;
 const C_RESP_BUF:    u32 = 0x80;
 const C_RESP_R:      u32 = 0xA0;
 const C_RESP_W:      u32 = 0xA1;
+const C_DATA_BUF:    u32 = 0x100;   // 2352-byte sector data
+
+// Disc pointer stored at the end of the header (offset 0xE0..0xEF, 16
+// bytes of pointer slop). Set by cdromAttachDisc, consumed by the read
+// state machine. Stored as raw bytes so the slice cast survives Jam's
+// type system.
+const C_DISC_PTR:    u32 = 0xE0;
 
 // State machine states (psxe enum: IDLE/TX_RESP1/TX_RESP2/READ/PLAY).
 const CD_STATE_IDLE:      u32 = 0;
@@ -95,18 +117,27 @@ const CD_STATE_TX_RESP2:  u32 = 2;
 const CD_STATE_READ:      u32 = 3;
 const CD_STATE_PLAY:      u32 = 4;
 
-// psxe's CD_DELAY_FR / CD_DELAY_INIT_FR — measured in CPU cycles.
-const CD_DELAY_FR:      u32 = 50401;
-const CD_DELAY_INIT_FR: u32 = 81102;
+// psxe's CD_DELAY_FR / CD_DELAY_INIT_FR / CD_DELAY_READ_* (measured in
+// CPU cycles).  Single-speed reads = 33,868,800/75 cycles per sector.
+const CD_DELAY_FR:        u32 = 50401;
+const CD_DELAY_INIT_FR:   u32 = 81102;
+const CD_DELAY_READ_SS:   u32 = 451584;     // 33_868_800 / 75
+const CD_DELAY_READ_DS:   u32 = 225792;     // 33_868_800 / (2*75)
 
 // Command codes (matches CDL_* in cdrom.h).
 const CDL_GETSTAT:  u32 = 0x01;
 const CDL_SETLOC:   u32 = 0x02;
+const CDL_READN:    u32 = 0x06;
 const CDL_PAUSE:    u32 = 0x09;
 const CDL_INIT:     u32 = 0x0A;
 const CDL_MUTE:     u32 = 0x0B;
 const CDL_DEMUTE:   u32 = 0x0C;
 const CDL_SETMODE:  u32 = 0x0E;
+const CDL_READS:    u32 = 0x1B;
+
+// MODE register bits.
+const MODE_SECTOR_SIZE: u32 = 0x20;   // 0 = 0x800 payload, 1 = 0x924 raw
+const MODE_SPEED:       u32 = 0x80;   // 0 = 1x, 1 = 2x
 const CDL_SEEKL:    u32 = 0x15;
 const CDL_TEST:     u32 = 0x19;
 const CDL_GETID:    u32 = 0x1A;
@@ -139,6 +170,13 @@ pub fn cdromAlloc() *mut[] u8 {
 }
 
 pub fn cdromFree(d: *mut[] u8) { free(d); }
+
+// Mark a disc as present on the controller. The actual `Disc` pointer
+// is threaded through cdromUpdate per-frame (Jam doesn't currently
+// support stashing typed-slice pointers inside a u8 buffer via casts).
+pub fn cdromAttachDisc(d: *mut[] u8, disc: *mut[] Disc) {
+    if (discLoaded(disc) != 0) { d[C_HAS_DISC] = 1; }
+}
 
 // ---------- FIFO helpers ------------------------------------------------
 
@@ -230,8 +268,8 @@ pub fn cdromRead8(d: *mut[] u8, off: u32) u32 {
         return qPop(d, C_RESP_BUF, C_RESP_R, C_RESP_W);
     }
     if (off == 2) {
-        // Data FIFO pop — return 0 for now (no sector reads).
-        return 0;
+        // Data FIFO pop — current sector buffer position advances by 1.
+        return cdromReadData(d);
     }
     if (off == 3) {
         // Index 0/2 → IER; index 1/3 → IFR with high bits set to 0xE0.
@@ -354,12 +392,10 @@ pub fn cdromExecuteCommand(d: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32) {
         return;
     }
     // All single-INT3 status commands (Getstat / Mute / Demute /
-    // Setmode / Reset / Pause-without-disc / etc.). psxe's
-    // cdrom_cmd_getstat / mute / demute / setmode all just push a
-    // stat byte and set INT3.
+    // Setmode / Reset / etc.). psxe's cdrom_cmd_getstat / mute /
+    // demute / setmode all just push a stat byte and set INT3.
     if (cmd == CDL_GETSTAT or cmd == CDL_MUTE or cmd == CDL_DEMUTE or
-        cmd == CDL_SETMODE or cmd == CDL_RESET or cmd == CDL_PAUSE or
-        cmd == CDL_SETLOC) {
+        cmd == CDL_SETMODE or cmd == CDL_RESET or cmd == CDL_SETLOC) {
         if (cmd == CDL_SETMODE) {
             d[C_MODE] = qPop(d, C_PARAM_BUF, C_PARAM_R, C_PARAM_W) as u8;
         }
@@ -371,11 +407,29 @@ pub fn cdromExecuteCommand(d: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32) {
             const mB: u32 = (m & 0x0F) + ((m >> 4) & 0x0F) * 10;
             const sB: u32 = (s & 0x0F) + ((s >> 4) & 0x0F) * 10;
             const fB: u32 = (f & 0x0F) + ((f >> 4) & 0x0F) * 10;
-            cdSetU32(d, C_PENDING_LBA, (((mB * 60) + sB) * 75) + fB - 150);
+            const lba: u32 = (((mB * 60) + sB) * 75) + fB - 150;
+            cdSetU32(d, C_PENDING_LBA, lba);
+            if (d[0x1E] < 40) {
+                var fmt: []u8 = "CD SetLoc m=%02X s=%02X f=%02X -> LBA=%u\n";
+                printf(fmt.ptr, m, s, f, lba);
+            }
         }
         d[C_IFR] = 3;
         qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
         d[C_STATE] = d[C_PREV_STATE];
+        return;
+    }
+    // CdlPause is two-phase like CdlInit. First INT3+stat, then after a
+    // delay INT2+STAT_SPINDLE and a hard reset of read state. The
+    // critical fix vs the single-INT3 path: prev_state gets set to
+    // IDLE here so we don't bounce back to READ when the BIOS issues
+    // its next command. Without this Musashi stalls after the first
+    // ReadN/Pause pair.
+    if (cmd == CDL_PAUSE) {
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        d[C_STATE] = CD_STATE_TX_RESP2 as u8;
+        cdSetU32(d, C_DELAY, CD_DELAY_FR);
         return;
     }
     // CdlInit: psxe responds INT3+stat first, then a delayed INT2+stat.
@@ -401,11 +455,41 @@ pub fn cdromExecuteCommand(d: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32) {
         cdSetU32(d, C_DELAY, CD_DELAY_FR);
         return;
     }
+    // CdlReadN / CdlReadS — kick off sector-streaming. psxe sends an
+    // INT3+stat ack immediately, then enters CD_STATE_READ which fires
+    // INT1+stat per sector on a 1x/2x delay schedule.
+    if (cmd == CDL_READN or cmd == CDL_READS) {
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        cdromProcessSetloc(d);
+        d[C_STATE]      = CD_STATE_READ as u8;
+        d[C_PREV_STATE] = CD_STATE_READ as u8;
+        d[C_READ_ONGOING] = 1;
+        cdSetU32(d, C_DELAY, cdromReadDelay(d));
+        return;
+    }
     // Unknown command — invalid.
     cdromError(d, CD_STAT_SPINDLE, CD_ERR_INVALID_COMMAND);
 }
 
-// Second-phase response for two-stage commands (Init / GetID / Seek).
+// Move the staged Setloc target into the current LBA (psxe's
+// cdrom_process_setloc — only commits if pending_lba was actually set
+// after the last commit).
+pub fn cdromProcessSetloc(d: *mut[] u8) {
+    const pending: u32 = cdGetU32(d, C_PENDING_LBA);
+    if (pending == 0) { return; }
+    cdSetU32(d, C_LBA, pending);
+    cdSetU32(d, C_PENDING_LBA, 0);
+}
+
+// CD_DELAY_READ_SS / DS depending on mode bit 7 (1x vs 2x speed).
+pub fn cdromReadDelay(d: *mut[] u8) u32 {
+    if ((d[C_MODE] as u32 & MODE_SPEED) != 0) { return CD_DELAY_READ_DS; }
+    return CD_DELAY_READ_SS;
+}
+
+// Second-phase response for two-stage commands (Init / GetID / Seek /
+// Pause).
 pub fn cdromExecuteResp2(d: *mut[] u8) {
     const cmd: u32 = d[C_PENDING_CMD] as u32;
     if (cmd == CDL_INIT) {
@@ -420,11 +504,42 @@ pub fn cdromExecuteResp2(d: *mut[] u8) {
         d[C_STATE] = CD_STATE_IDLE as u8;
         return;
     }
+    if (cmd == CDL_PAUSE) {
+        // Mirror psxe's cdrom_pause: hard reset to IDLE, clear all
+        // streaming flags, INT2 response with just SPINDLE in the stat
+        // byte (no READ / PLAY).
+        d[C_IFR] = 2;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, CD_STAT_SPINDLE);
+        d[C_STATE]        = CD_STATE_IDLE as u8;
+        d[C_PREV_STATE]   = CD_STATE_IDLE as u8;
+        d[C_PENDING_CMD]  = 0;
+        d[C_BUSY]         = 0;
+        d[C_READ_ONGOING] = 0;
+        return;
+    }
     if (cmd == CDL_GETID) {
-        // No disc → INT5(0x08, 0x40, 0x00, 0x00) per psxe cdrom_cd_getid
-        // table, "Unlicensed/no disc" entry. With disc, push licensed
-        // disc info; we don't have a disc yet so always take the
-        // no-disc branch.
+        // With a real disc attached, return the licensed signature
+        // (psxe `cdrom_cd_getid` table entry for CDT_LICENSED), then
+        // "SCEA" (or region-appropriate) ASCII. Without a disc, fall
+        // back to the unlicensed/no-disc INT5 error so the BIOS shell
+        // displays the "Please insert PlayStation CD-ROM" screen.
+        if (d[C_HAS_DISC] != 0) {
+            d[C_IFR] = 2;
+            qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0x02);   // licensed flag
+            qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0x00);
+            qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0x20);   // disc type = data
+            qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0x00);
+            qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0x53);   // 'S'
+            qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0x43);   // 'C'
+            qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0x45);   // 'E'
+            // Region letter — d[C_REGION] is 0=J/1=A/2=E.
+            var region: u32 = 0x41;     // 'A'
+            if (d[C_REGION] == 0) { region = 0x49; }     // 'I'
+            if (d[C_REGION] == 2) { region = 0x45; }     // 'E'
+            qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, region);
+            d[C_STATE] = CD_STATE_IDLE as u8;
+            return;
+        }
         d[C_IFR] = 5;
         qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0x08);
         qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0x40);
@@ -456,8 +571,10 @@ pub fn cdromError(d: *mut[] u8, stat: u32, err: u32) {
     d[C_BUSY]        = 0;
 }
 
-// Per-scanline tick. Mirror of psxe's psx_cdrom_update.
-pub fn cdromUpdate(d: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
+// Per-scanline tick. Mirror of psxe's psx_cdrom_update. `disc` is the
+// attached image (may have loaded == 0 when there's no .bin/.cue).
+pub fn cdromUpdate(d: *mut[] u8, disc: *mut[] Disc,
+                   ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
     var delay: u32 = cdGetU32(d, C_DELAY);
     if (delay > 0) {
         if (delay > cyc) { cdSetU32(d, C_DELAY, delay - cyc); return; }
@@ -473,12 +590,80 @@ pub fn cdromUpdate(d: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
     }
     if (d[C_STATE] == CD_STATE_TX_RESP1 as u8) {
         cdromExecuteCommand(d, ic, cop0);
-    } else {
-        if (d[C_STATE] == CD_STATE_TX_RESP2 as u8) {
-            cdromExecuteResp2(d);
-        }
+    } else if (d[C_STATE] == CD_STATE_TX_RESP2 as u8) {
+        cdromExecuteResp2(d);
+    } else if (d[C_STATE] == CD_STATE_READ as u8) {
+        cdromHandleRead(d, disc);
     }
     // Only raise CPU IRQ if the corresponding IER bit is enabled.
     if ((d[C_IFR] as u32 & d[C_IER] as u32 & 0x1F) == 0) { return; }
     irqRaise(ic, cop0, IC_CDROM());
+}
+
+// One sector of CdlReadN / CdlReadS: pull 2352 bytes from the disc
+// image into our data FIFO, raise INT1+stat, advance the LBA, and
+// schedule the next sector delay. Mirror of psxe's cdrom_handle_read.
+pub fn cdromHandleRead(d: *mut[] u8, disc: *mut[] Disc) {
+    cdromProcessSetloc(d);
+    if (d[C_HAS_DISC] == 0) {
+        cdromError(d, CD_STAT_SPINDLE, CD_ERR_NO_DISC);
+        return;
+    }
+    const lba: u32 = cdGetU32(d, C_LBA);
+    // discRead writes directly into our state buffer's data-FIFO slot.
+    // We pass the buffer base + offset; discRead handles indexing.
+    if (cdromDiscReadAt(d, disc, lba) == 0) {
+        cdromError(d, CD_STAT_SPINDLE | CD_STAT_SEEKERROR,
+                   CD_ERR_INVALID_SUBFUNC);
+        return;
+    }
+    // psxe sets read_index based on the sector-size MODE bit:
+    //   bit 5 = 0 (0x800 payload): skip 12 sync + 4 hdr + 8 subhdr = 24
+    //   bit 5 = 1 (0x924 raw):     skip 12 sync only
+    var rIdx: u32 = 24;
+    var wEnd: u32 = 24 + 0x800;
+    if ((d[C_MODE] as u32 & MODE_SECTOR_SIZE) != 0) {
+        rIdx = 12;
+        wEnd = 12 + 0x924;
+    }
+    cdSetU32(d, C_DATA_RIDX, rIdx);
+    cdSetU32(d, C_DATA_WIDX, wEnd);
+
+    d[C_IFR] = 1;
+    qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+
+    // Advance LBA and schedule the next sector.
+    cdSetU32(d, C_LBA, lba + 1);
+    cdSetU32(d, C_DELAY, cdromReadDelay(d));
+}
+
+// Read one sector at `lba` into the state's data-FIFO slot. Uses a
+// scratch buffer rather than a slice-offset pointer (Jam doesn't yet
+// support pointer arithmetic / offset views on `*mut[] T`), so we
+// stream through 2352 bytes once per sector. Returns 1 on success.
+pub fn cdromDiscReadAt(d: *mut[] u8, disc: *mut[] Disc, lba: u32) i32 {
+    var scratch: *mut[] u8 = malloc(SECTOR_BYTES as u64);
+    if (discRead(disc, lba, scratch) == 0) {
+        free(scratch);
+        return 0;
+    }
+    var i: u32 = 0;
+    while (i < SECTOR_BYTES) {
+        d[C_DATA_BUF + i] = scratch[i];
+        i = i + 1;
+    }
+    free(scratch);
+    return 1;
+}
+
+// Read one byte from the data FIFO (the 0x1F801802 register).
+// Called by cdromRead8 when the BIOS / game polls for sector data.
+pub fn cdromReadData(d: *mut[] u8) u32 {
+    if (d[C_DATA_REQ] == 0) { return 0; }
+    var rIdx: u32 = cdGetU32(d, C_DATA_RIDX);
+    const wIdx: u32 = cdGetU32(d, C_DATA_WIDX);
+    if (rIdx >= wIdx) { return 0; }
+    const v: u8 = d[C_DATA_BUF + rIdx];
+    cdSetU32(d, C_DATA_RIDX, rIdx + 1);
+    return v as u32;
 }
