@@ -403,11 +403,15 @@ pub fn cdromExecuteCommand(d: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32) {
             const m: u32 = qPop(d, C_PARAM_BUF, C_PARAM_R, C_PARAM_W);
             const s: u32 = qPop(d, C_PARAM_BUF, C_PARAM_R, C_PARAM_W);
             const f: u32 = qPop(d, C_PARAM_BUF, C_PARAM_R, C_PARAM_W);
-            // BCD → LBA: lba = (((m*60) + s) * 75) + f - 150
+            // psxe convention: lba = m*4500 + s*75 + f (no -150). The
+            // 150-sector lead-in is subtracted inside disc.jam when we
+            // index into the .bin file. Subtracting twice (here AND in
+            // disc.jam) meant the BIOS read all zeros for the PVD and
+            // fell back to PSX.EXE instead of parsing SYSTEM.CNF.
             const mB: u32 = (m & 0x0F) + ((m >> 4) & 0x0F) * 10;
             const sB: u32 = (s & 0x0F) + ((s >> 4) & 0x0F) * 10;
             const fB: u32 = (f & 0x0F) + ((f >> 4) & 0x0F) * 10;
-            const lba: u32 = (((mB * 60) + sB) * 75) + fB - 150;
+            const lba: u32 = (mB * 4500) + (sB * 75) + fB;
             cdSetU32(d, C_PENDING_LBA, lba);
             if (d[0x1E] < 40) {
                 var fmt: []u8 = "CD SetLoc m=%02X s=%02X f=%02X -> LBA=%u\n";
