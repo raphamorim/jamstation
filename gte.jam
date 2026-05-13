@@ -249,17 +249,7 @@ pub fn satSxy(v: i64) u32 {
 pub fn gteDivide(h: u32, sz3: u32) u32 {
     if (sz3 == 0) { return 0x1FFFF; }
     if (h >= sz3 * 2) { return 0x1FFFF; }
-    // result = (h << 16) / sz3, capped at 0x1FFFF.
-    var num: u32 = h << 16;
-    var den: u32 = sz3;
-    var q: u32 = 0;
-    var r: u32 = 0;
-    var i: u32 = 32;
-    while (i > 0) {
-        i = i - 1;
-        r = (r << 1) | ((num >> i) & 1);
-        if (r >= den) { r = r - den; q = q | (1 << i); }
-    }
+    var q: u32 = (h << 16) / sz3;
     if (q > 0x1FFFF) { q = 0x1FFFF; }
     return q;
 }

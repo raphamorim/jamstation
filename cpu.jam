@@ -174,25 +174,20 @@ pub fn signedGeZero(a: u32) bool { return (a & 0x80000000) == 0; }
 
 // ---------- integer division -------------------------------------------
 //
-// Jam still has no `/` operator. Shift-and-subtract, 32 bits per pass.
+// MIPS DIV / DIVU semantics: division by zero produces -1 (signed) or
+// 0xFFFFFFFF (unsigned) for the quotient; signed INT_MIN / -1 stays at
+// INT_MIN. We lower to LLVM's hardware sdiv / udiv via Jam's `/`
+// operator, after handling those special cases — `sdiv INT_MIN, -1` is
+// UB in LLVM, so we sidestep it explicitly.
 
 pub fn divU32(a: u32, b: u32) u32 {
     if (b == 0) { return 0xFFFFFFFF; }
-    var q: u32 = 0;
-    var r: u32 = 0;
-    var i: u32 = 32;
-    while (i > 0) {
-        i = i - 1;
-        r = (r << 1) | ((a >> i) & 1);
-        if (r >= b) { r = r - b; q = q | (1 << i); }
-    }
-    return q;
+    return a / b;
 }
 
 pub fn modU32(a: u32, b: u32) u32 {
     if (b == 0) { return a; }
-    const q: u32 = divU32(a, b);
-    return a - (q * b);
+    return a % b;
 }
 
 pub fn absI32(a: u32) u32 {
@@ -205,18 +200,15 @@ pub fn divI32(a: u32, b: u32) u32 {
         if ((a & 0x80000000) != 0) { return 1; }
         return 0xFFFFFFFF;
     }
-    const neg: bool = ((a ^ b) & 0x80000000) != 0;
-    const au: u32 = absI32(a);
-    const bu: u32 = absI32(b);
-    var q: u32 = divU32(au, bu);
-    if (neg) { q = (~q) + 1; }
-    return q;
+    // MIPS quirk: INT_MIN / -1 == INT_MIN (no overflow trap).
+    if (a == 0x80000000 and b == 0xFFFFFFFF) { return 0x80000000; }
+    return ((a as i32) / (b as i32)) as u32;
 }
 
 pub fn modI32(a: u32, b: u32) u32 {
     if (b == 0) { return a; }
-    const q: u32 = divI32(a, b);
-    return a - (q * b);
+    if (a == 0x80000000 and b == 0xFFFFFFFF) { return 0; }
+    return ((a as i32) % (b as i32)) as u32;
 }
 
 // ---------- exception machinery ----------------------------------------

@@ -908,34 +908,22 @@ pub fn gpuDitherKernel(idx: u32) i64 {
 // Match psxe's order: divide first, dither, clamp.
 pub fn gpuSatChan(num: i64, area: i64, dith: i64) u32 {
     if (area == 0) { return 0; }
-    var quot: i64 = gpuDivClamp(num, area, 0xFFFFFFFF) as i64;
+    var quot: i64 = num / area;
     quot = quot + dith;
     if (quot < 0)   { quot = 0; }
     if (quot > 255) { quot = 255; }
     return quot as u32;
 }
 
-// Divide an i64 dividend by a (positive) i64 divisor, clamping the
-// result to 0..maxOut. Hand-rolled because Jam has no `/` operator;
-// we use shift-and-subtract on the absolute values.
+// Divide an i64 dividend by an i64 divisor, clamping the (truncated-to-
+// zero) result to 0..maxOut. Native LLVM signed divide via Jam's `/`
+// operator — previously this was a 64-iteration shift-and-subtract loop
+// (the inner-pixel hot path on every shaded / textured polygon).
 pub fn gpuDivClamp(num: i64, den: i64, maxOut: u32) u32 {
     if (den == 0) { return 0; }
-    var n: i64 = num;
-    var neg: bool = false;
-    if (n < 0) { n = -n; neg = true; }
-    var q: u64 = 0;
-    var r: u64 = 0;
-    var i: u32 = 64;
-    while (i > 0) {
-        i = i - 1;
-        r = (r << 1) | (((n as u64) >> i) & 1);
-        if (r >= (den as u64)) {
-            r = r - (den as u64);
-            q = q | (1 << i);
-        }
-    }
-    if (neg) { return 0; }
-    if (q > (maxOut as u64)) { return maxOut; }
+    var q: i64 = num / den;
+    if (q < 0) { return 0; }
+    if (q > (maxOut as i64)) { return maxOut; }
     return q as u32;
 }
 

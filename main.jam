@@ -371,6 +371,10 @@ fn main() {
 
     var frames: u32 = 0;
     var quit: u32 = 0;
+    // Wall-clock window so we can print a rolling FPS without depending on
+    // the SDL window close to flush state.
+    var winStartMs: u32 = SDL_GetTicks();
+    var winStartFrames: u32 = 0;
     while (quit == 0) {
         // Game-EXE side-load. Trigger once when PC enters the BIOS shell
         // region (0x80030000-0x80030FFF). We check by range because a
@@ -400,6 +404,19 @@ fn main() {
         }
         quit = sdlPump();
         frames = frames + 1;
+        // Roll a wall-clock FPS print every second so we can profile
+        // without depending on the "Stopped after N frames" tail message
+        // (which only fires on a clean window close).
+        const nowMs: u32 = SDL_GetTicks();
+        if (nowMs - winStartMs >= 1000) {
+            const fpsFrames: u32 = frames - winStartFrames;
+            const elapsed: u32 = nowMs - winStartMs;
+            var fpsFmt: []u8 = "[fps] %u frames in %u ms (%llu cycles total)\n";
+            printf(fpsFmt.ptr, fpsFrames, elapsed, c.cycles);
+            flushAll();
+            winStartMs = nowMs;
+            winStartFrames = frames;
+        }
         // Bail after a long-but-finite session if no quit event comes —
         // protects users from a runaway window when there's no controller
         // input wired up yet.
