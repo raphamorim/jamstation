@@ -23,6 +23,7 @@ const {
 // Force device modules into this module's codegen context so bus.jam's
 // allocBus body (which calls gpuAlloc / dmaAlloc / etc.) resolves.
 const { gpuAlloc } = import("gpu");
+const { gteAlloc } = import("gte");
 const { dmaAlloc } = import("dma");
 const { irqAlloc } = import("irq");
 const { timerAlloc } = import("timer");
@@ -42,6 +43,7 @@ const Bus = struct {
     dma:   *mut[] u32,
     irq:   *mut[] u32,
     timer: *mut[] u32,
+    gte:   *mut[] u32,
     biosLoaded: u8,
 };
 

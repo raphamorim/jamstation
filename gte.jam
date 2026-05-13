@@ -1,0 +1,521 @@
+// COP2 / GTE — Geometry Transformation Engine.
+//
+// Partial port of psxe's GTE in src/cpu.c (~3000 lines of fixed-point
+// math with saturation flags). This module covers the *register file*
+// — 32 data registers + 32 control registers — and dispatches the
+// register-move instructions (MFC2/MTC2/CFC2/CTC2/LWC2/SWC2). The
+// math instructions (RTPS, NCLIP, NCDS, AVSZ3/4, OP, SQR, ...) all
+// land in `gteExec` which currently does the *minimum* the BIOS needs
+// to not stall: for RTPS we just copy the input vertex straight into
+// the screen-space FIFO with no rotation/perspective. Vertices end up
+// "static" but reachable, which is a step up from the previous swallow
+// stub (vertices collapsed to origin).
+//
+// Data register layout (32 × u32):
+//   0  V0  (xy packed, low half of vertex 0)
+//   1  V0Z (z, low 16 bits)
+//   2  V1  / 3 V1Z
+//   4  V2  / 5 V2Z
+//   6  RGBC                — current colour + code
+//   7  OTZ                 — average Z for ordering table
+//   8  IR0                 — interpolation parameter
+//   9-11  IR1, IR2, IR3
+//   12-15 SXY0, SXY1, SXY2, SXYP — screen-space FIFO + push input
+//   16-19 SZ0, SZ1, SZ2, SZ3     — Z FIFO
+//   20-22 RGB0, RGB1, RGB2
+//   23 RES1                — reserved
+//   24-27 MAC0, MAC1, MAC2, MAC3
+//   28 IRGB (R), 29 ORGB (R) — packed 15-bit IR view
+//   30 LZCS, 31 LZCR        — leading-zero count source / result
+//
+// Control register layout (32 × u32):
+//   0..4   rotation matrix (R11R12, R13R21, R22R23, R31R32, R33)
+//   5..7   translation vector (TRX, TRY, TRZ)
+//   8..12  light matrix (L11L12, ..., L33)
+//   13..15 background colour (RBK, GBK, BBK)
+//   16..20 light colour matrix
+//   21..23 far colour (RFC, GFC, BFC)
+//   24..25 OFX, OFY (screen offset, 16-bit fixed-point with 16 frac bits)
+//   26     H (projection plane distance)
+//   27     DQA (depth queue parameter A)
+//   28     DQB (depth queue parameter B)
+//   29     ZSF3, 30 ZSF4
+//   31     FLAG (saturation/overflow bits)
+
+pub extern fn malloc(size: u64) *mut[] u8;
+pub extern fn free(ptr: *mut[] u8);
+pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+pub extern fn printf(format: *const[] u8, ...) i32;
+
+const GTE_REGS: u32 = 64;
+const D_V0: u32 = 0;
+const D_V0Z: u32 = 1;
+const D_SXY0: u32 = 12;
+const D_SXY1: u32 = 13;
+const D_SXY2: u32 = 14;
+const D_SXYP: u32 = 15;
+const D_MAC0: u32 = 24;
+const D_MAC1: u32 = 25;
+const D_MAC2: u32 = 26;
+const D_MAC3: u32 = 27;
+const C_OFX: u32 = 24;
+const C_OFY: u32 = 25;
+const C_FLAG: u32 = 31;
+
+pub fn gteAlloc() *mut[] u32 {
+    var raw: *mut[] u8 = malloc((GTE_REGS as u64) * 4);
+    memset(raw, 0, (GTE_REGS as u64) * 4);
+    return raw as *mut[] u32;
+}
+
+pub fn gteFree(g: *mut[] u32) { free(g as *mut[] u8); }
+
+// Data and control share the same storage buffer: data at index 0..31,
+// control at index 32..63.
+//
+// Several COP2 data registers have side effects on read/write that
+// psxe handles in gte_read_register / gte_write_register:
+//
+//   15  SXYP   read → mirror of SXY2; write → push SXY FIFO
+//   28  IRGB   write → unpack 15-bit RGB into IR1..IR3; read → repack
+//   29  ORGB   read → repack IR1..IR3 to 15-bit; write → ignored (RO)
+//   30  LZCS   write → also compute LZCR (leading sign-bit count)
+//   31  LZCR   read-only
+pub fn gteDataRead(g: *mut[] u32, idx: u32) u32 {
+    const i: u32 = idx & 0x1F;
+    if (i == 15) { return g[14]; }                  // SXYP mirrors SXY2
+    if (i == 28 or i == 29) {
+        // Re-pack IR1/IR2/IR3 (>> 7, clamped 0..0x1F) into 15-bit RGB.
+        var r: i64 = (g[9] as i32) as i64 >> 7;
+        var grn: i64 = (g[10] as i32) as i64 >> 7;
+        var b: i64 = (g[11] as i32) as i64 >> 7;
+        if (r < 0) { r = 0; }
+        if (r > 0x1F) { r = 0x1F; }
+        if (grn < 0) { grn = 0; }
+        if (grn > 0x1F) { grn = 0x1F; }
+        if (b < 0) { b = 0; }
+        if (b > 0x1F) { b = 0x1F; }
+        return ((r as u64) | ((grn as u64) << 5) | ((b as u64) << 10)) as u32;
+    }
+    return g[i];
+}
+
+pub fn gteDataWrite(g: *mut[] u32, idx: u32, val: u32) {
+    const i: u32 = idx & 0x1F;
+    if (i == 15) {
+        // SXYP — store the value, then push SXY FIFO so the latest
+        // entry slides into SXY2 and older entries shift down. Used by
+        // the BIOS to pre-load screen-space vertices without RTPS.
+        g[15] = val;                                // SXYP raw
+        g[12] = g[13];                              // SXY0 ← SXY1
+        g[13] = g[14];                              // SXY1 ← SXY2
+        g[14] = val;                                // SXY2 ← new
+        return;
+    }
+    if (i == 28) {
+        // IRGB — unpack 5-bit channels into IR1/IR2/IR3 (<< 7 to map
+        // 0..0x1F → 0..0xF80).
+        const packed: u32 = val & 0x7FFF;
+        g[28] = packed;
+        g[9]  = (packed & 0x1F) << 7;
+        g[10] = ((packed >> 5) & 0x1F) << 7;
+        g[11] = ((packed >> 10) & 0x1F) << 7;
+        return;
+    }
+    if (i == 29) {
+        // ORGB is read-only — psxe silently discards writes.
+        return;
+    }
+    if (i == 30) {
+        // LZCS — write computes LZCR (count of leading sign bits, or
+        // leading zeros if the value is non-negative).
+        g[30] = val;
+        g[31] = gteCountLeadingSign(val);
+        return;
+    }
+    g[i] = val;
+}
+
+// Count the number of leading bits that match bit 31 of `v`. Matches
+// the LZCS/LZCR semantic: if v has bit 31 = 0, this is the count of
+// leading zeros; if bit 31 = 1, it's the count of leading ones. Result
+// ranges from 0 to 32 (32 only for v == 0 or v == 0xFFFFFFFF).
+pub fn gteCountLeadingSign(v: u32) u32 {
+    if (v == 0) { return 32; }
+    if (v == 0xFFFFFFFF) { return 32; }
+    var x: u32 = v;
+    if ((x & 0x80000000) != 0) { x = ~x; }
+    var n: u32 = 0;
+    while ((x & 0x80000000) == 0 and n < 32) {
+        x = x << 1;
+        n = n + 1;
+    }
+    return n;
+}
+
+pub fn gteCtrlRead(g: *mut[] u32, idx: u32) u32 {
+    return g[32 + (idx & 0x1F)];
+}
+
+pub fn gteCtrlWrite(g: *mut[] u32, idx: u32, val: u32) {
+    g[32 + (idx & 0x1F)] = val;
+}
+
+// Dispatch on the bottom 6 bits of the GTE math opcode. psxe's full
+// table covers 22 ops (RTPS=0x01, NCLIP=0x06, ..., NCCT=0x3F). Almost
+// all are NOPs here; RTPS gets a pass-through implementation so the
+// BIOS's vertex stream lands at the input coords instead of (0,0).
+pub fn gteExec(g: *mut[] u32, opc: u32) {
+    g[32 + C_FLAG] = 0;        // clear FLAG every instruction
+    const op: u32 = opc & 0x3F;
+    // Decode sf (bit 19 → 12 or 0) and lm (bit 10) once per dispatch
+    // so RTPS/RTPT/MVMVA all see the same flags.
+    const sf: u32 = ((opc >> 19) & 1) * 12;
+    const lm: u32 = (opc >> 10) & 1;
+    if (op == 0x01) { gteRtps(g, 0, sf, lm); }    // RTPS
+    if (op == 0x06) { gteNclip(g); }              // NCLIP
+    if (op == 0x0C) { gteOp(g); }                 // OP
+    if (op == 0x12) { gteMvmva(g, opc); }         // MVMVA
+    if (op == 0x28) { gteSqr(g); }                // SQR
+    if (op == 0x2D) { gteAvsz(g, 3); }            // AVSZ3
+    if (op == 0x2E) { gteAvsz(g, 4); }            // AVSZ4
+    if (op == 0x30) {                              // RTPT — 3 successive RTPS
+        gteRtps(g, 0, sf, lm);
+        gteRtps(g, 1, sf, lm);
+        gteRtps(g, 2, sf, lm);
+    }
+    // Remaining ops (NCDS/NCS/CC/CDP/INTPL/DPCS/DPCT/DCPL/NCCS/NCCT/GPF/GPL)
+    // are still NOPs. They're mostly colour / depth-queue / lighting and
+    // not strictly required for the BIOS boot animation's geometry.
+}
+
+// Sign-extend a 16-bit value (stored in u32 low 16) to i64.
+pub fn s16ToI64(v: u32) i64 {
+    const lo: u32 = v & 0xFFFF;
+    if ((lo & 0x8000) != 0) {
+        var w: i64 = lo as i64;
+        return w - 0x10000;
+    }
+    return (v & 0xFFFF) as i64;
+}
+
+// Sign-extend a 32-bit value (stored in u32) to i64.
+pub fn s32ToI64(v: u32) i64 {
+    var w: i64 = v as i64;
+    if ((v & 0x80000000) != 0) {
+        w = w - 0x100000000;
+    }
+    return w;
+}
+
+// Saturate an i64 to a signed 16-bit IR result. psxe's
+// gte_clamp_ir(c, idx, value, lm) uses (lm ? 0 : -0x8000) as the lower
+// bound. We default to lm=0 (signed 16) here; see `satIrLm` for the
+// lm-aware variant used by RTPS/MVMVA.
+pub fn satIr16(v: i64) i64 {
+    if (v < -32768) { return -32768; }
+    if (v > 32767) { return 32767; }
+    return v;
+}
+
+pub fn satIrLm(v: i64, lm: u32) i64 {
+    var lo: i64 = -32768;
+    if (lm != 0) { lo = 0; }
+    if (v < lo) { return lo; }
+    if (v > 32767) { return 32767; }
+    return v;
+}
+
+// Saturate to u16 (used for SZ3).
+pub fn satSz3(v: i64) u32 {
+    if (v < 0) { return 0; }
+    if (v > 0xFFFF) { return 0xFFFF; }
+    return (v as u64 & 0xFFFF) as u32;
+}
+
+// Saturate to signed 11-bit (used for SX/SY in the FIFO).
+pub fn satSxy(v: i64) u32 {
+    if (v < -1024) { return 0xFFFFFC00; }
+    if (v > 1023)  { return 0x3FF; }
+    // i64 → u32 via the low 32 bits, masked.
+    const lo: u32 = ((v + 0x100000000) as u64 & 0xFFFF) as u32;
+    return lo;
+}
+
+// GTE perspective-divide approximation. psxe uses a 257-entry
+// reciprocal table (UNR algorithm); integer math is simpler and good
+// enough for the BIOS animation. Result is the scaled reciprocal of
+// SZ3 such that the projected x/y land in screen space.
+pub fn gteDivide(h: u32, sz3: u32) u32 {
+    if (sz3 == 0) { return 0x1FFFF; }
+    if (h >= sz3 * 2) { return 0x1FFFF; }
+    // result = (h << 16) / sz3, capped at 0x1FFFF.
+    var num: u32 = h << 16;
+    var den: u32 = sz3;
+    var q: u32 = 0;
+    var r: u32 = 0;
+    var i: u32 = 32;
+    while (i > 0) {
+        i = i - 1;
+        r = (r << 1) | ((num >> i) & 1);
+        if (r >= den) { r = r - den; q = q | (1 << i); }
+    }
+    if (q > 0x1FFFF) { q = 0x1FFFF; }
+    return q;
+}
+
+// RTPS — rotate, translate, perspective single. Computes a screen-
+// space projection of vertex `vidx` and pushes it onto the SXY/SZ
+// FIFO. Port of psxe's GTE_RTP macro, minus the per-instruction FLAG
+// bookkeeping (kept simple; visual artifacts from missing flags are
+// preferable to faulting out of the boot sequence).
+pub fn gteRtps(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
+    const vSlot: u32 = vidx * 2;        // V0 at 0, V1 at 2, V2 at 4
+    const vxy: u32 = g[vSlot];
+    const vz:  u32 = g[vSlot + 1];
+    const vx: i64 = s16ToI64(vxy & 0xFFFF);
+    const vy: i64 = s16ToI64((vxy >> 16) & 0xFFFF);
+    const vzS: i64 = s16ToI64(vz & 0xFFFF);
+
+    // Rotation matrix elements (packed two-per-u32 like psxe's
+    // gte_matrix_t). Layout:
+    //   C[0] low = RT11, high = RT12
+    //   C[1] low = RT13, high = RT21
+    //   C[2] low = RT22, high = RT23
+    //   C[3] low = RT31, high = RT32
+    //   C[4] low = RT33
+    const rt11: i64 = s16ToI64(g[32 + 0] & 0xFFFF);
+    const rt12: i64 = s16ToI64((g[32 + 0] >> 16) & 0xFFFF);
+    const rt13: i64 = s16ToI64(g[32 + 1] & 0xFFFF);
+    const rt21: i64 = s16ToI64((g[32 + 1] >> 16) & 0xFFFF);
+    const rt22: i64 = s16ToI64(g[32 + 2] & 0xFFFF);
+    const rt23: i64 = s16ToI64((g[32 + 2] >> 16) & 0xFFFF);
+    const rt31: i64 = s16ToI64(g[32 + 3] & 0xFFFF);
+    const rt32: i64 = s16ToI64((g[32 + 3] >> 16) & 0xFFFF);
+    const rt33: i64 = s16ToI64(g[32 + 4] & 0xFFFFFFFF);
+
+    // Translation (32-bit signed per axis).
+    const trx: i64 = s32ToI64(g[32 + 5]);
+    const try_: i64 = s32ToI64(g[32 + 6]);
+    const trz: i64 = s32ToI64(g[32 + 7]);
+
+    // MAC = TR * 4096 + R * V.
+    const mac1: i64 = (trx << 12) + rt11 * vx + rt12 * vy + rt13 * vzS;
+    const mac2: i64 = (try_ << 12) + rt21 * vx + rt22 * vy + rt23 * vzS;
+    const mac3: i64 = (trz << 12) + rt31 * vx + rt32 * vy + rt33 * vzS;
+
+    // IR = MAC >> sf (sf is 0 or 12). lm=1 clamps IR to 0..0x7FFF,
+    // lm=0 clamps to -0x8000..0x7FFF.
+    var sm1: i64 = mac1;
+    var sm2: i64 = mac2;
+    var sm3: i64 = mac3;
+    if (sf == 12) { sm1 = mac1 >> 12; sm2 = mac2 >> 12; sm3 = mac3 >> 12; }
+    const ir1: i64 = satIrLm(sm1, lm);
+    const ir2: i64 = satIrLm(sm2, lm);
+    const ir3: i64 = satIrLm(sm3, lm);
+
+    // SZ FIFO: SZ0←SZ1, SZ1←SZ2, SZ2←SZ3, SZ3← new. SZ3 always uses
+    // the >>12 form regardless of `sf` (per psxe gte_clamp_ir_z).
+    g[16] = g[17];
+    g[17] = g[18];
+    g[18] = g[19];
+    g[19] = satSz3(mac3 >> 12);
+
+    // Perspective division.
+    const h: u32 = g[32 + 26] & 0xFFFF;
+    const sz3: u32 = g[19];
+    const div: u32 = gteDivide(h, sz3);
+
+    // SXY = (OFX + IR * div) >> 16. OFX/OFY are 32-bit signed.
+    const ofx: i64 = s32ToI64(g[32 + 24]);
+    const ofy: i64 = s32ToI64(g[32 + 25]);
+    const sx: i64 = (ofx + ir1 * (div as i64)) >> 16;
+    const sy: i64 = (ofy + ir2 * (div as i64)) >> 16;
+
+    // SXY FIFO push.
+    g[D_SXY0] = g[D_SXY1];
+    g[D_SXY1] = g[D_SXY2];
+    g[D_SXY2] = (satSxy(sx) & 0xFFFF) | ((satSxy(sy) & 0xFFFF) << 16);
+
+    // Write IR back and MAC for further pipeline stages.
+    g[9]  = (ir1 as u64 & 0xFFFF) as u32;
+    g[10] = (ir2 as u64 & 0xFFFF) as u32;
+    g[11] = (ir3 as u64 & 0xFFFF) as u32;
+    g[D_MAC1] = (mac1 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC2] = (mac2 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC3] = (mac3 as u64 & 0xFFFFFFFF) as u32;
+
+    // Depth-queue tail (psxe's GTE_RTP_DQ). Strictly only run on the
+    // last vertex of RTPS/RTPT, but doing it every vertex is harmless
+    // since the BIOS reads IR0/MAC0 after the final RTP call.
+    const dqa: i64 = s32ToI64(g[32 + 27]);
+    const dqb: i64 = s32ToI64(g[32 + 28]);
+    const mac0: i64 = dqb + dqa * (div as i64);
+    g[D_MAC0] = (mac0 as u64 & 0xFFFFFFFF) as u32;
+    // IR0 clamps to 0..0x1000 in psxe (gte_clamp_ir0).
+    var ir0: i64 = mac0 >> 12;
+    if (ir0 < 0) { ir0 = 0; }
+    if (ir0 > 0x1000) { ir0 = 0x1000; }
+    g[8] = (ir0 as u64 & 0xFFFF) as u32;
+}
+
+// AVSZ3 / AVSZ4 — average Z of the last 3 or 4 SZ FIFO entries,
+// scaled by ZSF3 / ZSF4 respectively. psxe:
+//   AVSZ3: MAC0 = ZSF3 * (SZ1 + SZ2 + SZ3); OTZ = clampSZ(MAC0 >> 12)
+//   AVSZ4: MAC0 = ZSF4 * (SZ0 + SZ1 + SZ2 + SZ3); OTZ = clampSZ(MAC0 >> 12)
+// ZSF3 is at control reg 29 (s16), ZSF4 at control reg 30 (s16).
+pub fn gteAvsz(g: *mut[] u32, count: u32) {
+    var sum: i64 = (g[17] as i64) + (g[18] as i64) + (g[19] as i64);
+    var zsf: i64 = s16ToI64(g[32 + 29]);            // ZSF3 default
+    if (count == 4) {
+        sum = sum + (g[16] as i64);
+        zsf = s16ToI64(g[32 + 30]);                 // ZSF4
+    }
+    const mac0: i64 = zsf * sum;
+    g[D_MAC0] = (mac0 as u64 & 0xFFFFFFFF) as u32;
+    g[7] = satSz3(mac0 >> 12);                       // OTZ (clamped 0..0xFFFF)
+}
+
+// NCLIP — back-face cull test. MAC0 = signed cross product of the three
+// screen-space vertices currently sitting in the SXY FIFO. The BIOS
+// uses the sign of MAC0 to decide whether to draw a triangle. Port of
+// psx_gte_i_nclip in psxe.
+pub fn gteNclip(g: *mut[] u32) {
+    const sx0: i64 = s16ToI64(g[D_SXY0] & 0xFFFF);
+    const sy0: i64 = s16ToI64((g[D_SXY0] >> 16) & 0xFFFF);
+    const sx1: i64 = s16ToI64(g[D_SXY1] & 0xFFFF);
+    const sy1: i64 = s16ToI64((g[D_SXY1] >> 16) & 0xFFFF);
+    const sx2: i64 = s16ToI64(g[D_SXY2] & 0xFFFF);
+    const sy2: i64 = s16ToI64((g[D_SXY2] >> 16) & 0xFFFF);
+    const v: i64 = sx0 * (sy1 - sy2) + sx1 * (sy2 - sy0) + sx2 * (sy0 - sy1);
+    g[D_MAC0] = (v as u64 & 0xFFFFFFFF) as u32;
+}
+
+// OP — outer product / cross product variant. psxe:
+//   MAC1 = RT22*IR3 - RT33*IR2
+//   MAC2 = RT33*IR1 - RT11*IR3
+//   MAC3 = RT11*IR2 - RT22*IR1
+// Uses the rotation matrix diagonal as the input vector. Used by some
+// lighting normal computations.
+pub fn gteOp(g: *mut[] u32) {
+    const rt11: i64 = s16ToI64(g[32 + 0] & 0xFFFF);
+    const rt22: i64 = s16ToI64(g[32 + 2] & 0xFFFF);
+    const rt33: i64 = s16ToI64(g[32 + 4] & 0xFFFF);
+    const ir1: i64 = s16ToI64(g[9]);
+    const ir2: i64 = s16ToI64(g[10]);
+    const ir3: i64 = s16ToI64(g[11]);
+    const mac1: i64 = rt22 * ir3 - rt33 * ir2;
+    const mac2: i64 = rt33 * ir1 - rt11 * ir3;
+    const mac3: i64 = rt11 * ir2 - rt22 * ir1;
+    g[D_MAC1] = (mac1 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC2] = (mac2 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC3] = (mac3 as u64 & 0xFFFFFFFF) as u32;
+    g[9]  = (satIr16(mac1) as u64 & 0xFFFF) as u32;
+    g[10] = (satIr16(mac2) as u64 & 0xFFFF) as u32;
+    g[11] = (satIr16(mac3) as u64 & 0xFFFF) as u32;
+}
+
+// SQR — square each IR component. Used for vector-length computations.
+// psxe: MAC{1,2,3} = IR{1,2,3}^2; IR{1,2,3} = clamp(MAC).
+pub fn gteSqr(g: *mut[] u32) {
+    const ir1: i64 = s16ToI64(g[9]);
+    const ir2: i64 = s16ToI64(g[10]);
+    const ir3: i64 = s16ToI64(g[11]);
+    const mac1: i64 = ir1 * ir1;
+    const mac2: i64 = ir2 * ir2;
+    const mac3: i64 = ir3 * ir3;
+    g[D_MAC1] = (mac1 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC2] = (mac2 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC3] = (mac3 as u64 & 0xFFFFFFFF) as u32;
+    g[9]  = (satIr16(mac1) as u64 & 0xFFFF) as u32;
+    g[10] = (satIr16(mac2) as u64 & 0xFFFF) as u32;
+    g[11] = (satIr16(mac3) as u64 & 0xFFFF) as u32;
+}
+
+// MVMVA — Multiply-Vector-by-Matrix and add-Vector. Opcode bits select
+// which matrix (mx: 0=rotation, 1=light, 2=lightColour), which vector
+// (v: 0..2 = V0..V2, 3 = IR vec), and which translation vector
+// (cv: 0=TR, 1=BK, 2=FC, 3=zero). Bit 19 sets sf (shift fraction = 12
+// or 0). Bit 10 sets lm (limit IR to 0..0x7FFF if 1).
+//
+// This omits the buggy CV=FC case from psxe — most BIOS calls use
+// CV=TR. Result: MAC = (CV << 12) + MX * V; IR = clamp(MAC >> sf).
+pub fn gteMvmva(g: *mut[] u32, opc: u32) {
+    const sf: u32 = ((opc >> 19) & 1) * 12;
+    const lm: u32 = (opc >> 10) & 1;
+    const cvSel: u32 = (opc >> 13) & 3;
+    const vSel:  u32 = (opc >> 15) & 3;
+    const mxSel: u32 = (opc >> 17) & 3;
+
+    // Pick matrix base index in the control buffer.
+    var mxBase: u32 = 0;
+    if (mxSel == 0) { mxBase = 0; }      // rotation matrix at C[0..4]
+    if (mxSel == 1) { mxBase = 8; }      // light matrix at C[8..12]
+    if (mxSel == 2) { mxBase = 16; }     // light colour matrix at C[16..20]
+    // mxSel == 3 is psxe's "garbage matrix" case — uses RC/IR0 mix.
+    // We approximate with rotation matrix; the BIOS doesn't hit this.
+
+    const m11: i64 = s16ToI64(g[32 + mxBase + 0] & 0xFFFF);
+    const m12: i64 = s16ToI64((g[32 + mxBase + 0] >> 16) & 0xFFFF);
+    const m13: i64 = s16ToI64(g[32 + mxBase + 1] & 0xFFFF);
+    const m21: i64 = s16ToI64((g[32 + mxBase + 1] >> 16) & 0xFFFF);
+    const m22: i64 = s16ToI64(g[32 + mxBase + 2] & 0xFFFF);
+    const m23: i64 = s16ToI64((g[32 + mxBase + 2] >> 16) & 0xFFFF);
+    const m31: i64 = s16ToI64(g[32 + mxBase + 3] & 0xFFFF);
+    const m32: i64 = s16ToI64((g[32 + mxBase + 3] >> 16) & 0xFFFF);
+    const m33: i64 = s16ToI64(g[32 + mxBase + 4] & 0xFFFF);
+
+    // Pick input vector.
+    var vx: i64 = 0;
+    var vy: i64 = 0;
+    var vz: i64 = 0;
+    if (vSel == 3) {
+        vx = s16ToI64(g[9]);
+        vy = s16ToI64(g[10]);
+        vz = s16ToI64(g[11]);
+    } else {
+        const slot: u32 = vSel * 2;
+        const vxy: u32 = g[slot];
+        const vzS: u32 = g[slot + 1];
+        vx = s16ToI64(vxy & 0xFFFF);
+        vy = s16ToI64((vxy >> 16) & 0xFFFF);
+        vz = s16ToI64(vzS & 0xFFFF);
+    }
+
+    // Pick translation vector.
+    var tx: i64 = 0;
+    var ty: i64 = 0;
+    var tz: i64 = 0;
+    if (cvSel == 0) {                    // TR
+        tx = s32ToI64(g[32 + 5]);
+        ty = s32ToI64(g[32 + 6]);
+        tz = s32ToI64(g[32 + 7]);
+    }
+    if (cvSel == 1) {                    // BK (background colour)
+        tx = s32ToI64(g[32 + 13]);
+        ty = s32ToI64(g[32 + 14]);
+        tz = s32ToI64(g[32 + 15]);
+    }
+    if (cvSel == 2) {                    // FC (far colour)
+        tx = s32ToI64(g[32 + 21]);
+        ty = s32ToI64(g[32 + 22]);
+        tz = s32ToI64(g[32 + 23]);
+    }
+    // cvSel == 3: zero translation.
+
+    const mac1: i64 = (tx << 12) + m11 * vx + m12 * vy + m13 * vz;
+    const mac2: i64 = (ty << 12) + m21 * vx + m22 * vy + m23 * vz;
+    const mac3: i64 = (tz << 12) + m31 * vx + m32 * vy + m33 * vz;
+
+    var sm1: i64 = mac1;
+    var sm2: i64 = mac2;
+    var sm3: i64 = mac3;
+    if (sf == 12) { sm1 = mac1 >> 12; sm2 = mac2 >> 12; sm3 = mac3 >> 12; }
+
+    g[D_MAC1] = (sm1 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC2] = (sm2 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC3] = (sm3 as u64 & 0xFFFFFFFF) as u32;
+    g[9]  = (satIrLm(sm1, lm) as u64 & 0xFFFF) as u32;
+    g[10] = (satIrLm(sm2, lm) as u64 & 0xFFFF) as u32;
+    g[11] = (satIrLm(sm3, lm) as u64 & 0xFFFF) as u32;
+}

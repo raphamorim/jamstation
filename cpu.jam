@@ -30,11 +30,14 @@ const { gpuAlloc } = import("gpu");
 const { dmaAlloc } = import("dma");
 const { irqAlloc } = import("irq");
 const { timerAlloc } = import("timer");
+const { gteAlloc, gteDataRead, gteDataWrite,
+        gteCtrlRead, gteCtrlWrite, gteExec } = import("gte");
 
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
 pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 pub extern fn putchar(c: i32) i32;
+pub extern fn printf(format: *const[] u8, ...) i32;
 
 const Bus = struct {
     ram:  *mut[] u8,
@@ -46,6 +49,7 @@ const Bus = struct {
     dma:   *mut[] u32,
     irq:   *mut[] u32,
     timer: *mut[] u32,
+    gte:   *mut[] u32,
     biosLoaded: u8,
 };
 
@@ -888,39 +892,80 @@ pub fn iRfe(c: Cpu, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
     return nc;
 }
 
-// COP2 (GTE) stub. Faulting on every GTE access made the BIOS skip its
-// 3D boot animation entirely; absorbing the access without faulting at
-// least lets the kernel proceed, with the side-effect that any GTE-
-// projected vertices come out as zero. The full math port is a project
-// of its own (~3 kLOC of fixed-point with saturation flags) and lives
-// behind this stub.
+// COP2 (GTE) dispatch. Sub-opcode in bits 25..21 (rs field) selects the
+// register-move; otherwise it's a math operation whose body lives in
+// `gteExec`.
 //
-// Layout:
-//   MFC2 (rs=0x00): load delay slot picks up `0`
-//   CFC2 (rs=0x02): load delay slot picks up `0`
-//   MTC2 (rs=0x04): swallow
-//   CTC2 (rs=0x06): swallow
-//   COP2 imm (rs >= 0x10): swallow
-pub fn iCop2Unimpl(c: Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+//   rs = 0x00  MFC2  data register → CPU register (delayed load)
+//   rs = 0x02  CFC2  control register → CPU register (delayed load)
+//   rs = 0x04  MTC2  CPU register → data register
+//   rs = 0x06  CTC2  CPU register → control register
+//   rs >= 0x10 COP2 imm — math op (RTPS, NCLIP, NCDS, ...)
+pub fn iCop2Unimpl(c: Cpu, opc: u32, bus: Bus,
+                   regs: *mut[] u32, cop0: *mut[] u32) Cpu {
     const rs: u32 = opRs(opc);
-    if (rs == 0x00 or rs == 0x02) {
-        // GTE register read — produce 0 via the load-delay slot so the
-        // caller's MFLO-style usage doesn't observe stale data.
+    if (rs == 0x00) {
+        // MFC2
         var nc: Cpu = c;
         if (nc.loadD != opRt(opc)) { nc = commitLoad(nc, regs); }
         nc.loadD = opRt(opc);
-        nc.loadV = 0;
+        nc.loadV = gteDataRead(bus.gte, opRd(opc));
         return nc;
     }
-    // MTC2 / CTC2 / COP2 math — silently absorb.
-    return commitLoad(c, regs);
+    if (rs == 0x02) {
+        // CFC2
+        var nc: Cpu = c;
+        if (nc.loadD != opRt(opc)) { nc = commitLoad(nc, regs); }
+        nc.loadD = opRt(opc);
+        nc.loadV = gteCtrlRead(bus.gte, opRd(opc));
+        return nc;
+    }
+    if (rs == 0x04) {
+        const v: u32 = gprRead(regs, opRt(opc));
+        var nc: Cpu = commitLoad(c, regs);
+        gteDataWrite(bus.gte, opRd(opc), v);
+        return nc;
+    }
+    if (rs == 0x06) {
+        const v: u32 = gprRead(regs, opRt(opc));
+        var nc: Cpu = commitLoad(c, regs);
+        gteCtrlWrite(bus.gte, opRd(opc), v);
+        return nc;
+    }
+    // COP2 math op (RTPS, NCLIP, ...) — bottom 25 bits encode the
+    // operation; gteExec dispatches on the low 6.
+    var nc: Cpu = commitLoad(c, regs);
+    gteExec(bus.gte, opc);
+    return nc;
 }
 
-// LWC2 / SWC2 (primary 0x32 / 0x3A) — same swallow semantics. These
-// load/store a single COP2 data register from/to memory and the BIOS
-// scaffolding uses them around RTPS calls.
-pub fn iCop2Mem(c: Cpu, regs: *mut[] u32) Cpu {
-    return commitLoad(c, regs);
+// LWC2 / SWC2 (primary 0x32 / 0x3A) — load/store a single COP2 data
+// register from/to memory. Used by some BIOS routines around RTPS
+// calls. Per psxe these go through the standard bus + GTE data path.
+pub fn iCop2Lwc(c: Cpu, opc: u32, bus: Bus,
+                regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const addr: u32 = s + opImmS(opc);
+    var nc: Cpu = commitLoad(c, regs);
+    if ((addr & 3) != 0) {
+        cop0Write(cop0, C0_BADVADDR, addr);
+        return raiseException(nc, cop0, CAUSE_ADEL);
+    }
+    gteDataWrite(bus.gte, opRt(opc), busRead32(bus, addr));
+    return nc;
+}
+
+pub fn iCop2Swc(c: Cpu, opc: u32, bus: Bus,
+                regs: *mut[] u32, cop0: *mut[] u32) Cpu {
+    const s: u32 = gprRead(regs, opRs(opc));
+    const addr: u32 = s + opImmS(opc);
+    var nc: Cpu = commitLoad(c, regs);
+    if ((addr & 3) != 0) {
+        cop0Write(cop0, C0_BADVADDR, addr);
+        return raiseException(nc, cop0, CAUSE_ADES);
+    }
+    busWrite32(bus, cop0, addr, gteDataRead(bus.gte, opRt(opc)));
+    return nc;
 }
 
 pub fn illegal(c: Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
@@ -994,7 +1039,7 @@ pub fn dispatch(c: Cpu, opc: u32, bus: Bus,
     if (p == 0x0E) { return iXori(c, opc, regs); }
     if (p == 0x0F) { return iLui(c, opc, regs); }
     if (p == 0x10) { return dispatchCop0(c, opc, regs, cop0); }
-    if (p == 0x12) { return iCop2Unimpl(c, opc, regs, cop0); }
+    if (p == 0x12) { return iCop2Unimpl(c, opc, bus, regs, cop0); }
     if (p == 0x20) { return iLb(c, opc, bus, regs); }
     if (p == 0x21) { return iLh(c, opc, bus, regs, cop0); }
     if (p == 0x22) { return iLwl(c, opc, bus, regs); }
@@ -1010,10 +1055,13 @@ pub fn dispatch(c: Cpu, opc: u32, bus: Bus,
     // COPx load/store opcodes (LWC0/1/2/3, SWC0/1/2/3). COP2 (the GTE)
     // gets the swallow stub; the other coprocessors don't exist on the
     // PSX, so we raise coprocessor-unusable as before.
-    if (p == 0x32 or p == 0x3A) { return iCop2Mem(c, regs); }
+    if (p == 0x32) { return iCop2Lwc(c, opc, bus, regs, cop0); }
+    if (p == 0x3A) { return iCop2Swc(c, opc, bus, regs, cop0); }
+    // COP0/COP1/COP3 load/store — none exist on the PSX. Raise
+    // coprocessor-unusable like the original code.
     if (p == 0x30 or p == 0x31 or p == 0x33 or
         p == 0x38 or p == 0x39 or p == 0x3B) {
-        return iCop2Unimpl(c, opc, regs, cop0);
+        return iCop2Unimpl(c, opc, bus, regs, cop0);
     }
     return illegal(c, opc, regs, cop0);
 }

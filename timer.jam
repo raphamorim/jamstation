@@ -222,14 +222,18 @@ pub fn timerWrite8(t: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32,
     timerWrite32(t, ic, cop0, off, val & 0xFF);
 }
 
-// Per-cycle advance. Each call covers two CPU cycles (matches psxe's
-// `psx_timer_update` cadence). Timer 1 with clk_source=1 (hblank) is
-// driven by `timerHblankEvent` instead; timer 0 has a dotclock mode
-// we approximate as system clock for now.
+// Per-cycle advance. The caller passes how many CPU cycles have just
+// been executed (psxe equivalent: `psx_timer_update(timer, cpu->last_cycles)`).
+// Timer 1 with clk_source=1 (hblank) is driven by `timerHblankEvent`
+// instead; timer 0 has a dotclock mode we approximate as system clock.
 pub fn timerUpdate(t: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32) {
-    timerUpdateOne(t, 0, 2, ic, cop0);
-    timerUpdateOne(t, 1, 2, ic, cop0);
-    timerUpdateOne(t, 2, 2, ic, cop0);
+    timerUpdateCyc(t, ic, cop0, 2);
+}
+
+pub fn timerUpdateCyc(t: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
+    timerUpdateOne(t, 0, cyc, ic, cop0);
+    timerUpdateOne(t, 1, cyc, ic, cop0);
+    timerUpdateOne(t, 2, cyc, ic, cop0);
 }
 
 pub fn timerUpdateOne(t: *mut[] u32, idx: u32, cyc: u32,

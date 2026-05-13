@@ -17,10 +17,11 @@ const {
 
 // Force device modules into main.jam's codegen context.
 const { gpuAlloc, gpuUpdate, gpuFamilyCount } = import("gpu");
+const { gteAlloc } = import("gte");
 const { dmaAlloc, dmaUpdate } = import("dma");
 const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
 const {
-    timerAlloc, timerUpdate,
+    timerAlloc, timerUpdate, timerUpdateCyc,
     timerHblankBegin, timerHblankEnd,
     timerVblankBegin, timerVblankEnd
 } = import("timer");
@@ -92,6 +93,7 @@ const Bus = struct {
     dma:   *mut[] u32,
     irq:   *mut[] u32,
     timer: *mut[] u32,
+    gte:   *mut[] u32,
     biosLoaded: u8,
 };
 
@@ -244,6 +246,14 @@ fn runOneFrame(c: Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
     var line: u32 = 0;
     while (line < SCANLINES_TOTAL) {
         nc = runHooked(nc, bus, regs, cop0, CYCLES_PER_SCANLINE);
+        // Match psxe: tick the timer/dma engines on every scanline using
+        // the cycle delta actually executed. Doing this only at end-of-
+        // frame leaves timer 2 (and any DMA IRQ delay counters) frozen
+        // within a frame, which the BIOS's VSync routines detect and
+        // log as "VSync: timeout" before our once-per-frame vblank IRQ
+        // even fires.
+        timerUpdateCyc(bus.timer, bus.irq, cop0, CYCLES_PER_SCANLINE);
+        dmaUpdate(bus.dma, bus.irq, cop0);
         timerHblankBegin(bus.timer, bus.irq, cop0);
         timerHblankEnd(bus.timer);
         if (line == SCANLINES_VDRAW) {
@@ -253,8 +263,6 @@ fn runOneFrame(c: Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) Cpu {
         line = line + 1;
     }
     timerVblankEnd(bus.timer);
-    timerUpdate(bus.timer, bus.irq, cop0);
-    dmaUpdate(bus.dma, bus.irq, cop0);
     return nc;
 }
 
@@ -368,7 +376,7 @@ fn main() {
         // Bail after a long-but-finite session if no quit event comes —
         // protects users from a runaway window when there's no controller
         // input wired up yet.
-        if (frames > 180) { quit = 1; }
+        if (frames > 6000) { quit = 1; }
     }
 
     var fmtState: []u8 = "Stopped after %u frames: PC=%08X SP=%08X RA=%08X cycles=%llu\n";

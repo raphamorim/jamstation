@@ -17,6 +17,7 @@ const { irqRead32, irqRead16, irqRead8,
         irqWrite32, irqWrite16, irqWrite8, irqAlloc, irqFree } = import("irq");
 const { timerRead32, timerRead16, timerRead8,
         timerWrite32, timerWrite16, timerWrite8, timerAlloc, timerFree } = import("timer");
+const { gteAlloc, gteFree } = import("gte");
 
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
@@ -37,6 +38,7 @@ const Bus = struct {
     dma:   *mut[] u32,
     irq:   *mut[] u32,
     timer: *mut[] u32,
+    gte:   *mut[] u32,
     biosLoaded: u8,
 };
 
@@ -136,6 +138,7 @@ pub fn allocBus() Bus {
         dma:   dmaAlloc(),
         irq:   irqAlloc(),
         timer: timerAlloc(),
+        gte:   gteAlloc(),
         biosLoaded: 0,
     };
     return b;
@@ -151,6 +154,7 @@ pub fn freeBus(b: Bus) {
     dmaFree(b.dma);
     irqFree(b.irq);
     timerFree(b.timer);
+    gteFree(b.gte);
 }
 
 // Dispatch an IO-region address to the right device. The offset is
@@ -282,3 +286,4 @@ pub fn busGpuPtr(bus: Bus) *mut[] u32 { return bus.gpu; }
 pub fn busDmaPtr(bus: Bus) *mut[] u32 { return bus.dma; }
 pub fn busIrqPtr(bus: Bus) *mut[] u32 { return bus.irq; }
 pub fn busTimerPtr(bus: Bus) *mut[] u32 { return bus.timer; }
+pub fn busGtePtr(bus: Bus) *mut[] u32 { return bus.gte; }

@@ -118,6 +118,15 @@ pub fn dmaWriteDicr(d: *mut[] u32, val: u32) {
     var nd: u32 = d[22] & 0x80000000;
     nd = nd | flags;
     nd = nd | (val & 0xFFFFFF);
+    // Recompute the master-flag (bit 31) inline so the BIOS doesn't see a
+    // stale `master=1, no channel flags` reading between dmaUpdate ticks.
+    // psxe gets away with deferring this because its dma_update runs more
+    // often than ours; for safety we do it on every write.
+    const irqEn:  u32 = nd & DICR_IRQEN;
+    const forceB: u32 = nd & DICR_FORCE;
+    const fl:     u32 = nd & DICR_FLAGS;
+    nd = nd & (~DICR_IRQSI);
+    if (forceB != 0 or (fl != 0 and irqEn != 0)) { nd = nd | DICR_IRQSI; }
     d[22] = nd;
 }
 
