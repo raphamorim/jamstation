@@ -311,10 +311,23 @@ fn main() {
         write(STDOUT, msg.ptr, msg.len);
     }
 
-    var exePath: []u8 = "./demo.exe";
-    if (fileExists(exePath)) {
-        c = loadExe(exePath, bus, regs, c);
+    // EXE side-load. If `./demo.exe` exists we drop it into RAM and jump
+    // straight to its entry point (skipping the BIOS boot animation —
+    // appropriate for hand-crafted demos with their own init). For games
+    // that depend on the BIOS kernel being set up, drop the EXE at
+    // `./game.exe` instead: we boot the BIOS first and only sideload
+    // when PC reaches 0x80030000 (the standard "kernel ready" address
+    // psxe uses for the same handoff).
+    var demoPath: []u8 = "./demo.exe";
+    var gamePath: []u8 = "./game.exe";
+    var pendingGameExe: bool = false;
+    if (fileExists(demoPath)) {
+        c = loadExe(demoPath, bus, regs, c);
         flushAll();
+    } else if (fileExists(gamePath)) {
+        pendingGameExe = true;
+        var msg: []u8 = "game.exe found — booting BIOS first, will side-load at PC=80030000\n";
+        write(STDOUT, msg.ptr, msg.len);
     } else {
         var msg: []u8 = "No demo.exe — running from BIOS reset vector only\n";
         write(STDOUT, msg.ptr, msg.len);
@@ -364,6 +377,16 @@ fn main() {
     var frames: u32 = 0;
     var quit: u32 = 0;
     while (quit == 0) {
+        // Game-EXE side-load. Trigger once when PC enters the BIOS shell
+        // region (0x80030000-0x80030FFF). We check by range because a
+        // per-frame poll misses the exact transit through 0x80030000
+        // — the shell entry is reached for one instruction then control
+        // moves on.
+        if (pendingGameExe and c.pc >= 0x80030000 and c.pc < 0x80031000) {
+            c = loadExe(gamePath, bus, regs, c);
+            pendingGameExe = false;
+            flushAll();
+        }
         c = runOneFrame(c, bus, regs, cop0);
         var vram: *mut[] u8 = busVramPtr(bus);
         // Read the current display origin out of the GPU state buffer

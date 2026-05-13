@@ -39,6 +39,7 @@ pub extern fn free(ptr: *mut[] u8);
 pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 pub extern fn putchar(c: i32) i32;
 pub extern fn printf(format: *const[] u8, ...) i32;
+pub extern fn fflush(stream: u64) i32;
 
 const Bus = struct {
     ram:  *mut[] u8,
@@ -1128,18 +1129,25 @@ pub fn run(c: Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
 
 // ---------- BIOS A/B-table hooks ---------------------------------------
 
+// Emit one BIOS console byte. Falls back to a per-newline `fflush(NULL)`
+// so the boot log shows up even when stdout is redirected to a file
+// (which makes libc switch from line-buffered to fully-buffered, hiding
+// every banner char until the buffer fills or the process exits cleanly).
+pub fn biosPutc(ch: u32) {
+    putchar((ch & 0xFF) as i32);
+    if ((ch & 0xFF) == 0x0A) { fflush(0); }
+}
+
 pub fn biosHook(c: Cpu, bus: Bus, regs: *mut[] u32) Cpu {
     const pcMasked: u32 = c.pc & 0x3FFFFFFF;
-    // BIOS-call trace removed — was eating ~80% of CPU time printing
-    // ~50 chars per BIOS call. Re-enable when diffing against psxe.
     if (pcMasked == 0xA0) {
         const op: u32 = gprRead(regs, 9);
-        if (op == 0x09 or op == 0x3C) { putchar((gprRead(regs, 4) & 0xFF) as i32); }
+        if (op == 0x09 or op == 0x3C) { biosPutc(gprRead(regs, 4)); }
         if (op == 0x3E) {
             var src: u32 = gprRead(regs, 4);
             var ch: u32 = busRead8(bus, src);
             while (ch != 0) {
-                putchar((ch & 0xFF) as i32);
+                biosPutc(ch);
                 src = src + 1;
                 ch = busRead8(bus, src);
             }
@@ -1147,12 +1155,12 @@ pub fn biosHook(c: Cpu, bus: Bus, regs: *mut[] u32) Cpu {
     }
     if (pcMasked == 0xB0) {
         const op: u32 = gprRead(regs, 9);
-        if (op == 0x3B or op == 0x3D) { putchar((gprRead(regs, 4) & 0xFF) as i32); }
+        if (op == 0x3B or op == 0x3D) { biosPutc(gprRead(regs, 4)); }
         if (op == 0x3F) {
             var src: u32 = gprRead(regs, 4);
             var ch: u32 = busRead8(bus, src);
             while (ch != 0) {
-                putchar((ch & 0xFF) as i32);
+                biosPutc(ch);
                 src = src + 1;
                 ch = busRead8(bus, src);
             }
