@@ -437,6 +437,7 @@ pub fn iLh(c: mut Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     if ((addr & 1) != 0) {
         cop0Write(cop0, C0_BADVADDR, addr);
         raiseException(c, cop0, CAUSE_ADEL);
+        return;
     }
     c.loadD = opRt(opc);
     c.loadV = signExt16(busRead16(bus, addr));
@@ -449,6 +450,7 @@ pub fn iLhu(c: mut Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) 
     if ((addr & 1) != 0) {
         cop0Write(cop0, C0_BADVADDR, addr);
         raiseException(c, cop0, CAUSE_ADEL);
+        return;
     }
     c.loadD = opRt(opc);
     c.loadV = busRead16(bus, addr) & 0xFFFF;
@@ -461,6 +463,7 @@ pub fn iLw(c: mut Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     if ((addr & 3) != 0) {
         cop0Write(cop0, C0_BADVADDR, addr);
         raiseException(c, cop0, CAUSE_ADEL);
+        return;
     }
     c.loadD = opRt(opc);
     c.loadV = busRead32(bus, addr);
@@ -515,6 +518,7 @@ pub fn iSh(c: mut Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     if ((addr & 1) != 0) {
         cop0Write(cop0, C0_BADVADDR, addr);
         raiseException(c, cop0, CAUSE_ADES);
+        return;
     }
     busWrite16(bus, cop0, addr, t & 0xFFFF);
 }
@@ -528,6 +532,7 @@ pub fn iSw(c: mut Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     if ((addr & 3) != 0) {
         cop0Write(cop0, C0_BADVADDR, addr);
         raiseException(c, cop0, CAUSE_ADES);
+        return;
     }
     busWrite32(bus, cop0, addr, t);
 }
@@ -819,10 +824,29 @@ pub fn iMfc0(c: mut Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) {
     c.loadV = v;
 }
 
+// COP0 mtc0 write mask, per cop0 register index. Mirrors psxe's
+// g_psx_cpu_cop0_write_mask_table (cpu.c:10-27): CAUSE (r13) is mostly
+// read-only — only the software-IRQ bits 8-9 are writable, bit 10
+// (IP2, the IC-driven external IRQ) MUST be preserved. Without this,
+// a kernel ISR that clears software IRQs by writing CAUSE clobbers
+// IP2 and silently drops the pending CD-DMA / VBlank IRQ. The other
+// register masks are mostly 0 (read-only) or 0xFFFFFFFF (fully
+// writable). We only special-case CAUSE because the others' wrong
+// values don't manifest as a stall.
+pub fn cop0WriteMask(idx: u32) u32 {
+    if (idx == C0_CAUSE) { return 0x00000300; }
+    if (idx == C0_BADVADDR) { return 0; }
+    if (idx == C0_EPC) { return 0; }
+    return 0xFFFFFFFF;
+}
+
 pub fn iMtc0(c: mut Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) {
     const t: u32 = gprRead(regs, opRt(opc));
     commitLoad(c, regs);
-    cop0Write(cop0, opRd(opc), t);
+    const rd: u32 = opRd(opc);
+    const mask: u32 = cop0WriteMask(rd);
+    const old:  u32 = cop0Read(cop0, rd);
+    cop0Write(cop0, rd, (old & (~mask)) | (t & mask));
 }
 
 pub fn iRfe(c: mut Cpu, regs: *mut[] u32, cop0: *mut[] u32) {
@@ -885,6 +909,7 @@ pub fn iCop2Lwc(c: mut Cpu, opc: u32, bus: Bus,
     if ((addr & 3) != 0) {
         cop0Write(cop0, C0_BADVADDR, addr);
         raiseException(c, cop0, CAUSE_ADEL);
+        return;
     }
     gteDataWrite(bus.gte, opRt(opc), busRead32(bus, addr));
 }
@@ -897,6 +922,7 @@ pub fn iCop2Swc(c: mut Cpu, opc: u32, bus: Bus,
     if ((addr & 3) != 0) {
         cop0Write(cop0, C0_BADVADDR, addr);
         raiseException(c, cop0, CAUSE_ADES);
+        return;
     }
     busWrite32(bus, cop0, addr, gteDataRead(bus.gte, opRt(opc)));
 }

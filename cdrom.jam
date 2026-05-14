@@ -231,9 +231,14 @@ pub fn cdSetU32(d: *mut[] u8, off: u32, v: u32) {
 
 // ---------- status byte -------------------------------------------------
 
-// `cdrom_get_stat` in psxe: SPINDLE | (shell-open if no disc).
+// Mirrors psxe cdrom_get_stat (cdrom.c:454): SPINDLE always, plus READ
+// while the sector pump is active, SHELLOPEN if no disc, IDERROR if
+// mode bit 4 is set. The READ bit is what streaming-disc games poll
+// to confirm a CdlReadN/S actually took.
 pub fn cdromGetStat(d: *mut[] u8) u32 {
     var s: u32 = CD_STAT_SPINDLE;
+    if (d[C_READ_ONGOING] != 0) { s = s | CD_STAT_READ; }
+    if ((d[C_MODE] as u32 & 0x10) != 0) { s = s | CD_STAT_IDERROR; }
     if (d[C_HAS_DISC] == 0) { s = s | CD_STAT_SHELLOPEN; }
     return s;
 }
@@ -256,13 +261,13 @@ pub fn cdromReadStatus(d: *mut[] u8) u32 {
     if (qFull(d, C_PARAM_R, C_PARAM_W) == 0)  { r = r | 0x10; }
     // bit 5: response FIFO not empty.
     if (qEmpty(d, C_RESP_R, C_RESP_W) == 0)   { r = r | 0x20; }
-    // bit 6: data FIFO not empty (sector data available). psxe checks
-    // `read_index != 12 + 0x924`; we equivalently compare ridx vs wend.
-    // Without this Musashi spins at 0x80045128 polling for data after
-    // the bootloader's last ReadN/Pause.
+    // bit 6: data FIFO not empty AND data_req is asserted. psxe formula
+    // (cdrom.c:583): data_empty = queue_is_empty(data) || !data_req,
+    // bit 6 = !data_empty. A game polling for `(stat & 0x40)` to know
+    // when DMA is ready expects the data_req gate.
     const rIdx: u32 = cdGetU32(d, C_DATA_RIDX);
     const wIdx: u32 = cdGetU32(d, C_DATA_WIDX);
-    if (rIdx < wIdx) { r = r | 0x40; }
+    if (rIdx < wIdx and d[C_DATA_REQ] != 0) { r = r | 0x40; }
     // bit 7: busy.
     if (d[C_BUSY] != 0) { r = r | 0x80; }
     return r;
@@ -310,13 +315,7 @@ pub fn cdromWrite8(d: *mut[] u8, off: u32, val: u32) {
     }
     // Bank 0
     if (slot == 1) {
-        // Command byte — schedule state-machine entry. Only the first
-        // few commands are traced; bump the limit when debugging.
-        if (d[0x1E] < 200) {
-            var fmt: []u8 = "CD cmd 0x%02X (#%u)\n";
-            printf(fmt.ptr, val & 0xFF, d[0x1E] as u32);
-            d[0x1E] = d[0x1E] + 1;
-        }
+        // Command byte — schedule state-machine entry.
         d[C_PENDING_CMD] = (val & 0xFF) as u8;
         d[C_CMD_PENDING] = 1;
         d[C_PREV_STATE]  = d[C_STATE];
@@ -420,10 +419,6 @@ pub fn cdromExecuteCommand(d: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32) {
             const fB: u32 = (f & 0x0F) + ((f >> 4) & 0x0F) * 10;
             const lba: u32 = (mB * 4500) + (sB * 75) + fB;
             cdSetU32(d, C_PENDING_LBA, lba);
-            if (d[0x1E] < 40) {
-                var fmt: []u8 = "CD SetLoc m=%02X s=%02X f=%02X -> LBA=%u\n";
-                printf(fmt.ptr, m, s, f, lba);
-            }
         }
         d[C_IFR] = 3;
         qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
@@ -440,7 +435,19 @@ pub fn cdromExecuteCommand(d: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32) {
         d[C_IFR] = 3;
         qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
         d[C_STATE] = CD_STATE_TX_RESP2 as u8;
-        cdSetU32(d, C_DELAY, CD_DELAY_FR);
+        // psxe cdrom_get_pause_delay (cdrom.c:230): 7000 cycles if not
+        // streaming, otherwise 70ms (1x) or 35ms (2x). The long delay
+        // is what gives the game time to drain the data FIFO and
+        // process the last batch of sectors before INT2 ends the read.
+        var pauseDelay: u32 = 7000;
+        if (d[C_READ_ONGOING] != 0) {
+            if ((d[C_MODE] as u32 & MODE_SPEED) != 0) {
+                pauseDelay = 33869 * 35;
+            } else {
+                pauseDelay = 33869 * 70;
+            }
+        }
+        cdSetU32(d, C_DELAY, pauseDelay);
         return;
     }
     // CdlInit: psxe responds INT3+stat first, then a delayed INT2+stat.
@@ -510,9 +517,18 @@ pub fn cdromExecuteResp2(d: *mut[] u8) {
         return;
     }
     if (cmd == CDL_SEEKL) {
+        // Mirror psxe cdrom_cmd_seekl TX_RESP2 (impl.c:540-568): commit
+        // any pending SetLoc target into the current LBA, then INT2 +
+        // stat, and restore the prior state — so a SeekL issued during
+        // a streaming read keeps the READ state machine running.
+        cdromProcessSetloc(d);
         d[C_IFR] = 2;
         qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
-        d[C_STATE] = CD_STATE_IDLE as u8;
+        if (d[C_PREV_STATE] == CD_STATE_READ as u8) {
+            d[C_STATE] = CD_STATE_READ as u8;
+        } else {
+            d[C_STATE] = CD_STATE_IDLE as u8;
+        }
         return;
     }
     if (cmd == CDL_PAUSE) {
@@ -601,8 +617,23 @@ pub fn cdromUpdate(d: *mut[] u8, disc: *mut[] Disc,
     }
     if (d[C_STATE] == CD_STATE_TX_RESP1 as u8) {
         cdromExecuteCommand(d, ic, cop0);
+        // psxe cdrom.c:548-554: switching to READ after a non-read
+        // command in TX_RESP1 (e.g. SetMode/SetLoc/SeekL during a
+        // streaming read) incurs the "ongoing-read" delay of
+        // read_delay + 4ms. Without this Musashi sees an INT1 fire
+        // immediately on top of the INT3 ack and skips the Pause it
+        // would otherwise issue after each sector batch — producing
+        // the SetMode→SetLoc→SeekL→ReadN spin we observed.
+        if (d[C_STATE] == CD_STATE_READ as u8) {
+            cdromProcessSetloc(d);
+            cdSetU32(d, C_DELAY, cdromReadDelay(d) + 4 * 33869);
+        }
     } else if (d[C_STATE] == CD_STATE_TX_RESP2 as u8) {
         cdromExecuteResp2(d);
+        if (d[C_STATE] == CD_STATE_READ as u8) {
+            cdromProcessSetloc(d);
+            cdSetU32(d, C_DELAY, cdromReadDelay(d) + 4 * 33869);
+        }
     } else if (d[C_STATE] == CD_STATE_READ as u8) {
         cdromHandleRead(d, disc);
     }

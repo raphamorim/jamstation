@@ -42,6 +42,12 @@ const F_IRQ_FIRED:  u32 = 12;
 const F_PAUSED:     u32 = 13;
 const F_BLANK_ONCE: u32 = 14;
 const F_CLKSRC:     u32 = 15;
+// Scratch slot for the timer-2 /8 sub-tick accumulator. Previously we
+// stored this in the high 16 bits of F_COUNTER, but timerRead32 returns
+// the full 32-bit word — so the game would see counter | (sub<<16) and
+// equality checks against the target value never matched. Keep the
+// counter clean and stash sub-cycles in F_SUBTICK instead.
+const F_SUBTICK:    u32 = 51;
 
 pub fn timerAlloc() *mut[] u32 {
     var raw: *mut[] u8 = malloc((TIMER_STATE_WORDS as u64) * 4);
@@ -242,15 +248,15 @@ pub fn timerUpdateOne(t: *mut[] u32, idx: u32, cyc: u32,
     if (t[b + F_PAUSED] != 0) { return; }
     // Timer 1 sourced from hblank is incremented in the hblank handler.
     if (idx == 1 and (t[b + F_CLKSRC] & 1) != 0) { return; }
-    // Timer 2 with clk_source >= 2 ticks at sysclk/8.
+    // Timer 2 with clk_source >= 2 ticks at sysclk/8. psxe uses a float
+    // counter; we accumulate sub-cycles in F_SUBTICK and add whole /8
+    // increments to the clean 16-bit counter so timerRead32 returns a
+    // value the game can compare against F_TARGET without garbage bits.
     if (idx == 2 and t[b + F_CLKSRC] >= 2) {
-        // Accumulate every 8th tick. Use the counter's high word as a
-        // sub-tick accumulator — fine since the counter itself only
-        // uses 16 bits.
-        const acc: u32 = ((t[b + F_COUNTER] >> 16) + cyc) & 0xFFFF;
-        const incr: u32 = (acc >> 3) & 0xFFFF;
-        const sub:  u32 = acc & 7;
-        t[b + F_COUNTER] = ((t[b + F_COUNTER] + incr) & 0xFFFF) | (sub << 16);
+        const acc: u32 = t[F_SUBTICK] + cyc;
+        const incr: u32 = acc >> 3;
+        t[F_SUBTICK] = acc & 7;
+        t[b + F_COUNTER] = (t[b + F_COUNTER] + incr) & 0xFFFF;
     } else {
         t[b + F_COUNTER] = (t[b + F_COUNTER] + cyc) & 0xFFFFFFFF;
     }

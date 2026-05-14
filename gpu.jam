@@ -58,7 +58,11 @@ pub fn gpuAlloc() *mut[] u32 {
     memset(raw, 0, (GPU_STATE_WORDS as u64) * 4);
     var g: *mut[] u32 = raw as *mut[] u32;
     g[19] = GP_RECV_CMD;
-    g[46] = 0x14802000;   // GPUSTAT init (psxe: bit 23 display off)
+    // psxe init (gpu.c:59): only sets bit 23 (display disabled). Reads
+    // OR 0x1C000000 on the fly. Our previous 0x14802000 was wrong —
+    // bit 28 is OR'd by read anyway, bit 13 is junk that leaked into
+    // game state and produced a GPUSTAT diff at PC=0x8005C204.
+    g[46] = 0x00800000;
     g[47] = 1;            // default display_mode
     return g;
 }
@@ -183,13 +187,16 @@ pub fn gpuGp0(g: *mut[] u32, vram: *mut[] u8, val: u32) {
 pub fn gpuGp1(g: *mut[] u32, val: u32) {
     const cmd: u32 = (val >> 24) & 0xFF;
     if (cmd == 0x00) {
-        // Reset GPU: clear everything except VRAM contents.
+        // psxe ignores GP1(0x00) (gpu.c:1841-1874 switch has no case 0).
+        // Our previous clobber of gpustat to 0x14802000 wiped texpage /
+        // display-enable bits accumulated from prior GP0 commands —
+        // diff-trace showed Musashi reading GPUSTAT and getting the
+        // wrong value at PC=0x8005C204 after BIOS GPU init. Just reset
+        // the command-buffer state; leave gpustat alone.
         g[19] = GP_RECV_CMD;
         g[16] = 0;
         g[17] = 0;
         g[18] = 0;
-        g[46] = 0x14802000;
-        g[47] = 1;
         return;
     }
     if (cmd == 0x01) {
@@ -661,6 +668,12 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
         tpx = (page & 0xF) << 6;
         tpy = (page & 0x10) << 4;
         depth = (page >> 7) & 3;
+        // psxe gpu.c:971-977 "Undocumented behavior — fixes Mortal Kombat
+        // II, Bubble Bobble, Driver 1 & 2". Textured polys update gpustat
+        // bits 0-8 from the polygon's tpage byte. Without this, GPUSTAT
+        // texpage bits drift from psxe's value (diff trace at instruction
+        // 470014 confirmed this is the source).
+        g[46] = (g[46] & 0xFFFFFE00) | (page & 0x1FF);
         c2 = g[6] & 0xFFFFFF;
         v2x = gpuVertX(g[7]); v2y = gpuVertY(g[7]);
         uu2 = g[8] & 0xFF;  vv2 = (g[8] >> 8) & 0xFF;
@@ -682,6 +695,7 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
         tpx = (page & 0xF) << 6;
         tpy = (page & 0x10) << 4;
         depth = (page >> 7) & 3;
+        g[46] = (g[46] & 0xFFFFFE00) | (page & 0x1FF);
         v2x = gpuVertX(g[5]); v2y = gpuVertY(g[5]);
         uu2 = g[6] & 0xFF;  vv2 = (g[6] >> 8) & 0xFF;
         if (isQuad) {

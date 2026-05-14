@@ -240,7 +240,7 @@ pub fn ioRead8(bus: Bus, off: u32) u32 {
 pub fn ioWrite32(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     if (off >= 0x040 and off < 0x050) { padWrite32(bus.pad, off - 0x040, val); return; }
     if (off >= 0x070 and off < 0x080) { irqWrite32(bus.irq, cop0, off - 0x070, val); return; }
-    if (off >= 0x080 and off < 0x100) { dmaWrite32(bus.dma, bus, off - 0x080, val); return; }
+    if (off >= 0x080 and off < 0x100) { dmaWrite32(bus.dma, bus, cop0, off - 0x080, val); return; }
     if (off >= 0x100 and off < 0x130) { timerWrite32(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
     if (off >= 0x800 and off < 0x804) { cdromWrite32(bus.cdrom, off - 0x800, val); return; }
     if (off >= 0x810 and off < 0x818) { gpuWrite32(bus.gpu, bus.vram, off - 0x810, val); return; }
@@ -252,7 +252,7 @@ pub fn ioWrite32(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
 pub fn ioWrite16(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     if (off >= 0x040 and off < 0x050) { padWrite16(bus.pad, off - 0x040, val); return; }
     if (off >= 0x070 and off < 0x080) { irqWrite16(bus.irq, cop0, off - 0x070, val); return; }
-    if (off >= 0x080 and off < 0x100) { dmaWrite16(bus.dma, bus, off - 0x080, val); return; }
+    if (off >= 0x080 and off < 0x100) { dmaWrite16(bus.dma, bus, cop0, off - 0x080, val); return; }
     if (off >= 0x100 and off < 0x130) { timerWrite16(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
     if (off >= 0x800 and off < 0x804) { cdromWrite16(bus.cdrom, off - 0x800, val); return; }
     if (off >= 0x810 and off < 0x818) { gpuWrite16(bus.gpu, bus.vram, off - 0x810, val); return; }
@@ -264,7 +264,7 @@ pub fn ioWrite16(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
 pub fn ioWrite8(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     if (off >= 0x040 and off < 0x050) { padWrite8(bus.pad, off - 0x040, val); return; }
     if (off >= 0x070 and off < 0x080) { irqWrite8(bus.irq, cop0, off - 0x070, val); return; }
-    if (off >= 0x080 and off < 0x100) { dmaWrite8(bus.dma, bus, off - 0x080, val); return; }
+    if (off >= 0x080 and off < 0x100) { dmaWrite8(bus.dma, bus, cop0, off - 0x080, val); return; }
     if (off >= 0x100 and off < 0x130) { timerWrite8(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
     if (off >= 0x800 and off < 0x804) { cdromWrite8(bus.cdrom, off - 0x800, val); return; }
     if (off >= 0x810 and off < 0x818) { gpuWrite8(bus.gpu, bus.vram, off - 0x810, val); return; }

@@ -148,7 +148,7 @@ pub fn dmaWriteDicr(d: *mut[] u32, val: u32) {
     d[22] = nd;
 }
 
-pub fn dmaWrite32(d: *mut[] u32, bus: Bus, off: u32, val: u32) {
+pub fn dmaWrite32(d: *mut[] u32, bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     if (off < 0x70) {
         const ch:  u32 = (off >> 4) & 0x7;
         const reg: u32 = (off >> 2) & 0x3;
@@ -156,7 +156,7 @@ pub fn dmaWrite32(d: *mut[] u32, bus: Bus, off: u32, val: u32) {
         if (reg == 1) { d[chBase(ch) + F_BCR]  = val; }
         if (reg == 2) {
             d[chBase(ch) + F_CHCR] = val;
-            dmaTrigger(d, bus, ch);
+            dmaTrigger(d, bus, cop0, ch);
         }
         return;
     }
@@ -164,28 +164,35 @@ pub fn dmaWrite32(d: *mut[] u32, bus: Bus, off: u32, val: u32) {
     if (off == 0x74) { dmaWriteDicr(d, val); return; }
 }
 
-pub fn dmaWrite16(d: *mut[] u32, bus: Bus, off: u32, val: u32) {
+pub fn dmaWrite16(d: *mut[] u32, bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     if (off == 0x74) { dmaWriteDicr(d, val & 0xFFFF); return; }
     if (off == 0x76) { dmaWriteDicr(d, (val & 0xFFFF) << 16); return; }
-    dmaWrite32(d, bus, off, val & 0xFFFF);
+    dmaWrite32(d, bus, cop0, off, val & 0xFFFF);
 }
 
-pub fn dmaWrite8(d: *mut[] u32, bus: Bus, off: u32, val: u32) {
+pub fn dmaWrite8(d: *mut[] u32, bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     if (off == 0x74) { dmaWriteDicr(d, val & 0xFF); return; }
     if (off == 0x75) { dmaWriteDicr(d, (val & 0xFF) << 8);  return; }
     if (off == 0x76) { dmaWriteDicr(d, (val & 0xFF) << 16); return; }
     if (off == 0x77) { dmaWriteDicr(d, (val & 0xFF) << 24); return; }
-    dmaWrite32(d, bus, off, val & 0xFF);
+    dmaWrite32(d, bus, cop0, off, val & 0xFF);
 }
 
-pub fn dmaTrigger(d: *mut[] u32, bus: Bus, ch: u32) {
-    if (ch == 0) { dmaDoMdecIn(d, bus); return; }
-    if (ch == 1) { dmaDoMdecOut(d, bus); return; }
-    if (ch == 2) { dmaDoGpu(d, bus); return; }
-    if (ch == 3) { dmaDoCdrom(d, bus); return; }
-    if (ch == 4) { dmaDoSpu(d, bus); return; }
-    if (ch == 5) { return; }
-    if (ch == 6) { dmaDoOtc(d, bus); return; }
+// Trigger a channel's transfer when CHCR is written with the busy bit
+// set. After the burst completes we immediately call dmaUpdate to fold
+// the per-channel d[23..28] "done" flags into DICR.FLAG bits and raise
+// IC_DMA if enabled — psxe does this every CPU cycle via psx_dma_update,
+// but our scanline-granularity update missed the window where the game
+// polls DICR right after CHCR (Brave Fencer's audio bank loader does
+// exactly this around 0x80042510).
+pub fn dmaTrigger(d: *mut[] u32, bus: Bus, cop0: *mut[] u32, ch: u32) {
+    if (ch == 0) { dmaDoMdecIn(d, bus); }
+    if (ch == 1) { dmaDoMdecOut(d, bus); }
+    if (ch == 2) { dmaDoGpu(d, bus); }
+    if (ch == 3) { dmaDoCdrom(d, bus); }
+    if (ch == 4) { dmaDoSpu(d, bus); }
+    if (ch == 6) { dmaDoOtc(d, bus); }
+    dmaUpdate(d, bus.irq, cop0);
 }
 
 pub fn chcrBusy(d: *mut[] u32, ch: u32) bool {

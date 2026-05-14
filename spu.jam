@@ -620,11 +620,21 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
 
 // ---------- per-scanline tick ----------------------------------------
 //
-// No-op: spuGetSample is the only audio-producing path, and it's invoked
-// by the SDL audio callback at 44.1 kHz (wired in main.jam). Calling
-// spuGetSample per scanline would do nothing useful — the audio thread
-// is the rate-limiter for sample state.
+// PS1 CPU is 33.8688 MHz, SPU runs at 44.1 kHz, so 1 sample ≈ 768 CPU
+// cycles. We accumulate cycles and drain one spuGetSample per bucket.
+// This advances ADSR + voice playback at the correct rate; ENDX flips
+// naturally when a voice's release finishes. Samples are discarded for
+// now — actual audio output needs an SDL audio device.
+
+const G_SAMPLE_ACC: u32 = 0x58;        // u32, after G_LRSR
+const CYC_PER_SAMPLE: u32 = 768;
 
 pub fn spuUpdate(s: *mut[] u8, ram: *mut[] u8,
                  ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
+    var acc: u32 = getU32(s, GLOBAL_BASE + G_SAMPLE_ACC) + cyc;
+    while (acc >= CYC_PER_SAMPLE) {
+        spuGetSample(s, ram, ic, cop0);
+        acc = acc - CYC_PER_SAMPLE;
+    }
+    setU32(s, GLOBAL_BASE + G_SAMPLE_ACC, acc);
 }
