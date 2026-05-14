@@ -17,6 +17,7 @@ const {
     gprRead, gprWrite,
     cop0Read, cop0Write,
     run, runHooked,
+    step, biosHook, commitLoad,
     encR, encI, encJ
 } = import("cpu");
 
@@ -417,23 +418,35 @@ const CYC_PER_SCANLINE: u32 = 2172;
 const SCANLINES_VDRAW:  u32 = 240;
 const SCANLINES_TOTAL:  u32 = 263;
 
+// Mirror main.jam's per-cycle peripheral tick (post-Phase-3). Tests
+// should run the same scheduler as production so they catch real
+// regressions.
 fn emuRunOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     var line: u32 = 0;
+    var lineCyc: u32 = 0;
     while (line < SCANLINES_TOTAL) {
-        runHooked(c, bus, regs, cop0, CYC_PER_SCANLINE);
-        timerUpdateCyc(bus.timer, bus.irq, cop0, CYC_PER_SCANLINE);
+        biosHook(c, bus, regs);
+        const before: u64 = c.cycles;
+        step(c, bus, regs, cop0);
+        const delta: u32 = (c.cycles - before) as u32;
+        timerUpdateCyc(bus.timer, bus.irq, cop0, delta);
         dmaUpdate(bus.dma, bus.irq, cop0);
-        cdromUpdate(bus.cdrom, bus.disc, bus.irq, cop0, CYC_PER_SCANLINE);
-        padUpdate(bus.pad, bus.irq, cop0, CYC_PER_SCANLINE);
-        spuUpdate(bus.spu, bus.spuram, bus.irq, cop0, CYC_PER_SCANLINE);
-        timerHblankBegin(bus.timer, bus.irq, cop0);
-        timerHblankEnd(bus.timer);
-        if (line == SCANLINES_VDRAW) {
-            timerVblankBegin(bus.timer, bus.irq, cop0);
-            irqRaise(bus.irq, cop0, IC_VBLANK());
+        cdromUpdate(bus.cdrom, bus.disc, bus.irq, cop0, delta);
+        padUpdate(bus.pad, bus.irq, cop0, delta);
+        spuUpdate(bus.spu, bus.spuram, bus.irq, cop0, delta);
+        lineCyc = lineCyc + delta;
+        if (lineCyc >= CYC_PER_SCANLINE) {
+            lineCyc = lineCyc - CYC_PER_SCANLINE;
+            timerHblankBegin(bus.timer, bus.irq, cop0);
+            timerHblankEnd(bus.timer);
+            if (line == SCANLINES_VDRAW) {
+                timerVblankBegin(bus.timer, bus.irq, cop0);
+                irqRaise(bus.irq, cop0, IC_VBLANK());
+            }
+            line = line + 1;
         }
-        line = line + 1;
     }
+    commitLoad(c, regs);
     timerVblankEnd(bus.timer);
 }
 

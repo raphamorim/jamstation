@@ -65,6 +65,7 @@ const CTRL_SLOT: u32 = 0x2000;
 const STAT_TXR1: u32 = 0x0001;
 const STAT_RXNE: u32 = 0x0002;
 const STAT_TXR2: u32 = 0x0004;
+const STAT_ACKL: u32 = 0x0080;   // /ACK input level — controller response pulse
 const STAT_IRQ7: u32 = 0x0200;
 
 // Destinations on first TX byte.
@@ -173,15 +174,24 @@ pub fn padWriteTx(p: *mut[] u8, data: u32) {
     const ctrl: u32 = padGetU16(p, P_CTRL_LO);
     if ((ctrl & CTRL_TXEN) == 0) { return; }
     if (p[P_DEST] == 0) {
+        // First TX byte selects the destination (0x01 = joy, 0x81 = mcd).
         if ((data & 0xFF) == DEST_JOY) {
             p[P_DEST] = DEST_JOY as u8;
-            // sda starts at HIZ so the first read produces the 0xFF
-            // "byte-1 ignored" placeholder; the IDL state follows.
             p[P_SDA_STATE] = SDA_HIZ as u8;
             p[P_SDA_TXR] = 1;
             if ((ctrl & CTRL_ACIE) != 0) {
+                // Mirror psxe pad.c:115-118 — first byte ALSO sets
+                // irq_bit so when the countdown elapses, STAT.IRQ7
+                // gets latched, letting the BIOS pad driver see the
+                // controller "responded".
+                p[P_IRQ_BIT] = 1;
                 padSetU32(p, P_CYC_LO, JOY_IRQ_DELAY);
             }
+        } else {
+            // 0x81 = MCD or other — drop the line cleanly (no MCD
+            // emulated). Without this the BIOS BU/card task can jam
+            // the slot.
+            p[P_DEST] = 0;
         }
         return;
     }
@@ -266,8 +276,15 @@ pub fn padUpdate(p: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
     }
     padSetU32(p, P_CYC_LO, 0);
     if (p[P_IRQ_BIT] != 0) {
+        // Set IRQ7 AND ACKL (bit 7 = /ACK input level high during the
+        // controller's response pulse). The BIOS pad driver polls STAT
+        // bit 7 to confirm "controller responded with ACK" before
+        // sending the next TX byte. Without ACKL set, the driver
+        // bails before issuing byte 2 — explains "zero TX writes"
+        // beyond the first byte. ACKL gets cleared on the next
+        // CTRL_ACKN write (padHandleCtrlWrite).
         var stat: u32 = padGetU16(p, P_STAT_LO);
-        stat = stat | STAT_IRQ7;
+        stat = stat | STAT_IRQ7 | STAT_ACKL;
         padSetU16(p, P_STAT_LO, stat);
         p[P_IRQ_BIT] = 0;
     }
