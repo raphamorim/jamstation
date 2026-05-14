@@ -63,6 +63,8 @@ const Bus = struct {
     cdrom: *mut[] u8,
     disc:  *mut[] Disc,
     pad:   *mut[] u8,
+    spu:    *mut[] u8,
+    spuram: *mut[] u8,
     biosLoaded: u8,
 };
 

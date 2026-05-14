@@ -1,0 +1,630 @@
+// SPU — full port of psxe/psx/dev/spu.c.
+//
+// Layout of the byte buffer returned by spuAlloc:
+//   0x000..0x3FF : register file (mirrors psx_spu_t's voice[24] + globals)
+//   0x400..      : 24 × VS_SIZE per-voice runtime data (playing, counter,
+//                  current_addr, ADSR state, decoded buf[28], etc.)
+//   0x1C00..     : global runtime state (taddr, tfifo, even_cycle, revbaddr)
+//
+// Differences from psxe right now:
+//   - No reverb (the whole spu_get_reverb_sample path is skipped)
+//   - No Gaussian interpolation (nearest-neighbor: `out = s[0]`)
+//   - No SDL audio callback yet — spuGetSample is exported but unused
+//
+// What is in: ADPCM block decoder, ADSR (Attack/Decay/Sustain/Release),
+// KON/KOFF, ENDX, voice mixing, master volume. Enough to produce real
+// samples; we'll wire SDL audio + reverb after this lands clean.
+
+const { irqRaise, IC_SPU } = import("irq");
+
+pub extern fn malloc(size: u64) *mut[] u8;
+pub extern fn free(ptr: *mut[] u8);
+pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+pub extern fn printf(format: *const[] u8, ...) i32;
+
+const SPU_REG_SIZE:   u32 = 0x400;
+const VS_SIZE:        u32 = 256;
+const VOICE_COUNT:    u32 = 24;
+const VOICE_BASE:     u32 = 0x400;
+const GLOBAL_BASE:    u32 = 0x400 + 24 * 256;     // 0x1C00
+const SPU_STATE_SIZE: u32 = 0x400 + 24 * 256 + 256; // 0x1D00
+const SPU_RAM_SIZE:   u32 = 0x80000;
+
+// Voice-register offsets inside a 16-byte voice slot.
+const VR_VOLUMEL: u32 = 0x0;
+const VR_VOLUMER: u32 = 0x2;
+const VR_ADSAMPR: u32 = 0x4;
+const VR_ADSADDR: u32 = 0x6;
+const VR_ENVCTL1: u32 = 0x8;
+const VR_ENVCTL2: u32 = 0xA;
+const VR_ENVCVOL: u32 = 0xC;
+const VR_ADRADDR: u32 = 0xE;
+
+// Global register offsets (relative to 0x1F801C00).
+const R_MAINLVOL: u32 = 0x180;
+const R_MAINRVOL: u32 = 0x182;
+const R_VLOUT:    u32 = 0x184;
+const R_VROUT:    u32 = 0x186;
+const R_KONL:     u32 = 0x188;
+const R_KONH:     u32 = 0x18A;
+const R_KOFFL:    u32 = 0x18C;
+const R_KOFFH:    u32 = 0x18E;
+const R_EONL:     u32 = 0x198;
+const R_EONH:     u32 = 0x19A;
+const R_ENDXL:    u32 = 0x19C;
+const R_ENDXH:    u32 = 0x19E;
+const R_MBASE:    u32 = 0x1A2;
+const R_IRQADDR:  u32 = 0x1A4;
+const R_TADDR:    u32 = 0x1A6;
+const R_TFIFO:    u32 = 0x1A8;
+const R_SPUCNT:   u32 = 0x1AA;
+const R_TCTRL:    u32 = 0x1AC;
+const R_SPUSTAT:  u32 = 0x1AE;
+
+// Per-voice runtime offsets (added to VOICE_BASE + v * VS_SIZE).
+const D_PLAYING:    u32 = 0x00;
+const D_COUNTER:    u32 = 0x04;
+const D_CURADDR:    u32 = 0x08;
+const D_REPADDR:    u32 = 0x0C;
+const D_PREVSI:     u32 = 0x10;
+const D_S0:         u32 = 0x14;
+const D_S1:         u32 = 0x18;
+const D_S2:         u32 = 0x1C;
+const D_S3:         u32 = 0x20;
+const D_BFLAGS:     u32 = 0x24;
+const D_BUF0:       u32 = 0x28;   // 28 × i16 → 56 bytes through 0x60
+const D_H0:         u32 = 0x60;
+const D_H1:         u32 = 0x64;
+const D_LVOL:       u32 = 0x68;   // psxe stores as float; we keep i32 (volumel)
+const D_RVOL:       u32 = 0x6C;
+const D_CVOL:       u32 = 0x70;
+const D_APHASE:     u32 = 0x74;
+const D_ACYRELOAD:  u32 = 0x78;
+const D_ACYCLES:    u32 = 0x7C;
+const D_AMODE:      u32 = 0x80;
+const D_ADIR:       u32 = 0x84;
+const D_ASHIFT:     u32 = 0x88;
+const D_ASTEP:      u32 = 0x8C;
+const D_APENDSTEP:  u32 = 0x90;
+const D_ASUSLVL:    u32 = 0x94;
+const D_ENVCTL:     u32 = 0x98;
+
+// Global runtime offsets (added to GLOBAL_BASE).
+const G_TADDR:      u32 = 0x00;
+const G_TFIFO:      u32 = 0x04;   // 32 × u16 = 64 bytes → through 0x44
+const G_TFIFO_IDX:  u32 = 0x44;
+const G_EVEN_CYC:   u32 = 0x48;
+const G_REVBADDR:   u32 = 0x4C;
+const G_LRSL:       u32 = 0x50;
+const G_LRSR:       u32 = 0x54;
+
+// ADSR phases.
+const ADSR_ATTACK:  u32 = 0;
+const ADSR_DECAY:   u32 = 1;
+const ADSR_SUSTAIN: u32 = 2;
+const ADSR_RELEASE: u32 = 3;
+const ADSR_END:     u32 = 4;
+
+// ADPCM filter coefficient tables (psxe spu.c:22-28).
+const ADPCM_POS_0: i32 =   0;
+const ADPCM_POS_1: i32 =  60;
+const ADPCM_POS_2: i32 = 115;
+const ADPCM_POS_3: i32 =  98;
+const ADPCM_POS_4: i32 = 122;
+const ADPCM_NEG_0: i32 =   0;
+const ADPCM_NEG_1: i32 =   0;
+const ADPCM_NEG_2: i32 = -52;
+const ADPCM_NEG_3: i32 = -55;
+const ADPCM_NEG_4: i32 = -60;
+
+pub fn adpcmPos(f: u32) i32 {
+    if (f == 1) { return ADPCM_POS_1; }
+    if (f == 2) { return ADPCM_POS_2; }
+    if (f == 3) { return ADPCM_POS_3; }
+    if (f == 4) { return ADPCM_POS_4; }
+    return ADPCM_POS_0;
+}
+pub fn adpcmNeg(f: u32) i32 {
+    if (f == 2) { return ADPCM_NEG_2; }
+    if (f == 3) { return ADPCM_NEG_3; }
+    if (f == 4) { return ADPCM_NEG_4; }
+    return 0;
+}
+
+// ---------- allocation -------------------------------------------------
+
+pub fn spuAlloc() *mut[] u8 {
+    var raw: *mut[] u8 = malloc(SPU_STATE_SIZE as u64);
+    memset(raw, 0, SPU_STATE_SIZE as u64);
+    // psxe init: ENDX = 0x00FFFFFF (all voices ended), irq9addr = 0xFFFF.
+    setU16(raw, R_ENDXL, 0xFFFF);
+    setU16(raw, R_ENDXH, 0x00FF);
+    setU16(raw, R_IRQADDR, 0xFFFF);
+    return raw;
+}
+
+pub fn spuRamAlloc() *mut[] u8 {
+    var raw: *mut[] u8 = malloc(SPU_RAM_SIZE as u64);
+    memset(raw, 0, SPU_RAM_SIZE as u64);
+    return raw;
+}
+
+pub fn spuFree(p: *mut[] u8) { free(p); }
+pub fn spuRamFree(p: *mut[] u8) { free(p); }
+
+// ---------- byte-buffer access helpers --------------------------------
+
+pub fn getU16(s: *mut[] u8, off: u32) u32 {
+    return (s[off] as u32) | ((s[off + 1] as u32) << 8);
+}
+pub fn setU16(s: *mut[] u8, off: u32, v: u32) {
+    s[off]     = (v        & 0xFF) as u8;
+    s[off + 1] = ((v >> 8) & 0xFF) as u8;
+}
+pub fn getU32(s: *mut[] u8, off: u32) u32 {
+    return  (s[off]         as u32)
+         | ((s[off + 1]     as u32) << 8)
+         | ((s[off + 2]     as u32) << 16)
+         | ((s[off + 3]     as u32) << 24);
+}
+pub fn setU32(s: *mut[] u8, off: u32, v: u32) {
+    s[off]     = (v         & 0xFF) as u8;
+    s[off + 1] = ((v >>  8) & 0xFF) as u8;
+    s[off + 2] = ((v >> 16) & 0xFF) as u8;
+    s[off + 3] = ((v >> 24) & 0xFF) as u8;
+}
+
+pub fn getI16(s: *mut[] u8, off: u32) i32 {
+    const u: u32 = getU16(s, off);
+    if ((u & 0x8000) != 0) { return (u | 0xFFFF0000) as i32; }
+    return u as i32;
+}
+pub fn setI16(s: *mut[] u8, off: u32, v: i32) {
+    setU16(s, off, (v as u32) & 0xFFFF);
+}
+pub fn getI32(s: *mut[] u8, off: u32) i32 { return getU32(s, off) as i32; }
+pub fn setI32(s: *mut[] u8, off: u32, v: i32) { setU32(s, off, v as u32); }
+
+pub fn voiceRegBase(v: u32) u32 { return v * 0x10; }
+pub fn voiceRTBase(v: u32) u32 { return VOICE_BASE + v * VS_SIZE; }
+
+pub fn endx(s: *mut[] u8) u32 {
+    return getU16(s, R_ENDXL) | (getU16(s, R_ENDXH) << 16);
+}
+pub fn setEndx(s: *mut[] u8, v: u32) {
+    setU16(s, R_ENDXL, v & 0xFFFF);
+    setU16(s, R_ENDXH, (v >> 16) & 0xFF);
+}
+
+pub fn sat16(v: i32) i32 {
+    if (v < -32768) { return -32768; }
+    if (v >  32767) { return  32767; }
+    return v;
+}
+pub fn clamp7fff(v: i32) i32 {
+    if (v < 0)      { return 0; }
+    if (v > 0x7FFF) { return 0x7FFF; }
+    return v;
+}
+pub fn maxI(a: i32, b: i32) i32 { if (a > b) { return a; } return b; }
+
+// ---------- ADPCM block decoder (psxe spu_read_block) ----------------
+
+pub fn spuReadBlock(s: *mut[] u8, ram: *mut[] u8, v: u32) {
+    const base: u32 = voiceRTBase(v);
+    const addr: u32 = getU32(s, base + D_CURADDR);
+    const hdr: u32 = ram[addr] as u32;
+    setU32(s, base + D_BFLAGS, ram[addr + 1] as u32);
+
+    var hdrShift: u32 = hdr & 0xF;
+    if (hdrShift > 12) { hdrShift = 9; }
+    const shift: u32 = 12 - hdrShift;
+    const filter: u32 = (hdr >> 4) & 7;
+
+    const f0: i32 = adpcmPos(filter);
+    const f1: i32 = adpcmNeg(filter);
+
+    var h0: i32 = getI32(s, base + D_H0);
+    var h1: i32 = getI32(s, base + D_H1);
+
+    var j: u32 = 0;
+    while (j < 28) {
+        const byte: u32 = ram[addr + 2 + (j >> 1)] as u32;
+        const nibble: u32 = (byte >> ((j & 1) * 4)) & 0xF;
+        // Sign-extend the 4-bit nibble.
+        var t: i32 = nibble as i32;
+        if ((nibble & 0x8) != 0) { t = t - 16; }
+        const tShifted: i32 = t << shift;
+        const pred: i32 = ((h0 * f0) + (h1 * f1) + 32) / 64;
+        const sample: i32 = sat16(tShifted + pred);
+
+        h1 = h0;
+        h0 = sample;
+        setI16(s, base + D_BUF0 + j * 2, sample);
+        j = j + 1;
+    }
+
+    setI32(s, base + D_H0, h0);
+    setI32(s, base + D_H1, h1);
+}
+
+// ---------- ADSR ------------------------------------------------------
+
+pub fn adsrCalcValues(s: *mut[] u8, v: u32) {
+    const base: u32 = voiceRTBase(v);
+    const shift: i32 = getI32(s, base + D_ASHIFT);
+    const step: i32 = getI32(s, base + D_ASTEP);
+    const mode: u32 = getU32(s, base + D_AMODE);
+    const dir: u32 = getU32(s, base + D_ADIR);
+    const level: i32 = getI32(s, base + D_CVOL);
+
+    var cycles: i32 = 1 << maxI(0, shift - 11);
+    var stepShifted: i32 = step << maxI(0, 11 - shift);
+
+    if (mode != 0 and level > 0x6000 and dir == 0) { cycles = cycles * 4; }
+    if (mode != 0 and dir != 0) { stepShifted = (stepShifted * level) >> 15; }
+
+    setI32(s, base + D_ACYCLES, cycles);
+    setI32(s, base + D_ACYRELOAD, cycles);
+    setI32(s, base + D_APENDSTEP, stepShifted);
+}
+
+pub fn adsrLoadAttack(s: *mut[] u8, v: u32) {
+    const base: u32 = voiceRTBase(v);
+    const envctl: u32 = getU32(s, base + D_ENVCTL);
+    setU32(s, base + D_AMODE, (envctl >> 15) & 1);
+    setU32(s, base + D_ADIR, 0);
+    setI32(s, base + D_ASHIFT, ((envctl >> 10) & 0x1F) as i32);
+    setI32(s, base + D_ASTEP, 7 - (((envctl >> 8) & 3) as i32));
+    setI32(s, base + D_CVOL, 0);
+    setU32(s, base + D_APHASE, ADSR_ATTACK);
+    adsrCalcValues(s, v);
+}
+
+pub fn adsrLoadDecay(s: *mut[] u8, v: u32) {
+    const base: u32 = voiceRTBase(v);
+    const envctl: u32 = getU32(s, base + D_ENVCTL);
+    setU32(s, base + D_AMODE, 1);
+    setU32(s, base + D_ADIR, 1);
+    setI32(s, base + D_ASHIFT, ((envctl >> 4) & 0xF) as i32);
+    setI32(s, base + D_ASTEP, -8);
+    setI32(s, base + D_CVOL, 0x7FFF);
+    setU32(s, base + D_APHASE, ADSR_DECAY);
+    adsrCalcValues(s, v);
+}
+
+pub fn adsrLoadSustain(s: *mut[] u8, v: u32) {
+    const base: u32 = voiceRTBase(v);
+    const envctl: u32 = getU32(s, base + D_ENVCTL);
+    setU32(s, base + D_AMODE, (envctl >> 31) & 1);
+    setU32(s, base + D_ADIR, (envctl >> 30) & 1);
+    setI32(s, base + D_ASHIFT, ((envctl >> 24) & 0x1F) as i32);
+    var stepRaw: i32 = ((envctl >> 22) & 3) as i32;
+    if (((envctl >> 30) & 1) != 0) { stepRaw = -8 + stepRaw; }
+    else { stepRaw = 7 - stepRaw; }
+    setI32(s, base + D_ASTEP, stepRaw);
+    setI32(s, base + D_CVOL, getI32(s, base + D_ASUSLVL));
+    setU32(s, base + D_APHASE, ADSR_SUSTAIN);
+    adsrCalcValues(s, v);
+}
+
+pub fn adsrLoadRelease(s: *mut[] u8, v: u32) {
+    const base: u32 = voiceRTBase(v);
+    const envctl: u32 = getU32(s, base + D_ENVCTL);
+    setU32(s, base + D_AMODE, (envctl >> 21) & 1);
+    setU32(s, base + D_ADIR, 1);
+    setI32(s, base + D_ASHIFT, ((envctl >> 16) & 0x1F) as i32);
+    setI32(s, base + D_ASTEP, -8);
+    setU32(s, base + D_APHASE, ADSR_RELEASE);
+    setEndx(s, endx(s) | (1 << v));
+    adsrCalcValues(s, v);
+}
+
+pub fn spuHandleAdsr(s: *mut[] u8, v: u32) {
+    const base: u32 = voiceRTBase(v);
+    var cycles: i32 = getI32(s, base + D_ACYCLES);
+    if (cycles > 0) {
+        setI32(s, base + D_ACYCLES, cycles - 1);
+        return;
+    }
+
+    adsrCalcValues(s, v);
+    var level: i32 = getI32(s, base + D_CVOL);
+    level = level + getI32(s, base + D_APENDSTEP);
+    level = clamp7fff(level);
+
+    const phase: u32 = getU32(s, base + D_APHASE);
+    if (phase == ADSR_ATTACK) {
+        setI32(s, base + D_CVOL, level);
+        if (level == 0x7FFF) { adsrLoadDecay(s, v); }
+    } else if (phase == ADSR_DECAY) {
+        setI32(s, base + D_CVOL, level);
+        if (level <= getI32(s, base + D_ASUSLVL)) { adsrLoadSustain(s, v); }
+    } else if (phase == ADSR_SUSTAIN) {
+        setI32(s, base + D_CVOL, level);
+    } else if (phase == ADSR_RELEASE) {
+        setI32(s, base + D_CVOL, level);
+        if (level == 0) {
+            setU32(s, base + D_APHASE, ADSR_END);
+            setI32(s, base + D_ACYCLES, 0);
+            setI32(s, base + D_APENDSTEP, 0);
+            setU32(s, base + D_PLAYING, 0);
+        }
+    } else {
+        // ADSR_END
+        setU32(s, base + D_PLAYING, 0);
+    }
+
+    // Mirror the envelope volume into the voice register so games can read it.
+    setU16(s, voiceRegBase(v) + VR_ENVCVOL, getI32(s, base + D_CVOL) as u32);
+    setI32(s, base + D_ACYCLES, getI32(s, base + D_ACYRELOAD));
+}
+
+// ---------- KON / KOFF -----------------------------------------------
+
+pub fn spuKon(s: *mut[] u8, ram: *mut[] u8, value: u32) {
+    var i: u32 = 0;
+    while (i < VOICE_COUNT) {
+        if ((value & (1 << i)) != 0) {
+            const vr: u32 = voiceRegBase(i);
+            const rt: u32 = voiceRTBase(i);
+            setU32(s, rt + D_PLAYING, 1);
+            setU32(s, rt + D_CURADDR, getU16(s, vr + VR_ADSADDR) << 3);
+            setU32(s, rt + D_REPADDR, getU16(s, vr + VR_ADRADDR) << 3);
+            // Store volumes as signed i32 (psxe uses float; the multiplier
+            // matters more than the type).
+            setI32(s, rt + D_LVOL, getI16(s, vr + VR_VOLUMEL));
+            setI32(s, rt + D_RVOL, getI16(s, vr + VR_VOLUMER));
+            setI32(s, rt + D_ASUSLVL,
+                   (((getU16(s, vr + VR_ENVCTL1) & 0xF) + 1) * 0x800) as i32);
+            const envctl: u32 = (getU16(s, vr + VR_ENVCTL2) << 16)
+                              | getU16(s, vr + VR_ENVCTL1);
+            setU32(s, rt + D_ENVCTL, envctl);
+
+            adsrLoadAttack(s, i);
+            spuReadBlock(s, ram, i);
+            setU16(s, vr + VR_ENVCVOL, 0x7FFF);
+        }
+        i = i + 1;
+    }
+    setEndx(s, endx(s) & (~(value & 0x00FFFFFF)));
+}
+
+pub fn spuKoff(s: *mut[] u8, value: u32) {
+    var i: u32 = 0;
+    while (i < VOICE_COUNT) {
+        if ((value & (1 << i)) != 0) { adsrLoadRelease(s, i); }
+        i = i + 1;
+    }
+}
+
+// ---------- write-side effects (psxe spu_handle_write) ----------------
+
+pub fn spuHandleWrite(s: *mut[] u8, ram: *mut[] u8, off: u32, val: u32) i32 {
+    if (off == R_KONL or off == R_KONH) {
+        if (val == 0) { return 1; }
+        const high: u32 = ((off & 2) != 0) as u32;
+        spuKon(s, ram, val << (16 * high));
+        return 1;
+    }
+    if (off == R_KOFFL or off == R_KOFFH) {
+        if (val == 0) { return 1; }
+        const high: u32 = ((off & 2) != 0) as u32;
+        spuKoff(s, val << (16 * high));
+        return 1;
+    }
+    if (off == R_TADDR) {
+        setU16(s, R_TADDR, val);
+        setU32(s, GLOBAL_BASE + G_TADDR, val << 3);
+        return 1;
+    }
+    if (off == R_TFIFO) {
+        setU16(s, R_TFIFO, val);
+        const idx: u32 = getU32(s, GLOBAL_BASE + G_TFIFO_IDX);
+        setU16(s, GLOBAL_BASE + G_TFIFO + idx * 2, val);
+        setU32(s, GLOBAL_BASE + G_TFIFO_IDX, idx + 1);
+        if (idx + 1 == 32) {
+            const spucnt: u32 = getU16(s, R_SPUCNT);
+            if (((spucnt >> 4) & 3) == 2) {
+                var ta: u32 = getU32(s, GLOBAL_BASE + G_TADDR);
+                var i: u32 = 0;
+                while (i < 32) {
+                    const t: u32 = getU16(s, GLOBAL_BASE + G_TFIFO + i * 2);
+                    ram[ta] = (t & 0xFF) as u8;
+                    ram[ta + 1] = ((t >> 8) & 0xFF) as u8;
+                    ta = ta + 2;
+                    i = i + 1;
+                }
+                setU32(s, GLOBAL_BASE + G_TADDR, ta);
+                setU32(s, GLOBAL_BASE + G_TFIFO_IDX, 0);
+            }
+        }
+        return 1;
+    }
+    if (off == R_SPUCNT) {
+        setU16(s, R_SPUCNT, val);
+        var stat: u32 = getU16(s, R_SPUSTAT);
+        stat = (stat & 0xFFC0) | (val & 0x3F);
+        setU16(s, R_SPUSTAT, stat);
+        if (((val >> 4) & 3) != 0) {
+            var ta: u32 = getU32(s, GLOBAL_BASE + G_TADDR);
+            const idx: u32 = getU32(s, GLOBAL_BASE + G_TFIFO_IDX);
+            var i: u32 = 0;
+            while (i < idx) {
+                const t: u32 = getU16(s, GLOBAL_BASE + G_TFIFO + i * 2);
+                ram[ta] = (t & 0xFF) as u8;
+                ram[ta + 1] = ((t >> 8) & 0xFF) as u8;
+                ta = ta + 2;
+                i = i + 1;
+            }
+            setU32(s, GLOBAL_BASE + G_TADDR, ta);
+            setU32(s, GLOBAL_BASE + G_TFIFO_IDX, 0);
+        }
+        return 1;
+    }
+    if (off == R_MBASE) {
+        setU16(s, R_MBASE, val);
+        setU32(s, GLOBAL_BASE + G_REVBADDR, val << 3);
+        return 1;
+    }
+    return 0;
+}
+
+// ---------- read TFIFO (psxe spu_read16 SPUR_TFIFO branch) ------------
+
+pub fn spuReadTfifo(s: *mut[] u8, ram: *mut[] u8) u32 {
+    var ta: u32 = getU32(s, GLOBAL_BASE + G_TADDR);
+    const lo: u32 = ram[ta] as u32;
+    const hi: u32 = ram[ta + 1] as u32;
+    setU32(s, GLOBAL_BASE + G_TADDR, ta + 2);
+    return lo | (hi << 8);
+}
+
+// ---------- bus dispatch ---------------------------------------------
+
+pub fn spuRead8(s: *mut[] u8, ram: *mut[] u8, off: u32) u32 {
+    if (off >= SPU_REG_SIZE) { return 0; }
+    return s[off] as u32;
+}
+
+pub fn spuRead16(s: *mut[] u8, ram: *mut[] u8, off: u32) u32 {
+    if (off + 1 >= SPU_REG_SIZE) { return 0; }
+    if (off == R_TFIFO) { return spuReadTfifo(s, ram); }
+    return getU16(s, off);
+}
+
+pub fn spuRead32(s: *mut[] u8, ram: *mut[] u8, off: u32) u32 {
+    if (off + 3 >= SPU_REG_SIZE) { return 0; }
+    return getU32(s, off);
+}
+
+pub fn spuWrite8(s: *mut[] u8, ram: *mut[] u8, off: u32, val: u32) {
+    if (off >= SPU_REG_SIZE) { return; }
+    s[off] = (val & 0xFF) as u8;
+}
+
+pub fn spuWrite16(s: *mut[] u8, ram: *mut[] u8, off: u32, val: u32) {
+    if (off + 1 >= SPU_REG_SIZE) { return; }
+    if (spuHandleWrite(s, ram, off, val & 0xFFFF) != 0) { return; }
+    // psxe skips writes at offset 0x0C inside the voice slot (volumer mirror).
+    if ((off & 0xF) == 0xC and off < 0x180) { return; }
+    setU16(s, off, val & 0xFFFF);
+}
+
+pub fn spuWrite32(s: *mut[] u8, ram: *mut[] u8, off: u32, val: u32) {
+    if (off + 3 >= SPU_REG_SIZE) { return; }
+    if (spuHandleWrite(s, ram, off, val & 0xFFFF) != 0) {
+        setU16(s, off + 2, (val >> 16) & 0xFFFF);
+        return;
+    }
+    setU16(s, off, val & 0xFFFF);
+    setU16(s, off + 2, (val >> 16) & 0xFFFF);
+}
+
+// ---------- sample mixer (psxe psx_spu_get_sample) --------------------
+
+pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
+                    ic: *mut[] u32, cop0: *mut[] u32) u32 {
+    const even: u32 = getU32(s, GLOBAL_BASE + G_EVEN_CYC) ^ 1;
+    setU32(s, GLOBAL_BASE + G_EVEN_CYC, even);
+
+    var left: i32 = 0;
+    var right: i32 = 0;
+
+    // KON/KOFF are one-shot — psxe zeroes them after dispatch each tick.
+    setU16(s, R_KONL, 0);
+    setU16(s, R_KONH, 0);
+    setU16(s, R_KOFFL, 0);
+    setU16(s, R_KOFFH, 0);
+
+    var v: u32 = 0;
+    while (v < VOICE_COUNT) {
+        if (getU32(s, voiceRTBase(v) + D_PLAYING) != 0) {
+            const rt: u32 = voiceRTBase(v);
+            const vr: u32 = voiceRegBase(v);
+
+            spuHandleAdsr(s, v);
+
+            var counter: u32 = getU32(s, rt + D_COUNTER);
+            var sampleIdx: u32 = counter >> 12;
+
+            if (sampleIdx > 27) {
+                sampleIdx = sampleIdx - 28;
+                counter = (counter & 0xFFF) | (sampleIdx << 12);
+                setU32(s, rt + D_COUNTER, counter);
+
+                const flags: u32 = getU32(s, rt + D_BFLAGS);
+                if ((flags & 4) != 0) {
+                    setU32(s, rt + D_REPADDR, getU32(s, rt + D_CURADDR));
+                }
+                const lp: u32 = flags & 3;
+                if (lp == 0 or lp == 2) {
+                    const irq9: u32 = getU16(s, R_IRQADDR) << 3;
+                    const spucnt: u32 = getU16(s, R_SPUCNT);
+                    if (irq9 == getU32(s, rt + D_CURADDR) and (spucnt & 0x40) != 0) {
+                        irqRaise(ic, cop0, IC_SPU());
+                    }
+                    setU32(s, rt + D_CURADDR, getU32(s, rt + D_CURADDR) + 0x10);
+                    if (irq9 == getU32(s, rt + D_CURADDR) and (spucnt & 0x40) != 0) {
+                        irqRaise(ic, cop0, IC_SPU());
+                    }
+                } else if (lp == 1) {
+                    setU32(s, rt + D_CURADDR, getU32(s, rt + D_REPADDR));
+                    setU32(s, rt + D_PLAYING, 0);
+                    setU16(s, vr + VR_ENVCVOL, 0);
+                    adsrLoadRelease(s, v);
+                } else {
+                    // lp == 3
+                    setEndx(s, endx(s) | (1 << v));
+                    setU32(s, rt + D_CURADDR, getU32(s, rt + D_REPADDR));
+                }
+                spuReadBlock(s, ram, v);
+            }
+
+            // Shuffle history if sample index advanced (nearest-neighbor path).
+            const prev: u32 = getU32(s, rt + D_PREVSI);
+            if (prev != sampleIdx) {
+                setI32(s, rt + D_S3, getI32(s, rt + D_S2));
+                setI32(s, rt + D_S2, getI32(s, rt + D_S1));
+                setI32(s, rt + D_S1, getI32(s, rt + D_S0));
+            }
+            const out: i32 = getI16(s, rt + D_BUF0 + sampleIdx * 2);
+            setI32(s, rt + D_S0, out);
+
+            const envc: i32 = getI16(s, vr + VR_ENVCVOL);
+            const lvol: i32 = getI32(s, rt + D_LVOL);
+            const rvol: i32 = getI32(s, rt + D_RVOL);
+            // psxe: samplel = (out * lvol) * (envcvol / 32767)
+            // Integer form: (out * lvol * envcvol) >> 15  (kept signed)
+            const sl: i32 = (out * lvol >> 15) * envc >> 15;
+            const sr: i32 = (out * rvol >> 15) * envc >> 15;
+            left = left + sl;
+            right = right + sr;
+
+            const step: u32 = getU16(s, vr + VR_ADSAMPR);
+            setU32(s, rt + D_PREVSI, counter >> 12);
+            setU32(s, rt + D_COUNTER, counter + step);
+        }
+        v = v + 1;
+    }
+
+    const spucnt: u32 = getU16(s, R_SPUCNT);
+    if ((spucnt & 0x4000) == 0) { return 0; }
+
+    const mainl: i32 = getI16(s, R_MAINLVOL);
+    const mainr: i32 = getI16(s, R_MAINRVOL);
+    const cl: i32 = (sat16(left)  * mainl) >> 15;
+    const cr: i32 = (sat16(right) * mainr) >> 15;
+    return (cl as u32 & 0xFFFF) | ((cr as u32 & 0xFFFF) << 16);
+}
+
+// ---------- per-scanline tick ----------------------------------------
+//
+// No-op: spuGetSample is the only audio-producing path, and it's invoked
+// by the SDL audio callback at 44.1 kHz (wired in main.jam). Calling
+// spuGetSample per scanline would do nothing useful — the audio thread
+// is the rate-limiter for sample state.
+
+pub fn spuUpdate(s: *mut[] u8, ram: *mut[] u8,
+                 ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
+}

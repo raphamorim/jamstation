@@ -28,6 +28,7 @@ const { cdromAlloc } = import("cdrom");
 const { discAlloc } = import("disc");
 const { dmaAlloc } = import("dma");
 const { padAlloc } = import("pad");
+const { spuAlloc, spuRamAlloc } = import("spu");
 const { irqAlloc } = import("irq");
 const { timerAlloc } = import("timer");
 
@@ -58,6 +59,8 @@ const Bus = struct {
     cdrom: *mut[] u8,
     disc:  *mut[] Disc,
     pad:   *mut[] u8,
+    spu:    *mut[] u8,
+    spuram: *mut[] u8,
     biosLoaded: u8,
 };
 
