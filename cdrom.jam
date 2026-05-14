@@ -93,6 +93,10 @@ const C_LBA:         u32 = 0x14;
 const C_PENDING_LBA: u32 = 0x18;
 const C_HAS_DISC:    u32 = 0x1C;
 const C_CMD_PENDING: u32 = 0x1D;
+const C_XA_FILE:     u32 = 0x1E;    // SetFilter file selector
+const C_XA_CHANNEL:  u32 = 0x1F;    // SetFilter channel selector
+const C_SEEK_PREC:   u32 = 0x2C;    // SeekL sets this; GetLocP reads it
+const C_PREV_SPEED:  u32 = 0x2D;    // Previous MODE.SPEED for SetMode delay
 const C_DATA_RIDX:   u32 = 0x20;    // u32 LE — data FIFO read cursor
 const C_DATA_WIDX:   u32 = 0x24;    // u32 LE — data FIFO write cursor
 const C_PARAM_BUF:   u32 = 0x40;
@@ -124,15 +128,30 @@ const CD_DELAY_READ_SS:   u32 = 451584;     // 33_868_800 / 75
 const CD_DELAY_READ_DS:   u32 = 225792;     // 33_868_800 / (2*75)
 
 // Command codes (matches CDL_* in cdrom.h).
-const CDL_GETSTAT:  u32 = 0x01;
-const CDL_SETLOC:   u32 = 0x02;
-const CDL_READN:    u32 = 0x06;
-const CDL_PAUSE:    u32 = 0x09;
-const CDL_INIT:     u32 = 0x0A;
-const CDL_MUTE:     u32 = 0x0B;
-const CDL_DEMUTE:   u32 = 0x0C;
-const CDL_SETMODE:  u32 = 0x0E;
-const CDL_READS:    u32 = 0x1B;
+const CDL_GETSTAT:    u32 = 0x01;
+const CDL_SETLOC:     u32 = 0x02;
+const CDL_PLAY:       u32 = 0x03;
+const CDL_FORWARD:    u32 = 0x04;
+const CDL_BACKWARD:   u32 = 0x05;
+const CDL_READN:      u32 = 0x06;
+const CDL_MOTORON:    u32 = 0x07;
+const CDL_STOP:       u32 = 0x08;
+const CDL_PAUSE:      u32 = 0x09;
+const CDL_INIT:       u32 = 0x0A;
+const CDL_MUTE:       u32 = 0x0B;
+const CDL_DEMUTE:     u32 = 0x0C;
+const CDL_SETFILTER:  u32 = 0x0D;
+const CDL_SETMODE:    u32 = 0x0E;
+const CDL_GETPARAM:   u32 = 0x0F;
+const CDL_GETLOCL:    u32 = 0x10;
+const CDL_GETLOCP:    u32 = 0x11;
+const CDL_SETSESSION: u32 = 0x12;
+const CDL_GETTN:      u32 = 0x13;
+const CDL_GETTD:      u32 = 0x14;
+const CDL_SEEKP:      u32 = 0x16;
+const CDL_READS:      u32 = 0x1B;
+const CDL_GETQ:       u32 = 0x1D;
+const CDL_READTOC:    u32 = 0x1E;
 
 // MODE register bits.
 const MODE_SECTOR_SIZE: u32 = 0x20;   // 0 = 0x800 payload, 1 = 0x924 raw
@@ -462,6 +481,9 @@ pub fn cdromExecuteCommand(d: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32) {
         d[C_IFR] = 3;
         qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
         d[C_STATE] = CD_STATE_TX_RESP2 as u8;
+        // psxe impl.c:564 sets seek_precision = 1 after a successful
+        // seek; subsequent GetLocP omits the 25-sector seek correction.
+        d[C_SEEK_PREC] = 1;
         cdSetU32(d, C_DELAY, CD_DELAY_FR);
         return;
     }
@@ -485,8 +507,199 @@ pub fn cdromExecuteCommand(d: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32) {
         cdSetU32(d, C_DELAY, cdromReadDelay(d));
         return;
     }
+    // CdlSetFilter (0x0D) — XA file/channel filter for streaming audio.
+    // psxe impl.c:339: queue_push(stat); xa_file = pop; xa_channel = pop.
+    // Harvest Moon and most XA-using games call this before READS in XA
+    // mode so the SPU only picks up matching sectors.
+    if (cmd == CDL_SETFILTER) {
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        d[C_XA_FILE] = qPop(d, C_PARAM_BUF, C_PARAM_R, C_PARAM_W) as u8;
+        d[C_XA_CHANNEL] = qPop(d, C_PARAM_BUF, C_PARAM_R, C_PARAM_W) as u8;
+        d[C_STATE] = d[C_PREV_STATE];
+        return;
+    }
+    // CdlGetParam (0x0F) — read back the cached state. psxe impl.c:366:
+    // returns 5 bytes: stat, mode, 0, xa_file, xa_channel.
+    if (cmd == CDL_GETPARAM) {
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, d[C_MODE] as u32);
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0);
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, d[C_XA_FILE] as u32);
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, d[C_XA_CHANNEL] as u32);
+        d[C_STATE] = d[C_PREV_STATE];
+        return;
+    }
+    // CdlGetLocL (0x10) — current sector header (8 bytes from data buf
+    // 0x0C..0x13: mm/ss/ff/mode/file/channel/sm/ci).
+    if (cmd == CDL_GETLOCL) {
+        d[C_IFR] = 3;
+        var i: u32 = 0;
+        while (i < 8) {
+            qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W,
+                d[C_DATA_BUF + 0x0C + i] as u32);
+            i = i + 1;
+        }
+        d[C_STATE] = d[C_PREV_STATE];
+        return;
+    }
+    // CdlGetLocP (0x11) — physical Q-channel position. 8 BCD bytes:
+    // track / index / rel-MM / rel-SS / rel-FF / abs-MM / abs-SS / abs-FF.
+    // Without multi-track support we treat the whole disc as track 1; the
+    // returned absolute position is BCD(MM:SS:FF) and relative is the
+    // same minus track-1 lead-in (lba 150).
+    if (cmd == CDL_GETLOCP) {
+        d[C_IFR] = 3;
+        const lba: u32 = cdGetU32(d, C_LBA);
+        const track: u32 = 1;
+        const trackLba: u32 = 150;     // first data track starts at 00:02:00
+        var rel: i32 = (lba as i32) - (trackLba as i32);
+        if (d[C_SEEK_PREC] == 0) { rel = rel - 25; }
+        if (rel < 0) { rel = -rel; }
+        const rmm: u32 = (rel as u32) / (60 * 75);
+        const rss: u32 = ((rel as u32) % (60 * 75)) / 75;
+        const rff: u32 = ((rel as u32) % (60 * 75)) % 75;
+        const amm: u32 = lba / (60 * 75);
+        const ass: u32 = (lba % (60 * 75)) / 75;
+        const aff: u32 = (lba % (60 * 75)) % 75;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, bcdEnc(track));
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, bcdEnc(1));
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, bcdEnc(rmm));
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, bcdEnc(rss));
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, bcdEnc(rff));
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, bcdEnc(amm));
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, bcdEnc(ass));
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, bcdEnc(aff));
+        d[C_STATE] = d[C_PREV_STATE];
+        return;
+    }
+    // CdlGetTN (0x13) — track count. We model a single-track data disc.
+    if (cmd == CDL_GETTN) {
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, bcdEnc(1));
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, bcdEnc(1));
+        d[C_STATE] = d[C_PREV_STATE];
+        return;
+    }
+    // CdlGetTD (0x14) — BCD-encoded MM:SS:00 of the track. We treat the
+    // whole image as track 1 and return its lead-in (00:02:00). Real
+    // multi-track support requires .cue parsing.
+    if (cmd == CDL_GETTD) {
+        const bcd: u32 = qPop(d, C_PARAM_BUF, C_PARAM_R, C_PARAM_W);
+        if (!bcdValid(bcd)) {
+            cdromError(d, CD_STAT_SPINDLE, CD_ERR_INVALID_SUBFUNC);
+            return;
+        }
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        // For track 0/1 return 00:02:00; for other tracks we can't model
+        // the end without .cue — return the same.
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, bcdEnc(0));
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, bcdEnc(2));
+        d[C_STATE] = d[C_PREV_STATE];
+        return;
+    }
+    // CdlForward (0x04) / CdlBackward (0x05) — lba advance / retreat by
+    // a fixed amount (psxe: 35 sectors).
+    if (cmd == CDL_FORWARD) {
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        cdSetU32(d, C_LBA, cdGetU32(d, C_LBA) + 35);
+        d[C_STATE] = d[C_PREV_STATE];
+        return;
+    }
+    if (cmd == CDL_BACKWARD) {
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        var lbaCur: u32 = cdGetU32(d, C_LBA);
+        if (lbaCur > 35 + 150) {
+            lbaCur = lbaCur - 35;
+        } else {
+            lbaCur = 150;
+        }
+        cdSetU32(d, C_LBA, lbaCur);
+        d[C_STATE] = d[C_PREV_STATE];
+        return;
+    }
+    // CdlMotorOn (0x07) / CdlStop (0x08) — two-phase motor control.
+    // psxe impl.c:241 / 259. We mirror the TX_RESP2 delayed-ack pattern.
+    if (cmd == CDL_MOTORON or cmd == CDL_STOP) {
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        d[C_STATE] = CD_STATE_TX_RESP2 as u8;
+        cdSetU32(d, C_DELAY, CD_DELAY_FR);
+        return;
+    }
+    // CdlSeekP (0x16) — physical seek. Same protocol as SeekL.
+    if (cmd == CDL_SEEKP) {
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        d[C_STATE] = CD_STATE_TX_RESP2 as u8;
+        cdSetU32(d, C_DELAY, CD_DELAY_FR);
+        return;
+    }
+    // CdlSetSession (0x12) — multi-session disc selection. Single-INT3
+    // ack; without multi-session support we don't fail-out unknown
+    // sessions (psxe impl.c:462 also stubs this).
+    if (cmd == CDL_SETSESSION) {
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        d[C_STATE] = CD_STATE_TX_RESP2 as u8;
+        cdSetU32(d, C_DELAY, CD_DELAY_FR);
+        return;
+    }
+    // CdlReadTOC (0x1E) — single-INT3 ack + delayed INT2.
+    if (cmd == CDL_READTOC) {
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        d[C_STATE] = CD_STATE_TX_RESP2 as u8;
+        cdSetU32(d, C_DELAY, CD_DELAY_FR);
+        return;
+    }
+    // CdlPlay (0x03) — CDDA audio playback. We don't model CDDA audio,
+    // but stub the INT3+stat ack so games that start a soundtrack don't
+    // see an INVALID_COMMAND error and bail.
+    if (cmd == CDL_PLAY) {
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        cdromProcessSetloc(d);
+        // Drop any track parameter so subsequent commands see an empty
+        // FIFO (psxe restores state without entering PLAY when no track).
+        if (d[C_PARAM_W] != d[C_PARAM_R]) {
+            qPop(d, C_PARAM_BUF, C_PARAM_R, C_PARAM_W);
+        }
+        d[C_STATE] = d[C_PREV_STATE];
+        return;
+    }
+    // CdlGetQ (0x1D) — subchannel Q. Stub with 10 zero bytes after stat;
+    // games that don't strictly need TOC data will accept the result.
+    if (cmd == CDL_GETQ) {
+        d[C_IFR] = 3;
+        qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        var i: u32 = 0;
+        while (i < 10) {
+            qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, 0);
+            i = i + 1;
+        }
+        d[C_STATE] = d[C_PREV_STATE];
+        return;
+    }
     // Unknown command — invalid.
     cdromError(d, CD_STAT_SPINDLE, CD_ERR_INVALID_COMMAND);
+}
+
+// Binary-to-BCD encoder (psxe ITOB). Inputs 0..99.
+pub fn bcdEnc(v: u32) u32 {
+    const lo: u32 = v % 10;
+    const hi: u32 = (v / 10) % 10;
+    return (hi << 4) | lo;
+}
+
+// BCD validity check (psxe VALID_BCD): both nibbles must be 0..9.
+pub fn bcdValid(b: u32) bool {
+    return ((b & 0x0F) <= 9) and (((b >> 4) & 0x0F) <= 9);
 }
 
 // Move the staged Setloc target into the current LBA (psxe's
