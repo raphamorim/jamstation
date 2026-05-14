@@ -406,12 +406,19 @@ pub fn iRegimm(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     commitLoad(c, regs);
     c.branch = 1;
 
+    // Link only on the two explicit AL variants (0x10/0x11). For
+    // unknown rt values psxe's default path treats the op as a plain
+    // BLTZ/BGEZ depending on bit 16 — no link.
     if (variant == 0x10 or variant == 0x11) {
         gprWrite(regs, 31, c.nextPc);
     }
 
+    // psxe (cpu.c REGIMM default): branch type is decided by bit 16
+    // (= rt & 1). Even-numbered rt → BLTZ semantics, odd → BGEZ. Our
+    // previous code only matched 0x00/0x10 for BLTZ and treated 0x02
+    // / 0x12 as BGEZ — diverging from psxe.
     var take: bool = false;
-    if (variant == 0x00 or variant == 0x10) {
+    if ((variant & 1) == 0) {
         take = signedLtZero(s);
     } else {
         take = signedGeZero(s);
@@ -933,6 +940,10 @@ pub fn iCop2Swc(c: mut Cpu, opc: u32, bus: Bus,
         raiseException(c, cop0, CAUSE_ADES);
         return;
     }
+    // Match psxe cpu.c psx_cpu_i_swc2: drop the write while the cache
+    // is isolated. Real R3000 routes the access to the I-cache instead
+    // of memory; emulators just no-op the store.
+    if ((cop0Read(cop0, C0_SR) & SR_ISC) != 0) { return; }
     busWrite32(bus, cop0, addr, gteDataRead(bus.gte, opRt(opc)));
 }
 
@@ -978,12 +989,13 @@ pub fn dispatchSpecial(c: mut Cpu, opc: u32, bus: Bus,
 }
 
 pub fn dispatchCop0(c: mut Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) {
-    if (opRs(opc) == 0x10 and (opc & 0x3F) == 0x10) {
-        iRfe(c, regs, cop0); return;
-    }
+    // psxe dispatches purely on rs (the CO/CT/MFC/MTC selector); the
+    // R3000 fn field is ignored for RFE since TLB ops don't exist on
+    // PSX. Match psxe: rs=0x10 → RFE regardless of fn.
     const rs: u32 = opRs(opc);
     if (rs == 0x00) { iMfc0(c, opc, regs, cop0); return; }
     if (rs == 0x04) { iMtc0(c, opc, regs, cop0); return; }
+    if (rs == 0x10) { iRfe(c, regs, cop0); return; }
     illegal(c, opc, regs, cop0); return;
 }
 
@@ -1025,11 +1037,16 @@ pub fn dispatch(c: mut Cpu, opc: u32, bus: Bus,
     // PSX, so we raise coprocessor-unusable as before.
     if (p == 0x32) { iCop2Lwc(c, opc, bus, regs, cop0); return; }
     if (p == 0x3A) { iCop2Swc(c, opc, bus, regs, cop0); return; }
-    // COP0/COP1/COP3 load/store — none exist on the PSX. Raise
-    // coprocessor-unusable like the original code.
+    // COP0/COP1/COP3 load/store — none exist on the PSX. psxe raises
+    // CAUSE_CPU (coprocessor unusable, code 0xB) per cpu.c lwc0/lwc1/
+    // lwc3/swc0/swc1/swc3 stubs. Previously we routed these through
+    // iCop2Unimpl which silently ran them as GTE math — masking real
+    // illegal instructions in games.
     if (p == 0x30 or p == 0x31 or p == 0x33 or
         p == 0x38 or p == 0x39 or p == 0x3B) {
-        iCop2Unimpl(c, opc, bus, regs, cop0); return;
+        commitLoad(c, regs);
+        raiseException(c, cop0, CAUSE_CPU);
+        return;
     }
     illegal(c, opc, regs, cop0); return;
 }
