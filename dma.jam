@@ -14,6 +14,7 @@
 const { gpuGp0 } = import("gpu");
 const { irqRaise, IC_DMA } = import("irq");
 const { cdromReadData } = import("cdrom");
+const { mdecRead32, mdecWrite32 } = import("mdec");
 
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
@@ -44,8 +45,11 @@ const Bus = struct {
     cdrom: *mut[] u8,
     disc:  *mut[] Disc,
     pad:   *mut[] u8,
-    spu:    *mut[] u8,
-    spuram: *mut[] u8,
+    spu:     *mut[] u8,
+    spuram:  *mut[] u8,
+    mdec:    *mut[] u8,
+    mdecIn:  *mut[] u8,
+    mdecOut: *mut[] u8,
     biosLoaded: u8,
 };
 
@@ -279,6 +283,11 @@ pub fn dmaDoGpuLinked(d: *mut[] u32, bus: Bus) {
     }
 }
 
+// DMA0: RAM → MDEC input port. Each word from RAM is sent to the MDEC
+// data port (0x1F801820), which buffers it as command parameters or
+// command body. When all words for the active MDEC command are
+// delivered, MDEC's internal state machine runs the decode and fills
+// its output buffer (mdec.jam:mdecWrite32).
 pub fn dmaDoMdecIn(d: *mut[] u32, bus: Bus) {
     if (!chcrBusy(d, 0)) { return; }
     const size: u32 = bcrSize(d, 0) * bcrBlocks(d, 0);
@@ -286,7 +295,8 @@ pub fn dmaDoMdecIn(d: *mut[] u32, bus: Bus) {
     var addr: u32 = d[chBase(0) + F_MADR];
     var i: u32 = 0;
     while (i < size) {
-        ramRead32(bus, addr);    // discard — MDEC unimplemented
+        const w: u32 = ramRead32(bus, addr);
+        mdecWrite32(bus.mdec, bus.mdecIn, bus.mdecOut, 0, w);
         addr = addr + step;
         i = i + 1;
     }
@@ -296,6 +306,8 @@ pub fn dmaDoMdecIn(d: *mut[] u32, bus: Bus) {
     d[23] = size;
 }
 
+// DMA1: MDEC output port → RAM. Drains decoded RGB words from the MDEC
+// output FIFO (0x1F801820 reads when output_words_remaining > 0).
 pub fn dmaDoMdecOut(d: *mut[] u32, bus: Bus) {
     if (!chcrBusy(d, 1)) { return; }
     const size: u32 = bcrSize(d, 1) * bcrBlocks(d, 1);
@@ -303,7 +315,8 @@ pub fn dmaDoMdecOut(d: *mut[] u32, bus: Bus) {
     var addr: u32 = d[chBase(1) + F_MADR];
     var i: u32 = 0;
     while (i < size) {
-        ramWrite32(bus, addr, 0);    // MDEC unimplemented — write zeros
+        const w: u32 = mdecRead32(bus.mdec, bus.mdecOut, 0);
+        ramWrite32(bus, addr, w);
         addr = addr + step;
         i = i + 1;
     }

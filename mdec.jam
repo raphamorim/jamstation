@@ -1,0 +1,574 @@
+// MDEC — Motion Decoder. Port of psxe/psx/dev/mdec.c (~470 lines).
+//
+// PSX intros (Musashi SQUARESOFT logo, Harvest Moon opening, BIOS PS-X
+// startup splash, etc.) decompress YUV macroblock data through this
+// chip. The game's flow per frame:
+//
+//   1. CdlReadS streams compressed sectors into RAM.
+//   2. DMA channel 0 copies input → MDEC's input FIFO (0x1F801820).
+//   3. MDEC runs RLE-decode → inverse-quantisation → iDCT → YUV→RGB.
+//   4. DMA channel 1 reads decoded RGB → RAM.
+//   5. GPU display VRAM blit of the decoded frame.
+//
+// Without MDEC, step 4 hands the game zeros / never fires the DMA-done
+// IRQ → game stalls on its FMV-wait loop.
+//
+// Layout: state buffer (4KB) holds all scalars + tables. Input/output
+// buffers are pre-allocated separately (256KB + 1MB) so we avoid per-
+// command malloc/free.
+
+pub extern fn malloc(size: u64) *mut[] u8;
+pub extern fn free(ptr: *mut[] u8);
+pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+pub extern fn memcpy(dst: *mut[] u8, src: *mut[] u8, n: u64) *mut[] u8;
+
+const MDEC_STATE_SIZE: u32  = 4096;
+const MDEC_INPUT_SIZE: u32  = 0x40000;   // 256 KB
+const MDEC_OUTPUT_SIZE: u32 = 0x100000;  // 1 MB
+
+// State-byte offsets. u32-aligned slots in the 4 KB state buffer.
+const S_CMD:            u32 = 0x00;
+const S_WORDS_REM:      u32 = 0x04;   // words left to receive
+const S_CUR_BLOCK:      u32 = 0x08;
+const S_OUTPUT_BIT15:   u32 = 0x0C;
+const S_OUTPUT_SIGNED:  u32 = 0x10;
+const S_OUTPUT_DEPTH:   u32 = 0x14;
+const S_INPUT_REQ:      u32 = 0x18;
+const S_OUTPUT_REQ:     u32 = 0x1C;
+const S_BUSY:           u32 = 0x20;
+const S_INPUT_FULL:     u32 = 0x24;
+const S_OUTPUT_EMPTY:   u32 = 0x28;
+const S_ENABLE_DMA0:    u32 = 0x2C;
+const S_ENABLE_DMA1:    u32 = 0x30;
+const S_RECV_COLOR:     u32 = 0x34;
+const S_INPUT_INDEX:    u32 = 0x38;
+const S_INPUT_SIZE_B:   u32 = 0x3C;   // bytes — set at command start
+const S_OUTPUT_INDEX:   u32 = 0x40;   // word index into output buffer
+const S_OUTPUT_WORDS:   u32 = 0x44;   // words remaining to read
+
+// Table offsets — each 256 bytes (64 entries × 4 max for safety).
+const T_Y_QUANT:    u32 = 0x100;   // 64 bytes
+const T_UV_QUANT:   u32 = 0x140;   // 64 bytes
+const T_SCALE:      u32 = 0x200;   // 64 × i16 = 128 bytes
+const T_YBLK:       u32 = 0x300;   // 64 × i16
+const T_CRBLK:      u32 = 0x400;
+const T_CBBLK:      u32 = 0x500;
+const T_ZAGZIG:     u32 = 0x600;   // 64 × u8
+
+// Command-table indices (top 3 bits of cmd word).
+const MDEC_CMD_NOP:     u32 = 0;
+const MDEC_CMD_DECODE:  u32 = 1;
+const MDEC_CMD_SET_QT:  u32 = 2;
+const MDEC_CMD_SET_ST:  u32 = 3;
+
+// Output depth values.
+const DEPTH_4BIT:  u32 = 0;
+const DEPTH_8BIT:  u32 = 1;
+const DEPTH_24BIT: u32 = 2;
+const DEPTH_15BIT: u32 = 3;
+
+// ---------- u32 / u16 / i16 accessors on the byte state buffer --------
+
+pub fn mGetU32(s: *mut[] u8, off: u32) u32 {
+    return  (s[off]         as u32)
+         | ((s[off + 1]     as u32) << 8)
+         | ((s[off + 2]     as u32) << 16)
+         | ((s[off + 3]     as u32) << 24);
+}
+pub fn mSetU32(s: *mut[] u8, off: u32, v: u32) {
+    s[off]     = (v         & 0xFF) as u8;
+    s[off + 1] = ((v >>  8) & 0xFF) as u8;
+    s[off + 2] = ((v >> 16) & 0xFF) as u8;
+    s[off + 3] = ((v >> 24) & 0xFF) as u8;
+}
+pub fn mGetU16(s: *mut[] u8, off: u32) u32 {
+    return (s[off] as u32) | ((s[off + 1] as u32) << 8);
+}
+pub fn mSetU16(s: *mut[] u8, off: u32, v: u32) {
+    s[off]     = (v        & 0xFF) as u8;
+    s[off + 1] = ((v >> 8) & 0xFF) as u8;
+}
+pub fn mGetI16(s: *mut[] u8, off: u32) i32 {
+    const u: u32 = mGetU16(s, off);
+    if ((u & 0x8000) != 0) { return (u | 0xFFFF0000) as i32; }
+    return u as i32;
+}
+pub fn mSetI16(s: *mut[] u8, off: u32, v: i32) {
+    mSetU16(s, off, (v as u32) & 0xFFFF);
+}
+
+// ---------- zigzag / zagzig tables (computed at init) ------------------
+
+// psxe's `int zagzig[]` — index into yblk in iDCT-input order (mdec.c:19-28).
+pub fn zagzigInit(s: *mut[] u8) {
+    s[T_ZAGZIG +  0] =  0 as u8; s[T_ZAGZIG +  1] =  1 as u8;
+    s[T_ZAGZIG +  2] =  8 as u8; s[T_ZAGZIG +  3] = 16 as u8;
+    s[T_ZAGZIG +  4] =  9 as u8; s[T_ZAGZIG +  5] =  2 as u8;
+    s[T_ZAGZIG +  6] =  3 as u8; s[T_ZAGZIG +  7] = 10 as u8;
+    s[T_ZAGZIG +  8] = 17 as u8; s[T_ZAGZIG +  9] = 24 as u8;
+    s[T_ZAGZIG + 10] = 32 as u8; s[T_ZAGZIG + 11] = 25 as u8;
+    s[T_ZAGZIG + 12] = 18 as u8; s[T_ZAGZIG + 13] = 11 as u8;
+    s[T_ZAGZIG + 14] =  4 as u8; s[T_ZAGZIG + 15] =  5 as u8;
+    s[T_ZAGZIG + 16] = 12 as u8; s[T_ZAGZIG + 17] = 19 as u8;
+    s[T_ZAGZIG + 18] = 26 as u8; s[T_ZAGZIG + 19] = 33 as u8;
+    s[T_ZAGZIG + 20] = 40 as u8; s[T_ZAGZIG + 21] = 48 as u8;
+    s[T_ZAGZIG + 22] = 41 as u8; s[T_ZAGZIG + 23] = 34 as u8;
+    s[T_ZAGZIG + 24] = 27 as u8; s[T_ZAGZIG + 25] = 20 as u8;
+    s[T_ZAGZIG + 26] = 13 as u8; s[T_ZAGZIG + 27] =  6 as u8;
+    s[T_ZAGZIG + 28] =  7 as u8; s[T_ZAGZIG + 29] = 14 as u8;
+    s[T_ZAGZIG + 30] = 21 as u8; s[T_ZAGZIG + 31] = 28 as u8;
+    s[T_ZAGZIG + 32] = 35 as u8; s[T_ZAGZIG + 33] = 42 as u8;
+    s[T_ZAGZIG + 34] = 49 as u8; s[T_ZAGZIG + 35] = 56 as u8;
+    s[T_ZAGZIG + 36] = 57 as u8; s[T_ZAGZIG + 37] = 50 as u8;
+    s[T_ZAGZIG + 38] = 43 as u8; s[T_ZAGZIG + 39] = 36 as u8;
+    s[T_ZAGZIG + 40] = 29 as u8; s[T_ZAGZIG + 41] = 22 as u8;
+    s[T_ZAGZIG + 42] = 15 as u8; s[T_ZAGZIG + 43] = 23 as u8;
+    s[T_ZAGZIG + 44] = 30 as u8; s[T_ZAGZIG + 45] = 37 as u8;
+    s[T_ZAGZIG + 46] = 44 as u8; s[T_ZAGZIG + 47] = 51 as u8;
+    s[T_ZAGZIG + 48] = 58 as u8; s[T_ZAGZIG + 49] = 59 as u8;
+    s[T_ZAGZIG + 50] = 52 as u8; s[T_ZAGZIG + 51] = 45 as u8;
+    s[T_ZAGZIG + 52] = 38 as u8; s[T_ZAGZIG + 53] = 31 as u8;
+    s[T_ZAGZIG + 54] = 39 as u8; s[T_ZAGZIG + 55] = 46 as u8;
+    s[T_ZAGZIG + 56] = 53 as u8; s[T_ZAGZIG + 57] = 60 as u8;
+    s[T_ZAGZIG + 58] = 61 as u8; s[T_ZAGZIG + 59] = 54 as u8;
+    s[T_ZAGZIG + 60] = 47 as u8; s[T_ZAGZIG + 61] = 55 as u8;
+    s[T_ZAGZIG + 62] = 62 as u8; s[T_ZAGZIG + 63] = 63 as u8;
+}
+
+// ---------- allocation -------------------------------------------------
+
+pub fn mdecAlloc() *mut[] u8 {
+    var raw: *mut[] u8 = malloc(MDEC_STATE_SIZE as u64);
+    memset(raw, 0, MDEC_STATE_SIZE as u64);
+    // Reset state: bit 31 set (data-out empty), depth 0, current_block 4.
+    mSetU32(raw, S_OUTPUT_EMPTY, 1);
+    mSetU32(raw, S_CUR_BLOCK, 4);
+    zagzigInit(raw);
+    return raw;
+}
+
+pub fn mdecInputAlloc() *mut[] u8 {
+    return malloc(MDEC_INPUT_SIZE as u64);
+}
+
+pub fn mdecOutputAlloc() *mut[] u8 {
+    return malloc(MDEC_OUTPUT_SIZE as u64);
+}
+
+pub fn mdecFree(p: *mut[] u8) { free(p); }
+
+// ---------- iDCT (mdec.c:45 real_idct) --------------------------------
+//
+// Two-pass 8×8 transform. scale_table is shared and global. blk values
+// are int16; intermediate sums need int32 accumulation.
+
+pub fn idctPass(src: *mut[] u8, dst: *mut[] u8, scale: *mut[] u8) {
+    var x: u32 = 0;
+    while (x < 8) {
+        var y: u32 = 0;
+        while (y < 8) {
+            var sum: i32 = 0;
+            var z: u32 = 0;
+            while (z < 8) {
+                const a: i32 = mGetI16(src, (y + z * 8) * 2);
+                const b: i32 = mGetI16(scale, (x + z * 8) * 2);
+                sum = sum + a * (b / 8);
+                z = z + 1;
+            }
+            const result: i32 = (sum + 0xFFF) / 0x2000;
+            mSetI16(dst, (x + y * 8) * 2, result);
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+}
+
+pub fn realIdct(s: *mut[] u8, blockOff: u32) {
+    // Block lives in-place; psxe ping-pongs between src/dst via a 64-i16
+    // scratch buf. We use 128 bytes of scratch at the top of yblk's
+    // alternate slot (T_YBLK + 128 is unused space).
+    const scratchOff: u32 = blockOff + 128;
+    // Pass 1: blk -> scratch via scale_table.
+    idctPass1(s, blockOff, scratchOff);
+    // Pass 2: scratch -> blk via scale_table.
+    idctPass2(s, scratchOff, blockOff);
+}
+
+pub fn idctPass1(s: *mut[] u8, srcOff: u32, dstOff: u32) {
+    var x: u32 = 0;
+    while (x < 8) {
+        var y: u32 = 0;
+        while (y < 8) {
+            var sum: i32 = 0;
+            var z: u32 = 0;
+            while (z < 8) {
+                const a: i32 = mGetI16(s, srcOff + (y + z * 8) * 2);
+                const b: i32 = mGetI16(s, T_SCALE + (x + z * 8) * 2);
+                sum = sum + a * (b / 8);
+                z = z + 1;
+            }
+            mSetI16(s, dstOff + (x + y * 8) * 2, (sum + 0xFFF) / 0x2000);
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+}
+
+pub fn idctPass2(s: *mut[] u8, srcOff: u32, dstOff: u32) {
+    idctPass1(s, srcOff, dstOff);
+}
+
+// ---------- RLE block decode (mdec.c:72 rl_decode_block) --------------
+//
+// Reads 16-bit words from `input` starting at `inIdx`. Decodes one block
+// into the block at `blkOff`, then runs iDCT. Returns the new input word
+// index.
+
+pub fn exts10(v: u32) i32 {
+    const t: u32 = (v << 22) & 0xFFFFFFFF;  // shift 10-bit into top
+    return (t as i32) >> 22;                 // arithmetic right shift
+}
+
+pub fn clampS10(v: i32) i32 {
+    if (v < -0x400) { return -0x400; }
+    if (v > 0x3FF)  { return  0x3FF; }
+    return v;
+}
+
+pub fn rlDecodeBlock(s: *mut[] u8, input: *mut[] u8, inIdx: u32,
+                     blkOff: u32, quantOff: u32) u32 {
+    // Clear block.
+    var i: u32 = 0;
+    while (i < 64) {
+        mSetI16(s, blkOff + i * 2, 0);
+        i = i + 1;
+    }
+
+    var idx: u32 = inIdx;
+    // Skip 0xFE00 run markers at start of block.
+    var n: u32 = mGetU16(input, idx * 2);
+    idx = idx + 1;
+    while (n == 0xFE00) {
+        n = mGetU16(input, idx * 2);
+        idx = idx + 1;
+    }
+
+    const qScale: u32 = (n >> 10) & 0x3F;
+    var val: i32 = exts10(n & 0x3FF) * (s[quantOff + 0] as i32);
+
+    var k: u32 = 0;
+    while (k < 64) {
+        if (qScale == 0) {
+            val = exts10(n & 0x3FF) * 2;
+        }
+        val = clampS10(val);
+        if (qScale > 0) {
+            // Use zagzig permutation.
+            const zk: u32 = s[T_ZAGZIG + k] as u32;
+            mSetI16(s, blkOff + zk * 2, val);
+        } else {
+            mSetI16(s, blkOff + k * 2, val);
+        }
+        n = mGetU16(input, idx * 2);
+        if (k == 63) { break; }
+        idx = idx + 1;
+        k = k + ((n >> 10) & 0x3F) + 1;
+        if (k < 64) {
+            const q: i32 = s[quantOff + k] as i32;
+            val = (exts10(n & 0x3FF) * q * (qScale as i32) + 4) / 8;
+        }
+    }
+
+    realIdct(s, blkOff);
+    return idx;
+}
+
+// ---------- YUV → RGB (mdec.c:135 yuv_to_rgb) --------------------------
+
+pub fn clampSByte(v: i32) i32 {
+    if (v < -128) { return -128; }
+    if (v >  127) { return  127; }
+    return v;
+}
+
+pub fn yuvToRgb(s: *mut[] u8, output: *mut[] u8, outBase: u32,
+                xx: u32, yy: u32) {
+    const depth: u32 = mGetU32(s, S_OUTPUT_DEPTH);
+    const signed_: u32 = mGetU32(s, S_OUTPUT_SIGNED);
+    const bit15: u32 = mGetU32(s, S_OUTPUT_BIT15);
+
+    var y: u32 = 0;
+    while (y < 8) {
+        var x: u32 = 0;
+        while (x < 8) {
+            const cri: u32 = ((x + xx) >> 1) + ((y + yy) >> 1) * 8;
+            const rRaw: i32 = mGetI16(s, T_CRBLK + cri * 2);
+            const bRaw: i32 = mGetI16(s, T_CBBLK + cri * 2);
+
+            // psxe uses floats: g = -0.3437*b + -0.7143*r;
+            //                   r = 1.402*r; b = 1.772*b.  We do this
+            // in f64 because Jam's float literals default to f64.
+            const rf: f64 = rRaw as f64;
+            const bf: f64 = bRaw as f64;
+            const gFloat: f64 = (0.0 - 0.3437) * bf + (0.0 - 0.7143) * rf;
+            const rFloat: f64 = 1.402 * rf;
+            const bFloat: f64 = 1.772 * bf;
+
+            const l: i32 = mGetI16(s, T_YBLK + (x + y * 8) * 2);
+
+            var r: i32 = clampSByte(l + (rFloat as i32));
+            var g: i32 = clampSByte(l + (gFloat as i32));
+            var b: i32 = clampSByte(l + (bFloat as i32));
+
+            if (signed_ == 0) {
+                r = r ^ 0x80;
+                g = g ^ 0x80;
+                b = b ^ 0x80;
+            }
+
+            const px: u32 = (x + xx);
+            const py: u32 = (y + yy);
+            if (depth == DEPTH_15BIT) {
+                const r5: u32 = ((r as u32) & 0xFF) >> 3;
+                const g5: u32 = ((g as u32) & 0xFF) >> 3;
+                const b5: u32 = ((b as u32) & 0xFF) >> 3;
+                var rgb: u32 = (b5 << 10) | (g5 << 5) | r5;
+                if (bit15 != 0) { rgb = rgb | 0x8000; }
+                const pxOff: u32 = outBase + (px + py * 16) * 2;
+                output[pxOff]     = (rgb & 0xFF) as u8;
+                output[pxOff + 1] = ((rgb >> 8) & 0xFF) as u8;
+            } else {
+                const pxOff: u32 = outBase + (px + py * 16) * 3;
+                output[pxOff]     = (r & 0xFF) as u8;
+                output[pxOff + 1] = (g & 0xFF) as u8;
+                output[pxOff + 2] = (b & 0xFF) as u8;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+// ---------- decode macroblock (mdec.c:180) ----------------------------
+
+pub fn mdecDecodeMacroblock(s: *mut[] u8,
+                            input: *mut[] u8, output: *mut[] u8) {
+    const depth: u32 = mGetU32(s, S_OUTPUT_DEPTH);
+    const inputBytes: u32 = mGetU32(s, S_INPUT_SIZE_B);
+    if (depth < 2) {
+        // 4-bit / 8-bit mono — single Y block per macroblock.
+        const blockSize: u32 = 64;   // bytes (8-bit) ;4-bit halved later
+        rlDecodeBlock(s, input, 0, T_YBLK, T_Y_QUANT);
+        var i: u32 = 0;
+        while (i < 64) {
+            const y: i32 = mGetI16(s, T_YBLK + i * 2);
+            output[i] = (y & 0xFF) as u8;
+            i = i + 1;
+        }
+        var words: u32 = 16;   // 64 bytes / 4
+        if (depth == DEPTH_4BIT) { words = 8; }
+        mSetU32(s, S_OUTPUT_WORDS, words);
+        mSetU32(s, S_OUTPUT_EMPTY, 0);
+        mSetU32(s, S_OUTPUT_INDEX, 0);
+        return;
+    }
+    // 24-bit (depth=2) / 15-bit (depth=3) — full YUV macroblock decode.
+    var blockSize: u32 = 768;     // 16×16×3 (24-bit)
+    if (depth == DEPTH_15BIT) { blockSize = 512; }   // 16×16×2
+
+    var idx: u32 = 0;          // word index into input buffer
+    var blockCount: u32 = 0;
+    var outBytes: u32 = 0;
+    // Each macroblock: Cr, Cb, Y0, Y1, Y2, Y3 → 16×16 RGB.
+    while (idx * 2 < inputBytes) {
+        const outBase: u32 = outBytes;
+        idx = rlDecodeBlock(s, input, idx, T_CRBLK, T_UV_QUANT);
+        idx = rlDecodeBlock(s, input, idx, T_CBBLK, T_UV_QUANT);
+        idx = rlDecodeBlock(s, input, idx, T_YBLK,  T_Y_QUANT);
+        yuvToRgb(s, output, outBase, 0, 0);
+        idx = rlDecodeBlock(s, input, idx, T_YBLK,  T_Y_QUANT);
+        yuvToRgb(s, output, outBase, 8, 0);
+        idx = rlDecodeBlock(s, input, idx, T_YBLK,  T_Y_QUANT);
+        yuvToRgb(s, output, outBase, 0, 8);
+        idx = rlDecodeBlock(s, input, idx, T_YBLK,  T_Y_QUANT);
+        yuvToRgb(s, output, outBase, 8, 8);
+        outBytes = outBytes + blockSize;
+        blockCount = blockCount + 1;
+        if (outBytes + blockSize > MDEC_OUTPUT_SIZE) { break; }
+    }
+
+    mSetU32(s, S_OUTPUT_WORDS, outBytes / 4);
+    mSetU32(s, S_OUTPUT_EMPTY, 0);
+    mSetU32(s, S_OUTPUT_INDEX, 0);
+}
+
+// ---------- command dispatch (write to 0x1F801820) --------------------
+
+pub fn mdecSetQt(s: *mut[] u8, input: *mut[] u8) {
+    var i: u32 = 0;
+    while (i < 64) {
+        s[T_Y_QUANT + i] = input[i];
+        i = i + 1;
+    }
+    if (mGetU32(s, S_RECV_COLOR) != 0) {
+        var j: u32 = 0;
+        while (j < 64) {
+            s[T_UV_QUANT + j] = input[64 + j];
+            j = j + 1;
+        }
+    }
+}
+
+pub fn mdecSetSt(s: *mut[] u8, input: *mut[] u8) {
+    var i: u32 = 0;
+    while (i < 128) {
+        s[T_SCALE + i] = input[i];
+        i = i + 1;
+    }
+}
+
+pub fn mdecDispatch(s: *mut[] u8, input: *mut[] u8, output: *mut[] u8) {
+    const cmd: u32 = mGetU32(s, S_CMD);
+    const op: u32 = (cmd >> 29) & 7;
+    if (op == MDEC_CMD_NOP) { return; }
+    if (op == MDEC_CMD_DECODE) {
+        mdecDecodeMacroblock(s, input, output);
+        return;
+    }
+    if (op == MDEC_CMD_SET_QT) {
+        mdecSetQt(s, input);
+        return;
+    }
+    if (op == MDEC_CMD_SET_ST) {
+        mdecSetSt(s, input);
+        return;
+    }
+}
+
+// ---------- bus dispatch (mdec.c:287/348) -----------------------------
+
+pub fn mdecRead32(s: *mut[] u8, output: *mut[] u8, off: u32) u32 {
+    if (off == 0) {
+        // Data port — drain one word from the output buffer.
+        const wordsRem: u32 = mGetU32(s, S_OUTPUT_WORDS);
+        if (wordsRem > 0) {
+            const idx: u32 = mGetU32(s, S_OUTPUT_INDEX);
+            const v: u32 = mGetU32(output, idx * 4);
+            mSetU32(s, S_OUTPUT_INDEX, idx + 1);
+            mSetU32(s, S_OUTPUT_WORDS, wordsRem - 1);
+            return v;
+        }
+        mSetU32(s, S_OUTPUT_EMPTY, 0);
+        mSetU32(s, S_OUTPUT_INDEX, 0);
+        mSetU32(s, S_OUTPUT_REQ, 0);
+        return 0xAAAAAAAA;
+    }
+    if (off == 4) {
+        // Status register — psxe mdec.c:316.
+        var st: u32 = mGetU32(s, S_WORDS_REM) & 0xFFFF;
+        st = st | ((mGetU32(s, S_CUR_BLOCK) & 0x7) << 16);
+        if (mGetU32(s, S_OUTPUT_BIT15)   != 0) { st = st | (1 << 23); }
+        if (mGetU32(s, S_OUTPUT_SIGNED)  != 0) { st = st | (1 << 24); }
+        st = st | ((mGetU32(s, S_OUTPUT_DEPTH) & 3) << 25);
+        if (mGetU32(s, S_OUTPUT_REQ)     != 0) { st = st | (1 << 27); }
+        if (mGetU32(s, S_INPUT_REQ)      != 0) { st = st | (1 << 28); }
+        if (mGetU32(s, S_BUSY)           != 0) { st = st | (1 << 29); }
+        if (mGetU32(s, S_INPUT_FULL)     != 0) { st = st | (1 << 30); }
+        if (mGetU32(s, S_OUTPUT_EMPTY)   != 0) { st = st | (1 << 31); }
+        return st;
+    }
+    return 0;
+}
+
+pub fn mdecRead16(s: *mut[] u8, output: *mut[] u8, off: u32) u32 {
+    return mdecRead32(s, output, off & 0xFFFFFFFC) & 0xFFFF;
+}
+
+pub fn mdecRead8(s: *mut[] u8, output: *mut[] u8, off: u32) u32 {
+    return mdecRead32(s, output, off & 0xFFFFFFFC) & 0xFF;
+}
+
+pub fn mdecWrite32(s: *mut[] u8, input: *mut[] u8, output: *mut[] u8,
+                   off: u32, val: u32) {
+    if (off == 0) {
+        // Data port. Either streaming command parameters or the
+        // command word itself when words_remaining == 0.
+        const wordsRem: u32 = mGetU32(s, S_WORDS_REM);
+        if (wordsRem > 0) {
+            const idx: u32 = mGetU32(s, S_INPUT_INDEX);
+            mSetU32(input, idx * 4, val);
+            mSetU32(s, S_INPUT_INDEX, idx + 1);
+            mSetU32(s, S_WORDS_REM, wordsRem - 1);
+            if (wordsRem - 1 == 0) {
+                mSetU32(s, S_OUTPUT_EMPTY, 0);
+                mSetU32(s, S_INPUT_FULL, 1);
+                mSetU32(s, S_INPUT_REQ, 0);
+                mSetU32(s, S_BUSY, 0);
+                mSetU32(s, S_OUTPUT_REQ, mGetU32(s, S_ENABLE_DMA1));
+                mdecDispatch(s, input, output);
+            }
+            return;
+        }
+        // Start a new command.
+        mSetU32(s, S_CMD, val);
+        mSetU32(s, S_OUTPUT_REQ, 0);
+        mSetU32(s, S_OUTPUT_EMPTY, 1);
+        mSetU32(s, S_OUTPUT_BIT15,  (val >> 25) & 1);
+        mSetU32(s, S_OUTPUT_SIGNED, (val >> 26) & 1);
+        mSetU32(s, S_OUTPUT_DEPTH,  (val >> 27) & 3);
+        mSetU32(s, S_INPUT_INDEX, 0);
+        mSetU32(s, S_INPUT_FULL, 0);
+        mSetU32(s, S_BUSY, 1);
+        const op: u32 = (val >> 29) & 7;
+        var newWords: u32 = 0;
+        if (op == MDEC_CMD_NOP) {
+            mSetU32(s, S_BUSY, 0);
+        } else if (op == MDEC_CMD_DECODE) {
+            newWords = val & 0xFFFF;
+        } else if (op == MDEC_CMD_SET_QT) {
+            mSetU32(s, S_RECV_COLOR, val & 1);
+            if ((val & 1) != 0) { newWords = 32; } else { newWords = 16; }
+        } else if (op == MDEC_CMD_SET_ST) {
+            newWords = 32;
+        }
+        mSetU32(s, S_WORDS_REM, newWords);
+        if (newWords > 0) {
+            mSetU32(s, S_INPUT_REQ, 1);
+            mSetU32(s, S_INPUT_SIZE_B, newWords * 4);
+            mSetU32(s, S_INPUT_FULL, 0);
+            mSetU32(s, S_INPUT_INDEX, 0);
+        }
+        return;
+    }
+    if (off == 4) {
+        // Control register.
+        if ((val & 0x40000000) != 0) { mSetU32(s, S_ENABLE_DMA0, 1); }
+        else                         { mSetU32(s, S_ENABLE_DMA0, 0); }
+        if ((val & 0x20000000) != 0) { mSetU32(s, S_ENABLE_DMA1, 1); }
+        else                         { mSetU32(s, S_ENABLE_DMA1, 0); }
+        if ((val & 0x80000000) != 0) {
+            // Reset — status = 0x80040000.
+            mSetU32(s, S_BUSY, 0);
+            mSetU32(s, S_WORDS_REM, 0);
+            mSetU32(s, S_OUTPUT_BIT15, 0);
+            mSetU32(s, S_OUTPUT_SIGNED, 0);
+            mSetU32(s, S_OUTPUT_DEPTH, 0);
+            mSetU32(s, S_INPUT_REQ, 0);
+            mSetU32(s, S_OUTPUT_REQ, 0);
+            mSetU32(s, S_INPUT_FULL, 0);
+            mSetU32(s, S_OUTPUT_EMPTY, 1);
+            mSetU32(s, S_CUR_BLOCK, 4);
+        }
+        return;
+    }
+}
+
+pub fn mdecWrite16(s: *mut[] u8, input: *mut[] u8, output: *mut[] u8,
+                   off: u32, val: u32) {
+    mdecWrite32(s, input, output, off & 0xFFFFFFFC, val & 0xFFFF);
+}
+
+pub fn mdecWrite8(s: *mut[] u8, input: *mut[] u8, output: *mut[] u8,
+                  off: u32, val: u32) {
+    mdecWrite32(s, input, output, off & 0xFFFFFFFC, val & 0xFF);
+}
