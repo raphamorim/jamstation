@@ -54,6 +54,8 @@ const Bus = struct {
     mdecIn:  *mut[] u8,
     mdecOut: *mut[] u8,
     sio1:    *mut[] u8,
+    mcd:     *mut[] u8,
+    mcdRam:  *mut[] u8,
     biosLoaded: u8,
 };
 
