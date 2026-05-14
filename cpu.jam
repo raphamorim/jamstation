@@ -1059,6 +1059,11 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     }
 
     const opc: u32 = busRead32(bus, c.pc);
+
+    // Arm at first hit of PC=0x1EB0, then dump 100 PCs before we got
+    // there (using a circular buffer in cop0 slots 25-26) plus the
+    // next 100 PCs after arming.
+
     c.pc = c.nextPc;
     c.nextPc = c.nextPc + 4;
     c.cycles = c.cycles + 2;

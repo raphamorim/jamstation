@@ -36,6 +36,7 @@ const {
     gprRead, gprWrite,
     cop0Read, cop0Write,
     run, runHooked,
+    step, biosHook, commitLoad,
     encR, encI, encJ
 } = import("cpu");
 
@@ -249,42 +250,56 @@ fn loadBios(path: []u8, bus: Bus) u64 {
     return got;
 }
 
-// Run one full NTSC frame (263 scanlines × ~2175 CPU cycles each).
-// Between scanlines we tick the timers' hblank/vblank machinery; on
-// entry to vblank (line 240) we raise IRQ 0 and notify timer 1.
-// 33,868,800 Hz / 60 fps / 263 lines ≈ 2146.69 cycles. Round to 2147 so the
-// per-frame total (263 × 2147 = 564,661) stays just under the BIOS's
-// VSync-timeout threshold; with 2175 (the previous value) we were spending
-// 571,825 cycles per frame, which fires the BIOS timeout before our vblank
-// IRQ arrives and forks BIOS execution onto the "VSync: timeout" path
-// instead of the boot-animation success path.
-const CYCLES_PER_SCANLINE: u32 = 2147;
+// Run one full NTSC frame.
+//
+// psxe (psx.c:39): NTSC framerate = 59.29 Hz, so cycles/frame =
+// 33,868,800 / 59.29 ≈ 571,366. Per scanline: 571,366 / 263 ≈ 2172.49.
+//
+// We round to 2172 (per-frame total 571,236; 130 cycles short of psxe).
+// Earlier 2147 (33,868,800 / 60 / 263) was 6,700 short per frame and
+// drifted noticeably across multi-second boots; earlier 2175 was 459
+// long and triggered BIOS "VSync: timeout" messages. The current value
+// is within 130 cycles of psxe and matches its 59.29 Hz cadence.
+const CYCLES_PER_SCANLINE: u32 = 2172;
 const SCANLINES_VDRAW: u32 = 240;
 const SCANLINES_TOTAL: u32 = 263;
 
+// Per-CPU-cycle peripheral ticking, mirroring psxe psx.c:27-46 psx_update.
+// Each iteration: one CPU instruction (typically 2 cycles), then tick
+// every peripheral with the actual delta. HBlank/VBlank events fire when
+// the cumulative cycle counter crosses the scanline / VDraw boundaries.
+//
+// Why this matters: psxe's IRQs land at exact CPU cycles. Our previous
+// per-scanline batch (cyc=2172 dumped once at line boundary) made IRQs
+// land at quantized points up to 2k cycles after the equivalent psxe
+// fire — games that polled an IRQ flag at instruction-level granularity
+// (Musashi, Harvest Moon) saw IRQs at the wrong instruction.
 fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     var line: u32 = 0;
+    var lineCyc: u32 = 0;
     while (line < SCANLINES_TOTAL) {
-        runHooked(c, bus, regs, cop0, CYCLES_PER_SCANLINE);
-        // Match psxe: tick the timer/dma engines on every scanline using
-        // the cycle delta actually executed. Doing this only at end-of-
-        // frame leaves timer 2 (and any DMA IRQ delay counters) frozen
-        // within a frame, which the BIOS's VSync routines detect and
-        // log as "VSync: timeout" before our once-per-frame vblank IRQ
-        // even fires.
-        timerUpdateCyc(bus.timer, bus.irq, cop0, CYCLES_PER_SCANLINE);
+        biosHook(c, bus, regs);
+        const before: u64 = c.cycles;
+        step(c, bus, regs, cop0);
+        const delta: u32 = (c.cycles - before) as u32;
+        timerUpdateCyc(bus.timer, bus.irq, cop0, delta);
         dmaUpdate(bus.dma, bus.irq, cop0);
-        cdromUpdate(bus.cdrom, bus.disc, bus.irq, cop0, CYCLES_PER_SCANLINE);
-        padUpdate(bus.pad, bus.irq, cop0, CYCLES_PER_SCANLINE);
-        spuUpdate(bus.spu, bus.spuram, bus.irq, cop0, CYCLES_PER_SCANLINE);
-        timerHblankBegin(bus.timer, bus.irq, cop0);
-        timerHblankEnd(bus.timer);
-        if (line == SCANLINES_VDRAW) {
-            timerVblankBegin(bus.timer, bus.irq, cop0);
-            irqRaise(bus.irq, cop0, IC_VBLANK());
+        cdromUpdate(bus.cdrom, bus.disc, bus.irq, cop0, delta);
+        padUpdate(bus.pad, bus.irq, cop0, delta);
+        spuUpdate(bus.spu, bus.spuram, bus.irq, cop0, delta);
+        lineCyc = lineCyc + delta;
+        if (lineCyc >= CYCLES_PER_SCANLINE) {
+            lineCyc = lineCyc - CYCLES_PER_SCANLINE;
+            timerHblankBegin(bus.timer, bus.irq, cop0);
+            timerHblankEnd(bus.timer);
+            if (line == SCANLINES_VDRAW) {
+                timerVblankBegin(bus.timer, bus.irq, cop0);
+                irqRaise(bus.irq, cop0, IC_VBLANK());
+            }
+            line = line + 1;
         }
-        line = line + 1;
     }
+    commitLoad(c, regs);
     timerVblankEnd(bus.timer);
 }
 

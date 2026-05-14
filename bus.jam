@@ -67,7 +67,7 @@ const Bus = struct {
     biosLoaded: u8,
 };
 
-const BusRoute = struct {
+pub const BusRoute = struct {
     kind: u8,
     off: u32,
 };
