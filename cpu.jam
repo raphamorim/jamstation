@@ -68,6 +68,7 @@ const Bus = struct {
     mdec:    *mut[] u8,
     mdecIn:  *mut[] u8,
     mdecOut: *mut[] u8,
+    sio1:    *mut[] u8,
     biosLoaded: u8,
 };
 
@@ -325,7 +326,10 @@ pub fn iAddi(c: mut Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) {
     const r: u32 = s + imm;
     const ovf: u32 = (s ^ r) & (imm ^ r);
     if ((ovf & 0x80000000) != 0) {
+        // psxe cpu.c:465-481: skip the rd write on overflow so the
+        // exception handler sees the pre-state.
         raiseException(c, cop0, CAUSE_OV);
+        return;
     }
     gprWrite(regs, opRt(opc), r);
 }
@@ -742,6 +746,7 @@ pub fn iAdd(c: mut Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) {
     const ovf: u32 = (s ^ r) & (t ^ r);
     if ((ovf & 0x80000000) != 0) {
         raiseException(c, cop0, CAUSE_OV);
+        return;
     }
     gprWrite(regs, opRd(opc), r);
 }
@@ -761,6 +766,7 @@ pub fn iSub(c: mut Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) {
     const ovf: u32 = (s ^ t) & (s ^ r);
     if ((ovf & 0x80000000) != 0) {
         raiseException(c, cop0, CAUSE_OV);
+        return;
     }
     gprWrite(regs, opRd(opc), r);
 }

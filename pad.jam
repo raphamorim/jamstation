@@ -175,28 +175,34 @@ pub fn padWriteTx(p: *mut[] u8, data: u32) {
     if ((ctrl & CTRL_TXEN) == 0) { return; }
     if (p[P_DEST] == 0) {
         // First TX byte selects the destination (0x01 = joy, 0x81 = mcd).
-        if ((data & 0xFF) == DEST_JOY) {
-            p[P_DEST] = DEST_JOY as u8;
-            p[P_SDA_STATE] = SDA_HIZ as u8;
-            p[P_SDA_TXR] = 1;
+        // psxe pad.c:66-78: sets dest, schedules the ACK-pulse countdown
+        // if CTRL_ACIE — but does NOT set irq_bit on the first byte. The
+        // BIOS expects IC_JOY to assert while STAT.IRQ7 stays 0 until a
+        // *subsequent* byte writes through.
+        const b: u32 = data & 0xFF;
+        if (b == DEST_JOY or b == DEST_MCD) {
+            p[P_DEST] = b as u8;
+            if (b == DEST_JOY) {
+                p[P_SDA_STATE] = SDA_HIZ as u8;
+                p[P_SDA_TXR] = 1;
+            }
             if ((ctrl & CTRL_ACIE) != 0) {
-                // Mirror psxe pad.c:115-118 — first byte ALSO sets
-                // irq_bit so when the countdown elapses, STAT.IRQ7
-                // gets latched, letting the BIOS pad driver see the
-                // controller "responded".
-                p[P_IRQ_BIT] = 1;
                 padSetU32(p, P_CYC_LO, JOY_IRQ_DELAY);
             }
-        } else {
-            // 0x81 = MCD or other — drop the line cleanly (no MCD
-            // emulated). Without this the BIOS BU/card task can jam
-            // the slot.
-            p[P_DEST] = 0;
         }
         return;
     }
     if (p[P_DEST] == DEST_JOY as u8) {
         sdaWrite(p, data);
+        // psxe pad.c:90-91: if the controller has nothing more to send,
+        // drop the slot so the next first byte re-selects.
+        if (p[P_SDA_TXR] == 0) { p[P_DEST] = 0; }
+    } else {
+        // DEST_MCD (or any other selected destination we don't model):
+        // psxe routes to the MCD; with `!mcd` it clears dest and returns
+        // without scheduling another IRQ.
+        p[P_DEST] = 0;
+        return;
     }
     if ((ctrl & CTRL_ACIE) != 0) {
         p[P_IRQ_BIT] = 1;
@@ -275,16 +281,13 @@ pub fn padUpdate(p: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
         return;
     }
     padSetU32(p, P_CYC_LO, 0);
+    // psxe pad.c:329-343: raises IC_JOY unconditionally on countdown
+    // expiry, and ONLY sets STAT.IRQ7 (bit 9) if irq_bit was set by
+    // a subsequent-byte TX. The first byte raises IC_JOY without
+    // latching IRQ7 — BIOS sees the ACK pulse but no data-IRQ yet.
     if (p[P_IRQ_BIT] != 0) {
-        // Set IRQ7 AND ACKL (bit 7 = /ACK input level high during the
-        // controller's response pulse). The BIOS pad driver polls STAT
-        // bit 7 to confirm "controller responded with ACK" before
-        // sending the next TX byte. Without ACKL set, the driver
-        // bails before issuing byte 2 — explains "zero TX writes"
-        // beyond the first byte. ACKL gets cleared on the next
-        // CTRL_ACKN write (padHandleCtrlWrite).
         var stat: u32 = padGetU16(p, P_STAT_LO);
-        stat = stat | STAT_IRQ7 | STAT_ACKL;
+        stat = stat | STAT_IRQ7;
         padSetU16(p, P_STAT_LO, stat);
         p[P_IRQ_BIT] = 0;
     }

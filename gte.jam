@@ -154,11 +154,28 @@ pub fn gteCountLeadingSign(v: u32) u32 {
 }
 
 pub fn gteCtrlRead(g: *mut[] u32, idx: u32) u32 {
-    return g[32 + (idx & 0x1F)];
+    const i: u32 = idx & 0x1F;
+    if (i == C_FLAG) {
+        // psxe cpu.c:1272-1273: synthesize "any-error" bit 31 from the
+        // overflow/saturation bit-mask 0x7F87E000, mask the low garbage.
+        // Games CFC2 r63 and branch on bit 31; without this synthesis
+        // they always see "no error" even when MAC/IR saturated.
+        const v: u32 = g[32 + C_FLAG] & 0x7FFFF000;
+        if ((v & 0x7F87E000) != 0) { return v | 0x80000000; }
+        return v;
+    }
+    return g[32 + i];
 }
 
 pub fn gteCtrlWrite(g: *mut[] u32, idx: u32, val: u32) {
-    g[32 + (idx & 0x1F)] = val;
+    const i: u32 = idx & 0x1F;
+    if (i == C_FLAG) {
+        // Bit 31 is read-only "any-error" — strip on write so it can be
+        // resynthesized in gteCtrlRead.
+        g[32 + C_FLAG] = val & 0x7FFFF000;
+        return;
+    }
+    g[32 + i] = val;
 }
 
 // Dispatch on the bottom 6 bits of the GTE math opcode. psxe's full
@@ -194,9 +211,377 @@ pub fn gteExec(g: *mut[] u32, opc: u32) {
         gteRtps(g, 1, sf, lm);
         gteRtps(g, 2, sf, lm);
     }
-    // Remaining ops (NCDS/NCS/CC/CDP/INTPL/DPCS/DPCT/DCPL/NCCS/NCCT/GPF/GPL)
-    // are still NOPs. They're mostly colour / depth-queue / lighting and
-    // not strictly required for the BIOS boot animation's geometry.
+    if (op == 0x10) { gteDpcs(g, sf, lm); }       // DPCS
+    if (op == 0x11) { gteIntpl(g, sf, lm); }      // INTPL
+    if (op == 0x14) { gteCdp(g, sf, lm); }        // CDP
+    if (op == 0x1B) { gteNccs(g, 0, sf, lm); }    // NCCS
+    if (op == 0x1C) { gteCc(g, sf, lm); }         // CC
+    if (op == 0x1E) { gteNcs(g, 0, sf, lm); }     // NCS
+    if (op == 0x20) {                              // NCT — 3× NCS
+        gteNcs(g, 0, sf, lm);
+        gteNcs(g, 1, sf, lm);
+        gteNcs(g, 2, sf, lm);
+    }
+    if (op == 0x29) { gteDcpl(g, sf, lm); }       // DCPL
+    if (op == 0x2A) { gteDpct(g, sf, lm); }       // DPCT
+    if (op == 0x3D) { gteGpf(g, sf, lm); }        // GPF
+    if (op == 0x3E) { gteGpl(g, sf, lm); }        // GPL
+    if (op == 0x3F) {                              // NCCT — 3× NCCS
+        gteNccs(g, 0, sf, lm);
+        gteNccs(g, 1, sf, lm);
+        gteNccs(g, 2, sf, lm);
+    }
+}
+
+// Push (MAC1>>4, MAC2>>4, MAC3>>4, CODE) onto the RGB FIFO — used by
+// every colour-producing GTE op. RGB0 ← RGB1, RGB1 ← RGB2, RGB2 ← new.
+pub fn gtePushRgb(g: *mut[] u32, m1: i64, m2: i64, m3: i64) {
+    g[20] = g[21];
+    g[21] = g[22];
+    const code: u32 = (g[6] >> 24) & 0xFF;
+    const r2: u32 = clampU8(m1 >> 4);
+    const g2: u32 = clampU8(m2 >> 4);
+    const b2: u32 = clampU8(m3 >> 4);
+    g[22] = r2 | (g2 << 8) | (b2 << 16) | (code << 24);
+}
+
+// Light-matrix transform of vertex vidx into (IR1,IR2,IR3) and (MAC1,MAC2,MAC3).
+// Shared by NCS, NCDS, NCCS — psxe NCS/NCDS/NCCS macros all start with
+// the same L*V transformation. Stores IR into g[9..11] and MAC into g[D_MAC*].
+pub fn gteApplyLight(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
+    const vSlot: u32 = vidx * 2;
+    const vxy: u32 = g[vSlot];
+    const vzS: u32 = g[vSlot + 1];
+    const vx: i64 = s16ToI64(vxy & 0xFFFF);
+    const vy: i64 = s16ToI64((vxy >> 16) & 0xFFFF);
+    const vz: i64 = s16ToI64(vzS & 0xFFFF);
+    const ll11: i64 = s16ToI64(g[32 + 8] & 0xFFFF);
+    const ll12: i64 = s16ToI64((g[32 + 8] >> 16) & 0xFFFF);
+    const ll13: i64 = s16ToI64(g[32 + 9] & 0xFFFF);
+    const ll21: i64 = s16ToI64((g[32 + 9] >> 16) & 0xFFFF);
+    const ll22: i64 = s16ToI64(g[32 + 10] & 0xFFFF);
+    const ll23: i64 = s16ToI64((g[32 + 10] >> 16) & 0xFFFF);
+    const ll31: i64 = s16ToI64(g[32 + 11] & 0xFFFF);
+    const ll32: i64 = s16ToI64((g[32 + 11] >> 16) & 0xFFFF);
+    const ll33: i64 = s16ToI64(g[32 + 12] & 0xFFFF);
+    var m1: i64 = ll11 * vx + ll12 * vy + ll13 * vz;
+    var m2: i64 = ll21 * vx + ll22 * vy + ll23 * vz;
+    var m3: i64 = ll31 * vx + ll32 * vy + ll33 * vz;
+    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
+    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
+    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
+    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+}
+
+// (BK<<12) + LC*IR stage — applied by CC, CDP, NCDS, NCCS, NCS after
+// L*V. Reads IR1..IR3 from g[9..11], writes MAC1..MAC3, then IR1..IR3
+// clamped by lm.
+pub fn gteApplyLightColor(g: *mut[] u32, sf: u32, lm: u32) {
+    const ir1: i64 = s16ToI64(g[9]);
+    const ir2: i64 = s16ToI64(g[10]);
+    const ir3: i64 = s16ToI64(g[11]);
+    const lr1: i64 = s16ToI64(g[32 + 16] & 0xFFFF);
+    const lr2: i64 = s16ToI64((g[32 + 16] >> 16) & 0xFFFF);
+    const lr3: i64 = s16ToI64(g[32 + 17] & 0xFFFF);
+    const lg1: i64 = s16ToI64((g[32 + 17] >> 16) & 0xFFFF);
+    const lg2: i64 = s16ToI64(g[32 + 18] & 0xFFFF);
+    const lg3: i64 = s16ToI64((g[32 + 18] >> 16) & 0xFFFF);
+    const lb1: i64 = s16ToI64(g[32 + 19] & 0xFFFF);
+    const lb2: i64 = s16ToI64((g[32 + 19] >> 16) & 0xFFFF);
+    const lb3: i64 = s16ToI64(g[32 + 20] & 0xFFFF);
+    const rbk: i64 = s32ToI64(g[32 + 13]);
+    const gbk: i64 = s32ToI64(g[32 + 14]);
+    const bbk: i64 = s32ToI64(g[32 + 15]);
+    var m1: i64 = (rbk << 12) + lr1 * ir1 + lr2 * ir2 + lr3 * ir3;
+    var m2: i64 = (gbk << 12) + lg1 * ir1 + lg2 * ir2 + lg3 * ir3;
+    var m3: i64 = (bbk << 12) + lb1 * ir1 + lb2 * ir2 + lb3 * ir3;
+    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
+    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
+    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
+    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+}
+
+// Far-colour interpolation stage shared by CDP, NCDS, DCPL, DPCS:
+//   ir' = clamp(FC<<12 - (C<<4) * IR, lm=0)
+//   MAC = (C<<4) * IR + IR0 * ir'
+// Reads IR1..IR3 from g[9..11], color from g[6] RGBC (rc/gc/bc).
+// Writes MAC1..MAC3 and IR1..IR3 (clamped by lm).
+pub fn gteFarColorInterp(g: *mut[] u32, sf: u32, lm: u32) {
+    const ir1: i64 = s16ToI64(g[9]);
+    const ir2: i64 = s16ToI64(g[10]);
+    const ir3: i64 = s16ToI64(g[11]);
+    const rgbc: u32 = g[6];
+    const rc: i64 = (rgbc & 0xFF) as i64;
+    const gc: i64 = ((rgbc >> 8) & 0xFF) as i64;
+    const bc: i64 = ((rgbc >> 16) & 0xFF) as i64;
+    const rfc: i64 = s32ToI64(g[32 + 21]);
+    const gfc: i64 = s32ToI64(g[32 + 22]);
+    const bfc: i64 = s32ToI64(g[32 + 23]);
+    var fp1: i64 = (rfc << 12) - (rc << 4) * ir1;
+    var fp2: i64 = (gfc << 12) - (gc << 4) * ir2;
+    var fp3: i64 = (bfc << 12) - (bc << 4) * ir3;
+    if (sf == 12) { fp1 = fp1 >> 12; fp2 = fp2 >> 12; fp3 = fp3 >> 12; }
+    const ir1f: i64 = satIrLm(fp1, 0);
+    const ir2f: i64 = satIrLm(fp2, 0);
+    const ir3f: i64 = satIrLm(fp3, 0);
+    const ir0: i64 = s16ToI64(g[8]);
+    var m1: i64 = (rc << 4) * ir1 + ir0 * ir1f;
+    var m2: i64 = (gc << 4) * ir2 + ir0 * ir2f;
+    var m3: i64 = (bc << 4) * ir3 + ir0 * ir3f;
+    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
+    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
+    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
+    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+}
+
+// NCS — normal-color single. L*V then BK+LC*IR. No final colour stage.
+// Push RGB FIFO with the resulting MAC.
+pub fn gteNcs(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
+    gteApplyLight(g, vidx, sf, lm);
+    gteApplyLightColor(g, sf, lm);
+    const m1: i64 = s32ToI64(g[D_MAC1]);
+    const m2: i64 = s32ToI64(g[D_MAC2]);
+    const m3: i64 = s32ToI64(g[D_MAC3]);
+    gtePushRgb(g, m1, m2, m3);
+    // psxe NCS macro reclamps IR after the FIFO push using the *new*
+    // MAC values — the existing MAC1..MAC3 register state.
+    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
+    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
+    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+}
+
+// NCCS — normal-color-color single. NCS pipeline + (C * IR) << 4 final
+// colour stage (no FC interpolation).
+pub fn gteNccs(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
+    gteApplyLight(g, vidx, sf, lm);
+    gteApplyLightColor(g, sf, lm);
+    const ir1: i64 = s16ToI64(g[9]);
+    const ir2: i64 = s16ToI64(g[10]);
+    const ir3: i64 = s16ToI64(g[11]);
+    const rgbc: u32 = g[6];
+    const rc: i64 = (rgbc & 0xFF) as i64;
+    const gc: i64 = ((rgbc >> 8) & 0xFF) as i64;
+    const bc: i64 = ((rgbc >> 16) & 0xFF) as i64;
+    var m1: i64 = (rc * ir1) << 4;
+    var m2: i64 = (gc * ir2) << 4;
+    var m3: i64 = (bc * ir3) << 4;
+    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
+    gtePushRgb(g, m1, m2, m3);
+    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
+    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
+    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+}
+
+// CC — color color. Skips L*V (uses existing IR), then BK+LC*IR, then
+// (C*IR)<<4 final stage.
+pub fn gteCc(g: *mut[] u32, sf: u32, lm: u32) {
+    gteApplyLightColor(g, sf, lm);
+    const ir1: i64 = s16ToI64(g[9]);
+    const ir2: i64 = s16ToI64(g[10]);
+    const ir3: i64 = s16ToI64(g[11]);
+    const rgbc: u32 = g[6];
+    const rc: i64 = (rgbc & 0xFF) as i64;
+    const gc: i64 = ((rgbc >> 8) & 0xFF) as i64;
+    const bc: i64 = ((rgbc >> 16) & 0xFF) as i64;
+    var m1: i64 = (rc * ir1) << 4;
+    var m2: i64 = (gc * ir2) << 4;
+    var m3: i64 = (bc * ir3) << 4;
+    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
+    gtePushRgb(g, m1, m2, m3);
+    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
+    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
+    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+}
+
+// CDP — color depth-cued. Skips L*V (uses existing IR), then BK+LC*IR,
+// then FC interpolation. Push RGB FIFO.
+pub fn gteCdp(g: *mut[] u32, sf: u32, lm: u32) {
+    gteApplyLightColor(g, sf, lm);
+    gteFarColorInterp(g, sf, lm);
+    const m1: i64 = s32ToI64(g[D_MAC1]);
+    const m2: i64 = s32ToI64(g[D_MAC2]);
+    const m3: i64 = s32ToI64(g[D_MAC3]);
+    gtePushRgb(g, m1, m2, m3);
+}
+
+// DPCS — depth queue color single. FC interpolation on the RGBC color.
+// psxe uses (RFC<<12) - (RC<<16), then (RC<<16) + IR0*ir'. The shift-by-16
+// difference vs FarColorInterp's (RC<<4)*IR is because here IR=1.0 implicit.
+pub fn gteDpcs(g: *mut[] u32, sf: u32, lm: u32) {
+    const rgbc: u32 = g[6];
+    const rc: i64 = (rgbc & 0xFF) as i64;
+    const gc: i64 = ((rgbc >> 8) & 0xFF) as i64;
+    const bc: i64 = ((rgbc >> 16) & 0xFF) as i64;
+    const rfc: i64 = s32ToI64(g[32 + 21]);
+    const gfc: i64 = s32ToI64(g[32 + 22]);
+    const bfc: i64 = s32ToI64(g[32 + 23]);
+    var fp1: i64 = (rfc << 12) - (rc << 16);
+    var fp2: i64 = (gfc << 12) - (gc << 16);
+    var fp3: i64 = (bfc << 12) - (bc << 16);
+    if (sf == 12) { fp1 = fp1 >> 12; fp2 = fp2 >> 12; fp3 = fp3 >> 12; }
+    const ir1f: i64 = satIrLm(fp1, 0);
+    const ir2f: i64 = satIrLm(fp2, 0);
+    const ir3f: i64 = satIrLm(fp3, 0);
+    const ir0: i64 = s16ToI64(g[8]);
+    var m1: i64 = (rc << 16) + ir0 * ir1f;
+    var m2: i64 = (gc << 16) + ir0 * ir2f;
+    var m3: i64 = (bc << 16) + ir0 * ir3f;
+    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
+    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
+    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
+    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+    gtePushRgb(g, m1, m2, m3);
+}
+
+// DPCT — depth queue color triple. Repeats DPCS three times, each time
+// using RGB0 (FIFO head) as the source color. psxe macro DPCT1 also
+// shifts the FIFO so each iteration's "RGB0" is the previous result.
+pub fn gteDpct(g: *mut[] u32, sf: u32, lm: u32) {
+    var iter: u32 = 0;
+    while (iter < 3) {
+        const rgb0: u32 = g[20];
+        const rc: i64 = (rgb0 & 0xFF) as i64;
+        const gc: i64 = ((rgb0 >> 8) & 0xFF) as i64;
+        const bc: i64 = ((rgb0 >> 16) & 0xFF) as i64;
+        const rfc: i64 = s32ToI64(g[32 + 21]);
+        const gfc: i64 = s32ToI64(g[32 + 22]);
+        const bfc: i64 = s32ToI64(g[32 + 23]);
+        var fp1: i64 = (rfc << 12) - (rc << 16);
+        var fp2: i64 = (gfc << 12) - (gc << 16);
+        var fp3: i64 = (bfc << 12) - (bc << 16);
+        if (sf == 12) { fp1 = fp1 >> 12; fp2 = fp2 >> 12; fp3 = fp3 >> 12; }
+        const ir1f: i64 = satIrLm(fp1, 0);
+        const ir2f: i64 = satIrLm(fp2, 0);
+        const ir3f: i64 = satIrLm(fp3, 0);
+        const ir0: i64 = s16ToI64(g[8]);
+        var m1: i64 = (rc << 16) + ir0 * ir1f;
+        var m2: i64 = (gc << 16) + ir0 * ir2f;
+        var m3: i64 = (bc << 16) + ir0 * ir3f;
+        if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+        g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
+        g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
+        g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
+        g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
+        g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
+        g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+        gtePushRgb(g, m1, m2, m3);
+        iter = iter + 1;
+    }
+}
+
+// INTPL — interpolation. FC interpolation using the *existing* IR as the
+// "color" input (psxe: ir' = clamp(FC<<12 - IR<<12); MAC = IR<<12 + IR0*ir').
+pub fn gteIntpl(g: *mut[] u32, sf: u32, lm: u32) {
+    const ir1: i64 = s16ToI64(g[9]);
+    const ir2: i64 = s16ToI64(g[10]);
+    const ir3: i64 = s16ToI64(g[11]);
+    const rfc: i64 = s32ToI64(g[32 + 21]);
+    const gfc: i64 = s32ToI64(g[32 + 22]);
+    const bfc: i64 = s32ToI64(g[32 + 23]);
+    var fp1: i64 = (rfc << 12) - (ir1 << 12);
+    var fp2: i64 = (gfc << 12) - (ir2 << 12);
+    var fp3: i64 = (bfc << 12) - (ir3 << 12);
+    if (sf == 12) { fp1 = fp1 >> 12; fp2 = fp2 >> 12; fp3 = fp3 >> 12; }
+    const ir1f: i64 = satIrLm(fp1, 0);
+    const ir2f: i64 = satIrLm(fp2, 0);
+    const ir3f: i64 = satIrLm(fp3, 0);
+    const ir0: i64 = s16ToI64(g[8]);
+    var m1: i64 = (ir1 << 12) + ir0 * ir1f;
+    var m2: i64 = (ir2 << 12) + ir0 * ir2f;
+    var m3: i64 = (ir3 << 12) + ir0 * ir3f;
+    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
+    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
+    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
+    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+    gtePushRgb(g, m1, m2, m3);
+}
+
+// DCPL — depth-cue color light. Like CDP but uses (RC*IR)<<4 to derive
+// the first MAC stage instead of BK+LC*IR. Final stage = FC interpolation.
+pub fn gteDcpl(g: *mut[] u32, sf: u32, lm: u32) {
+    const ir1Pre: i64 = s16ToI64(g[9]);
+    const ir2Pre: i64 = s16ToI64(g[10]);
+    const ir3Pre: i64 = s16ToI64(g[11]);
+    const rgbc: u32 = g[6];
+    const rc: i64 = (rgbc & 0xFF) as i64;
+    const gc: i64 = ((rgbc >> 8) & 0xFF) as i64;
+    const bc: i64 = ((rgbc >> 16) & 0xFF) as i64;
+    var s1: i64 = (rc * ir1Pre) << 4;
+    var s2: i64 = (gc * ir2Pre) << 4;
+    var s3: i64 = (bc * ir3Pre) << 4;
+    if (sf == 12) { s1 = s1 >> 12; s2 = s2 >> 12; s3 = s3 >> 12; }
+    g[D_MAC1] = (s1 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC2] = (s2 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC3] = (s3 as u64 & 0xFFFFFFFF) as u32;
+    gteFarColorInterp(g, sf, lm);
+    const m1: i64 = s32ToI64(g[D_MAC1]);
+    const m2: i64 = s32ToI64(g[D_MAC2]);
+    const m3: i64 = s32ToI64(g[D_MAC3]);
+    gtePushRgb(g, m1, m2, m3);
+}
+
+// GPF — general purpose flat (interpolate IR0 with current IR).
+//   MAC = IR0 * IR; IR = clamp(MAC); push RGB FIFO from MAC>>4.
+pub fn gteGpf(g: *mut[] u32, sf: u32, lm: u32) {
+    const ir1: i64 = s16ToI64(g[9]);
+    const ir2: i64 = s16ToI64(g[10]);
+    const ir3: i64 = s16ToI64(g[11]);
+    const ir0: i64 = s16ToI64(g[8]);
+    var m1: i64 = ir0 * ir1;
+    var m2: i64 = ir0 * ir2;
+    var m3: i64 = ir0 * ir3;
+    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
+    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
+    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
+    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+    gtePushRgb(g, m1, m2, m3);
+}
+
+// GPL — general purpose linear (extend MAC by sf bits then add IR0*IR).
+//   MAC = (MAC << sf) + IR0 * IR; IR = clamp(MAC); push RGB FIFO.
+pub fn gteGpl(g: *mut[] u32, sf: u32, lm: u32) {
+    const ir1: i64 = s16ToI64(g[9]);
+    const ir2: i64 = s16ToI64(g[10]);
+    const ir3: i64 = s16ToI64(g[11]);
+    const ir0: i64 = s16ToI64(g[8]);
+    var mac1: i64 = s32ToI64(g[D_MAC1]) << sf;
+    var mac2: i64 = s32ToI64(g[D_MAC2]) << sf;
+    var mac3: i64 = s32ToI64(g[D_MAC3]) << sf;
+    var m1: i64 = mac1 + ir0 * ir1;
+    var m2: i64 = mac2 + ir0 * ir2;
+    var m3: i64 = mac3 + ir0 * ir3;
+    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
+    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
+    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
+    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+    gtePushRgb(g, m1, m2, m3);
 }
 
 // Sign-extend a 16-bit value (stored in u32 low 16) to i64.

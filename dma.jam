@@ -15,6 +15,9 @@ const { gpuGp0, gpuRead32 } = import("gpu");
 const { irqRaise, IC_DMA } = import("irq");
 const { cdromReadData } = import("cdrom");
 const { mdecRead32, mdecWrite32 } = import("mdec");
+const { spuWrite16, spuRead16 } = import("spu");
+
+const SPU_TFIFO_OFF: u32 = 0x1A8;
 
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
@@ -50,6 +53,7 @@ const Bus = struct {
     mdec:    *mut[] u8,
     mdecIn:  *mut[] u8,
     mdecOut: *mut[] u8,
+    sio1:    *mut[] u8,
     biosLoaded: u8,
 };
 
@@ -358,6 +362,11 @@ pub fn dmaDoCdrom(d: *mut[] u32, bus: Bus) {
     d[26] = 1;
 }
 
+// SPU DMA (channel 4). psxe dma.c:375-437 pipes each 32-bit word through
+// the SPU TFIFO register at 0x1F801DA8 as two 16-bit halves, low first.
+// Reverse direction reads two halves from TFIFO and packs them. Previously
+// we drop the data — meaning Musashi/HM ADPCM banks were never reaching
+// SPU RAM and the BIOS "wait for SPU drain" loops would never advance.
 pub fn dmaDoSpu(d: *mut[] u32, bus: Bus) {
     if (!chcrBusy(d, 4)) { return; }
     const size:   u32 = bcrSize(d, 4);
@@ -369,7 +378,22 @@ pub fn dmaDoSpu(d: *mut[] u32, bus: Bus) {
         while (j < blocks) {
             var i: u32 = 0;
             while (i < size) {
-                ramRead32(bus, addr);    // SPU unimplemented — read and drop
+                const data: u32 = ramRead32(bus, addr);
+                spuWrite16(bus.spu, bus.spuram, SPU_TFIFO_OFF, data & 0xFFFF);
+                spuWrite16(bus.spu, bus.spuram, SPU_TFIFO_OFF, (data >> 16) & 0xFFFF);
+                addr = addr + step;
+                i = i + 1;
+            }
+            j = j + 1;
+        }
+    } else {
+        var j: u32 = 0;
+        while (j < blocks) {
+            var i: u32 = 0;
+            while (i < size) {
+                const lo: u32 = spuRead16(bus.spu, bus.spuram, SPU_TFIFO_OFF);
+                const hi: u32 = spuRead16(bus.spu, bus.spuram, SPU_TFIFO_OFF);
+                ramWrite32(bus, addr, lo | (hi << 16));
                 addr = addr + step;
                 i = i + 1;
             }

@@ -31,6 +31,9 @@ const { spuRead32, spuRead16, spuRead8,
 const { mdecRead32, mdecRead16, mdecRead8,
         mdecWrite32, mdecWrite16, mdecWrite8,
         mdecAlloc, mdecInputAlloc, mdecOutputAlloc, mdecFree } = import("mdec");
+const { sio1Read32, sio1Read16, sio1Read8,
+        sio1Write32, sio1Write16, sio1Write8,
+        sio1Alloc, sio1Free } = import("sio1");
 
 // Disc shape — kept in sync with disc.jam so callers can reference the
 // stored pointer via `bus.disc[0]`.
@@ -70,6 +73,7 @@ const Bus = struct {
     mdec:    *mut[] u8,
     mdecIn:  *mut[] u8,
     mdecOut: *mut[] u8,
+    sio1:    *mut[] u8,
     biosLoaded: u8,
 };
 
@@ -178,6 +182,7 @@ pub fn allocBus() Bus {
         mdec:    mdecAlloc(),
         mdecIn:  mdecInputAlloc(),
         mdecOut: mdecOutputAlloc(),
+        sio1:    sio1Alloc(),
         biosLoaded: 0,
     };
     return b;
@@ -202,12 +207,14 @@ pub fn freeBus(b: Bus) {
     mdecFree(b.mdec);
     mdecFree(b.mdecIn);
     mdecFree(b.mdecOut);
+    sio1Free(b.sio1);
 }
 
 // Dispatch an IO-region address to the right device. The offset is
 // relative to 0x1F801000 (i.e. r.off from the BusRoute).
 pub fn ioRead32(bus: Bus, off: u32) u32 {
     if (off >= 0x040 and off < 0x050) { return padRead32(bus.pad, off - 0x040); }
+    if (off >= 0x050 and off < 0x060) { return sio1Read32(bus.sio1, off - 0x050); }
     if (off >= 0x070 and off < 0x080) { return irqRead32(bus.irq, off - 0x070); }
     if (off >= 0x080 and off < 0x100) { return dmaRead32(bus.dma, off - 0x080); }
     if (off >= 0x100 and off < 0x130) { return timerRead32(bus.timer, off - 0x100); }
@@ -222,6 +229,7 @@ pub fn ioRead32(bus: Bus, off: u32) u32 {
 
 pub fn ioRead16(bus: Bus, off: u32) u32 {
     if (off >= 0x040 and off < 0x050) { return padRead16(bus.pad, off - 0x040); }
+    if (off >= 0x050 and off < 0x060) { return sio1Read16(bus.sio1, off - 0x050); }
     if (off >= 0x070 and off < 0x080) { return irqRead16(bus.irq, off - 0x070); }
     if (off >= 0x080 and off < 0x100) { return dmaRead16(bus.dma, off - 0x080); }
     if (off >= 0x100 and off < 0x130) { return timerRead16(bus.timer, off - 0x100); }
@@ -229,14 +237,13 @@ pub fn ioRead16(bus: Bus, off: u32) u32 {
     if (off >= 0x810 and off < 0x818) { return gpuRead16(bus.gpu, bus.vram, off - 0x810); }
     if (off >= 0x820 and off < 0x828) { return mdecRead16(bus.mdec, bus.mdecOut, off - 0x820); }
     if (off >= 0xC00 and off < 0x1000) { return spuRead16(bus.spu, bus.spuram, off - 0xC00); }
-    if (off == 0x054) { return 0x05; }
-    if (off == 0x05A) { return 0; }
     if (off >= IO_SIZE) { return 0; }
     return bufRead16(bus.io, off);
 }
 
 pub fn ioRead8(bus: Bus, off: u32) u32 {
     if (off >= 0x040 and off < 0x050) { return padRead8(bus.pad, off - 0x040); }
+    if (off >= 0x050 and off < 0x060) { return sio1Read8(bus.sio1, off - 0x050); }
     if (off >= 0x070 and off < 0x080) { return irqRead8(bus.irq, off - 0x070); }
     if (off >= 0x080 and off < 0x100) { return dmaRead8(bus.dma, off - 0x080); }
     if (off >= 0x100 and off < 0x130) { return timerRead8(bus.timer, off - 0x100); }
@@ -254,6 +261,7 @@ pub fn ioRead8(bus: Bus, off: u32) u32 {
 // require those parameters at the outer interface.
 pub fn ioWrite32(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     if (off >= 0x040 and off < 0x050) { padWrite32(bus.pad, off - 0x040, val); return; }
+    if (off >= 0x050 and off < 0x060) { sio1Write32(bus.sio1, off - 0x050, val); return; }
     if (off >= 0x070 and off < 0x080) { irqWrite32(bus.irq, cop0, off - 0x070, val); return; }
     if (off >= 0x080 and off < 0x100) { dmaWrite32(bus.dma, bus, cop0, off - 0x080, val); return; }
     if (off >= 0x100 and off < 0x130) { timerWrite32(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
@@ -267,6 +275,7 @@ pub fn ioWrite32(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
 
 pub fn ioWrite16(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     if (off >= 0x040 and off < 0x050) { padWrite16(bus.pad, off - 0x040, val); return; }
+    if (off >= 0x050 and off < 0x060) { sio1Write16(bus.sio1, off - 0x050, val); return; }
     if (off >= 0x070 and off < 0x080) { irqWrite16(bus.irq, cop0, off - 0x070, val); return; }
     if (off >= 0x080 and off < 0x100) { dmaWrite16(bus.dma, bus, cop0, off - 0x080, val); return; }
     if (off >= 0x100 and off < 0x130) { timerWrite16(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
@@ -280,6 +289,7 @@ pub fn ioWrite16(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
 
 pub fn ioWrite8(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     if (off >= 0x040 and off < 0x050) { padWrite8(bus.pad, off - 0x040, val); return; }
+    if (off >= 0x050 and off < 0x060) { sio1Write8(bus.sio1, off - 0x050, val); return; }
     if (off >= 0x070 and off < 0x080) { irqWrite8(bus.irq, cop0, off - 0x070, val); return; }
     if (off >= 0x080 and off < 0x100) { dmaWrite8(bus.dma, bus, cop0, off - 0x080, val); return; }
     if (off >= 0x100 and off < 0x130) { timerWrite8(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
