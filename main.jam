@@ -16,7 +16,7 @@ const {
 } = import("bus");
 
 // Force device modules into main.jam's codegen context.
-const { gpuAlloc, gpuUpdate, gpuFamilyCount } = import("gpu");
+const { gpuAlloc, gpuFamilyCount } = import("gpu");
 const { gteAlloc } = import("gte");
 const { cdromAlloc, cdromUpdate, cdromAttachDisc } = import("cdrom");
 const { discAlloc, discOpen } = import("disc");

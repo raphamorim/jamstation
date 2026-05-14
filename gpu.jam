@@ -1283,45 +1283,12 @@ pub fn gpuBlend(fore: u32, back: u32, mode: u32) u32 {
 // horizontal-draw / hblank boundary we tick `line`; at scanline 240 we
 // raise the VBLANK IRQ.
 
+// Removed: gpuUpdate() was a dead alternative scanline counter that
+// never got called from main.jam — runOneFrame handles scanline pacing
+// directly. The function had two competing accumulators (one fractional
+// 11/7 path, one ×2 path), neither correct. Keeping the constants in
+// case a future per-cycle GPU tick is added.
 const GPU_CYC_HDRAW_NTSC: u32 = 2560;
 const GPU_CYC_SCANL_NTSC: u32 = 3413;
 const GPU_LINES_VDRAW:    u32 = 240;
 const GPU_LINES_TOTAL:    u32 = 263;
-// GPU clock ratio is roughly 11/7 of CPU clock. To keep integer-only we
-// scale up by 7 and accumulate; every 7 CPU cycles ≈ 11 GPU cycles.
-const GPU_NUMER: u32 = 11;
-const GPU_DENOM: u32 = 7;
-
-pub fn gpuUpdate(g: *mut[] u32, cpuCyc: u32,
-                 ic: *mut[] u32, cop0: *mut[] u32) {
-    // Accumulate GPU cycles. We store a fractional accumulator in the
-    // high 16 bits of g[69] and the integer cycle count in the low 16.
-    const sub: u32 = (g[69] >> 16) + cpuCyc * GPU_NUMER;
-    const ticks: u32 = (g[69] & 0xFFFF) + (sub >> 0);   // both halves
-    const intCyc: u32 = sub;                            // run as 11×N approximation
-    g[69] = ((sub % (GPU_DENOM as u32)) << 16) | ((g[69] & 0xFFFF) + (sub));
-    // Simpler heuristic: every CPU cycle = ~1.57 GPU cycles. Round to
-    // 11/7 by accumulating 11 per CPU cycle and dividing by 7 when
-    // we read scanline boundaries. The above tries to do that but
-    // ends up overflowing.  For now use a simpler approximation: each
-    // tick of cpuCyc advances the GPU line by cpuCyc/3413/7*11 = approx
-    // cpuCyc/2171. Drop the float, just count.
-    g[69] = g[69] + cpuCyc * 2;     // ~2x CPU cycles per GPU cycle
-    if (g[69] >= GPU_CYC_SCANL_NTSC) {
-        g[69] = g[69] - GPU_CYC_SCANL_NTSC;
-        g[70] = g[70] + 1;
-        // Toggle the odd-line bit at the head of each scanline.
-        if (g[70] < GPU_LINES_VDRAW) {
-            if ((g[70] & 1) != 0) { g[46] = g[46] | 0x80000000; }
-            else                  { g[46] = g[46] & 0x7FFFFFFF; }
-        } else {
-            g[46] = g[46] & 0x7FFFFFFF;
-        }
-        if (g[70] == GPU_LINES_VDRAW) {
-            irqRaise(ic, cop0, IC_VBLANK());
-        }
-        if (g[70] >= GPU_LINES_TOTAL) {
-            g[70] = 0;
-        }
-    }
-}

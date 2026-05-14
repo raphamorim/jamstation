@@ -11,7 +11,7 @@
 // structurally and we reach into bus.ram / bus.gpu directly, calling
 // gpuGp0 / vram helpers from gpu.jam where necessary.
 
-const { gpuGp0 } = import("gpu");
+const { gpuGp0, gpuRead32 } = import("gpu");
 const { irqRaise, IC_DMA } = import("irq");
 const { cdromReadData } = import("cdrom");
 const { mdecRead32, mdecWrite32 } = import("mdec");
@@ -249,12 +249,16 @@ pub fn dmaDoGpuRequest(d: *mut[] u32, bus: Bus) {
             i = i + 1;
         }
     } else {
-        // GPU→RAM: VRAM-to-CPU transfer in progress, drain GPUREAD into RAM.
-        // We don't fully support C0 transfers yet so this is a stub —
-        // writes zeros into the destination buffer.
+        // GPU→RAM (C0 transfer): drain GPUREAD per word into RAM.
+        // psxe dma.c:281-289: `data = psx_bus_read32(bus, 0x1F801810)` —
+        // GPUREAD pulls from VRAM via the active C0 state machine
+        // (gpu.c:69-114). Our previous stub wrote zeros, which broke
+        // games that DMA-copy VRAM back to RAM (font caches, frame
+        // composites, etc.).
         var i: u32 = 0;
         while (i < size) {
-            ramWrite32(bus, addr, 0);
+            const data: u32 = gpuRead32(bus.gpu, bus.vram, 0);
+            ramWrite32(bus, addr, data);
             addr = addr + step;
             i = i + 1;
         }
