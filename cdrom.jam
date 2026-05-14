@@ -310,8 +310,9 @@ pub fn cdromWrite8(d: *mut[] u8, off: u32, val: u32) {
     }
     // Bank 0
     if (slot == 1) {
-        // Command byte — schedule state-machine entry.
-        if (d[0x1E] < 20) {
+        // Command byte — schedule state-machine entry. Only the first
+        // few commands are traced; bump the limit when debugging.
+        if (d[0x1E] < 200) {
             var fmt: []u8 = "CD cmd 0x%02X (#%u)\n";
             printf(fmt.ptr, val & 0xFF, d[0x1E] as u32);
             d[0x1E] = d[0x1E] + 1;

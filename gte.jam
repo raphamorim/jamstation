@@ -47,7 +47,7 @@ pub extern fn free(ptr: *mut[] u8);
 pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 pub extern fn printf(format: *const[] u8, ...) i32;
 
-const GTE_REGS: u32 = 64;
+const GTE_REGS: u32 = 144;     // 0..63 = data/control regs, 64..143 = debug counters
 const D_V0: u32 = 0;
 const D_V0Z: u32 = 1;
 const D_SXY0: u32 = 12;
@@ -168,6 +168,10 @@ pub fn gteCtrlWrite(g: *mut[] u32, idx: u32, val: u32) {
 pub fn gteExec(g: *mut[] u32, opc: u32) {
     g[32 + C_FLAG] = 0;        // clear FLAG every instruction
     const op: u32 = opc & 0x3F;
+    // Per-op histogram of GTE math instructions. Stored at control
+    // register 31 (LZCR) + bits — wait, use g spare slot g[70+].
+    g[70] = g[70] + 1;                        // total GTE ops
+    if (op < 0x40) { g[80 + op] = g[80 + op] + 1; }
     // Decode sf (bit 19 → 12 or 0) and lm (bit 10) once per dispatch
     // so RTPS/RTPT/MVMVA all see the same flags.
     const sf: u32 = ((opc >> 19) & 1) * 12;
@@ -176,6 +180,12 @@ pub fn gteExec(g: *mut[] u32, opc: u32) {
     if (op == 0x06) { gteNclip(g); }              // NCLIP
     if (op == 0x0C) { gteOp(g); }                 // OP
     if (op == 0x12) { gteMvmva(g, opc); }         // MVMVA
+    if (op == 0x13) { gteNcds(g, 0, sf, lm); }    // NCDS
+    if (op == 0x16) {                              // NCDT — 3 successive NCDS
+        gteNcds(g, 0, sf, lm);
+        gteNcds(g, 1, sf, lm);
+        gteNcds(g, 2, sf, lm);
+    }
     if (op == 0x28) { gteSqr(g); }                // SQR
     if (op == 0x2D) { gteAvsz(g, 3); }            // AVSZ3
     if (op == 0x2E) { gteAvsz(g, 4); }            // AVSZ4
@@ -327,6 +337,19 @@ pub fn gteRtps(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     g[D_SXY1] = g[D_SXY2];
     g[D_SXY2] = (satSxy(sx) & 0xFFFF) | ((satSxy(sy) & 0xFFFF) << 16);
 
+    // Debug: log the first few RTPS calls so we can compare vertex
+    // projections with psxe's reference output.
+    if (g[65] < 6) {
+        var fmt: []u8 = "RTPS sf=%u V[%u]=(%d,%d,%d) RT=%08X %08X %08X %08X %08X TR=(%d,%d,%d) OF=(%08X,%08X) H=%04X SZ3=%04X div=%05X SX=%d SY=%d\n";
+        printf(fmt.ptr, sf, vidx,
+            vx as i32, vy as i32, vzS as i32,
+            g[32 + 0], g[32 + 1], g[32 + 2], g[32 + 3], g[32 + 4],
+            (trx as i32), (try_ as i32), (trz as i32),
+            g[32 + 24], g[32 + 25], h, sz3, div,
+            sx as i32, sy as i32);
+        g[65] = g[65] + 1;
+    }
+
     // Write IR back and MAC for further pipeline stages.
     g[9]  = (ir1 as u64 & 0xFFFF) as u32;
     g[10] = (ir2 as u64 & 0xFFFF) as u32;
@@ -403,6 +426,146 @@ pub fn gteOp(g: *mut[] u32) {
     g[9]  = (satIr16(mac1) as u64 & 0xFFFF) as u32;
     g[10] = (satIr16(mac2) as u64 & 0xFFFF) as u32;
     g[11] = (satIr16(mac3) as u64 & 0xFFFF) as u32;
+}
+
+// NCDS — Normal Color Depth Single. Computes per-vertex lit color with
+// far-color (fog) depth interpolation, using the light matrix to
+// transform the input vertex normal. Mirrors psxe's NCDS macro:
+//   1. L * V       → MAC, IR (vertex normal in light space)
+//   2. BK + LC*IR  → MAC, IR (background + reflected light)
+//   3. ir' = clamp((FC<<12) - (C<<4)*IR), with lm=0
+//   4. MAC = (C<<4)*IR + IR0*ir'    (interpolate to far-colour)
+//   5. IR = clamp(MAC, lm)
+//   6. RGB FIFO push; RC2/GC2/BC2 = clamp_rgb(MAC >> 4)
+//
+// Control-reg layout:
+//   CR[8..12]:  L matrix (LL11/LL12, LL13/LL21, LL22/LL23, LL31/LL32, LL33)
+//   CR[13..15]: RBK / GBK / BBK (background colour, 32-bit signed)
+//   CR[16..20]: LC matrix (LR1/LR2, LR3/LG1, LG2/LG3, LB1/LB2, LB3)
+//   CR[21..23]: RFC / GFC / BFC (far colour, 32-bit signed)
+//
+// Data-reg layout:
+//   DR[6] byte 0 = R, byte 1 = G, byte 2 = B, byte 3 = CODE (RGBC)
+//   DR[8] = IR0 (depth-queue factor)
+//   DR[20..22] = RGB FIFO entries 0/1/2
+//
+// Without this, the BIOS PS-logo polygons all receive colour (0,0,0)
+// and render black on a black background — completely invisible.
+// sf is 0 or 12 — psxe's gte_clamp_mac shifts the saturated MAC by sf
+// at every stage; we apply the same shift inline so IR values land in
+// the right magnitude before clamping.
+pub fn gteNcds(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
+    const vSlot: u32 = vidx * 2;
+    const vxy: u32 = g[vSlot];
+    const vzS: u32 = g[vSlot + 1];
+    const vx: i64 = s16ToI64(vxy & 0xFFFF);
+    const vy: i64 = s16ToI64((vxy >> 16) & 0xFFFF);
+    const vz: i64 = s16ToI64(vzS & 0xFFFF);
+
+    // Light matrix.
+    const ll11: i64 = s16ToI64(g[32 + 8] & 0xFFFF);
+    const ll12: i64 = s16ToI64((g[32 + 8] >> 16) & 0xFFFF);
+    const ll13: i64 = s16ToI64(g[32 + 9] & 0xFFFF);
+    const ll21: i64 = s16ToI64((g[32 + 9] >> 16) & 0xFFFF);
+    const ll22: i64 = s16ToI64(g[32 + 10] & 0xFFFF);
+    const ll23: i64 = s16ToI64((g[32 + 10] >> 16) & 0xFFFF);
+    const ll31: i64 = s16ToI64(g[32 + 11] & 0xFFFF);
+    const ll32: i64 = s16ToI64((g[32 + 11] >> 16) & 0xFFFF);
+    const ll33: i64 = s16ToI64(g[32 + 12] & 0xFFFF);
+
+    // Stage 1: L * V → MAC, IR.  psxe's gte_clamp_mac applies `>> sf`,
+    // so for sf=12 (the BIOS default) we shift down by 12 before
+    // clamping into the IR range; otherwise IR saturates at 0x7FFF and
+    // the downstream stages clip every channel to white.
+    var m1a: i64 = ll11 * vx + ll12 * vy + ll13 * vz;
+    var m2a: i64 = ll21 * vx + ll22 * vy + ll23 * vz;
+    var m3a: i64 = ll31 * vx + ll32 * vy + ll33 * vz;
+    if (sf == 12) { m1a = m1a >> 12; m2a = m2a >> 12; m3a = m3a >> 12; }
+    const ir1a: i64 = satIrLm(m1a, lm);
+    const ir2a: i64 = satIrLm(m2a, lm);
+    const ir3a: i64 = satIrLm(m3a, lm);
+
+    // Stage 2: background-colour + light-colour matrix * (IR from stage 1).
+    const lr1: i64 = s16ToI64(g[32 + 16] & 0xFFFF);
+    const lr2: i64 = s16ToI64((g[32 + 16] >> 16) & 0xFFFF);
+    const lr3: i64 = s16ToI64(g[32 + 17] & 0xFFFF);
+    const lg1: i64 = s16ToI64((g[32 + 17] >> 16) & 0xFFFF);
+    const lg2: i64 = s16ToI64(g[32 + 18] & 0xFFFF);
+    const lg3: i64 = s16ToI64((g[32 + 18] >> 16) & 0xFFFF);
+    const lb1: i64 = s16ToI64(g[32 + 19] & 0xFFFF);
+    const lb2: i64 = s16ToI64((g[32 + 19] >> 16) & 0xFFFF);
+    const lb3: i64 = s16ToI64(g[32 + 20] & 0xFFFF);
+    const rbk: i64 = s32ToI64(g[32 + 13]);
+    const gbk: i64 = s32ToI64(g[32 + 14]);
+    const bbk: i64 = s32ToI64(g[32 + 15]);
+
+    var m1b: i64 = (rbk << 12) + lr1 * ir1a + lr2 * ir2a + lr3 * ir3a;
+    var m2b: i64 = (gbk << 12) + lg1 * ir1a + lg2 * ir2a + lg3 * ir3a;
+    var m3b: i64 = (bbk << 12) + lb1 * ir1a + lb2 * ir2a + lb3 * ir3a;
+    if (sf == 12) { m1b = m1b >> 12; m2b = m2b >> 12; m3b = m3b >> 12; }
+    const ir1b: i64 = satIrLm(m1b, lm);
+    const ir2b: i64 = satIrLm(m2b, lm);
+    const ir3b: i64 = satIrLm(m3b, lm);
+
+    // Stage 3: vertex colour from RGBC register (DR[6]).
+    const rgbc: u32 = g[6];
+    const rc: i64 = (rgbc & 0xFF) as i64;
+    const gc: i64 = ((rgbc >> 8) & 0xFF) as i64;
+    const bc: i64 = ((rgbc >> 16) & 0xFF) as i64;
+    const code: u32 = (rgbc >> 24) & 0xFF;
+
+    // Stage 4: far-colour interpolation ir' = clamp((FC<<12) - (C<<4)*IR).
+    // psxe shifts this stage by `sf` too via the same gte_clamp_mac.
+    const rfc: i64 = s32ToI64(g[32 + 21]);
+    const gfc: i64 = s32ToI64(g[32 + 22]);
+    const bfc: i64 = s32ToI64(g[32 + 23]);
+    var fp1: i64 = (rfc << 12) - (rc << 4) * ir1b;
+    var fp2: i64 = (gfc << 12) - (gc << 4) * ir2b;
+    var fp3: i64 = (bfc << 12) - (bc << 4) * ir3b;
+    if (sf == 12) { fp1 = fp1 >> 12; fp2 = fp2 >> 12; fp3 = fp3 >> 12; }
+    const ir1f: i64 = satIrLm(fp1, 0);
+    const ir2f: i64 = satIrLm(fp2, 0);
+    const ir3f: i64 = satIrLm(fp3, 0);
+
+    // Stage 5: final colour = (C<<4)*IR + IR0 * ir'.
+    const ir0: i64 = s16ToI64(g[8]);
+    var m1c: i64 = (rc << 4) * ir1b + ir0 * ir1f;
+    var m2c: i64 = (gc << 4) * ir2b + ir0 * ir2f;
+    var m3c: i64 = (bc << 4) * ir3b + ir0 * ir3f;
+    if (sf == 12) { m1c = m1c >> 12; m2c = m2c >> 12; m3c = m3c >> 12; }
+
+    g[D_MAC1] = (m1c as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC2] = (m2c as u64 & 0xFFFFFFFF) as u32;
+    g[D_MAC3] = (m3c as u64 & 0xFFFFFFFF) as u32;
+    g[9]  = (satIrLm(m1c, lm) as u64 & 0xFFFF) as u32;
+    g[10] = (satIrLm(m2c, lm) as u64 & 0xFFFF) as u32;
+    g[11] = (satIrLm(m3c, lm) as u64 & 0xFFFF) as u32;
+
+    // Stage 6: RGB FIFO push and RGB2 = clamp_rgb(MAC >> 4).
+    g[20] = g[21];                       // RGB0 ← RGB1
+    g[21] = g[22];                       // RGB1 ← RGB2
+    const r2: u32 = clampU8(m1c >> 4);
+    const g2: u32 = clampU8(m2c >> 4);
+    const b2: u32 = clampU8(m3c >> 4);
+    g[22] = r2 | (g2 << 8) | (b2 << 16) | (code << 24);
+
+    // Debug: print first few NCDS calls so we can compare with psxe.
+    if (g[64] < 5) {
+        var fmt: []u8 = "NCDS sf=%u lm=%u V=(%d,%d,%d) RGBC=%08X IR0=%04X RFC=%08X RBK=%08X -> RGB=%02X%02X%02X (mac=%08X %08X %08X)\n";
+        printf(fmt.ptr, sf, lm,
+            vx as i32, vy as i32, vz as i32, g[6],
+            g[8] & 0xFFFF, g[32 + 21], g[32 + 13],
+            r2, g2, b2,
+            g[D_MAC1], g[D_MAC2], g[D_MAC3]);
+        g[64] = g[64] + 1;
+    }
+}
+
+// 8-bit unsigned clamp used by the RGB FIFO writes.
+pub fn clampU8(v: i64) u32 {
+    if (v < 0) { return 0; }
+    if (v > 255) { return 255; }
+    return (v as u64 & 0xFF) as u32;
 }
 
 // SQR — square each IR component. Used for vector-length computations.
