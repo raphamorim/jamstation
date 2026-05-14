@@ -97,6 +97,9 @@ const Cpu = struct {
     branchTaken: u8,
     halted: u8,
     cycles: u64,
+    diagDumped: u32,
+    diagExcCount: u32,
+    diagWalkCount: u32,
 };
 
 

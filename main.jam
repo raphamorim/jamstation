@@ -37,7 +37,7 @@ const {
     gprRead, gprWrite,
     cop0Read, cop0Write,
     run, runHooked,
-    step, biosHook, commitLoad,
+    step, biosHook, biosHookDiag, commitLoad,
     encR, encI, encJ
 } = import("cpu");
 
@@ -137,6 +137,9 @@ const Cpu = struct {
     branchTaken: u8,
     halted: u8,
     cycles: u64,
+    diagDumped: u32,
+    diagExcCount: u32,
+    diagWalkCount: u32,
 };
 
 const Sdl = struct {
@@ -287,6 +290,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     var lineCyc: u32 = 0;
     while (line < SCANLINES_TOTAL) {
         biosHook(c, bus, regs);
+        biosHookDiag(c, bus, regs, cop0);
         const before: u64 = c.cycles;
         step(c, bus, regs, cop0);
         const delta: u32 = (c.cycles - before) as u32;

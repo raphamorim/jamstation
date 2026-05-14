@@ -91,6 +91,10 @@ const Cpu = struct {
     branchTaken: u8,
     halted: u8,
     cycles: u64,
+    // DIAG: one-shot dump fields for IRQ-handler-chain investigation.
+    diagDumped: u32,
+    diagExcCount: u32,
+    diagWalkCount: u32,
 };
 
 // COP0 register indices.
@@ -154,6 +158,7 @@ pub fn freshCpu() Cpu {
         loadD: 0, loadV: 0,
         branch: 0, delaySlot: 0, branchTaken: 0, halted: 0,
         cycles: 0,
+        diagDumped: 0, diagExcCount: 0, diagWalkCount: 0,
     };
     return c;
 }
@@ -1153,11 +1158,109 @@ pub fn biosHook(c: mut Cpu, bus: Bus, regs: *mut[] u32) {
     }
 }
 
+// DIAG: dispatcher walker diagnostic. Called from runHooked.
+pub fn biosHookDiag(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
+    // Trace C0:02 (SysEnqIntRP) calls — the BIOS C-table dispatcher lives
+    // at masked-PC 0xC0. Note $t1=$9 holds the function index.
+    const pcMaskedSyscall: u32 = c.pc & 0x3FFFFFFF;
+    if (pcMaskedSyscall == 0xC0) {
+        const op: u32 = gprRead(regs, 9);
+        if (op == 0x02 or op == 0x03 or op == 0x0A or op == 0x0B) {
+            const a0: u32 = gprRead(regs, 4);
+            const a1: u32 = gprRead(regs, 5);
+            const ra: u32 = gprRead(regs, 31);
+            var fmt: []u8 = "[diag-C0] op=%02x a0=%08x a1=%08x ra=%08x\n";
+            printf(fmt.ptr, op, a0, a1, ra);
+            // For C0:02, dereference *a0 to see what handler is being registered
+            if (op == 0x02 and a0 != 0) {
+                const n0: u32 = busRead32(bus, a0);
+                const n1: u32 = busRead32(bus, a0+4);
+                const n2: u32 = busRead32(bus, a0+8);
+                const n3: u32 = busRead32(bus, a0+0xC);
+                var fmt2: []u8 = "[diag-C0:02] handler struct@%08x: {next=%08x, fn1=%08x, fn2=%08x, ?=%08x}\n";
+                printf(fmt2.ptr, a0, n0, n1, n2, n3);
+            }
+            fflush(0);
+        }
+    }
+    if (c.pc == 0x80059DCC and c.diagDumped == 0) {
+        c.diagDumped = 1;
+        var hdr: []u8 = "[diag] ===== mem[0x100..0x150] =====\n";
+        printf(hdr.ptr);
+        var rowFmt: []u8 = "[diag] 0x%08x: %08x %08x %08x %08x\n";
+        var addr: u32 = 0x100;
+        while (addr < 0x150) {
+            const w0: u32 = busRead32(bus, addr);
+            const w1: u32 = busRead32(bus, addr+4);
+            const w2: u32 = busRead32(bus, addr+8);
+            const w3: u32 = busRead32(bus, addr+0xC);
+            printf(rowFmt.ptr, addr, w0, w1, w2, w3);
+            addr = addr + 0x10;
+        }
+        const excbPtr: u32 = busRead32(bus, 0x100);
+        var f1: []u8 = "[diag] *0x100=0x%08x (ExCB table ptr)\n";
+        printf(f1.ptr, excbPtr);
+        var f2: []u8 = "[diag] *0x108=0x%08x (cur thread)\n";
+        printf(f2.ptr, busRead32(bus, 0x108));
+        if (excbPtr != 0) {
+            var f3: []u8 = "[diag] chain[%u] head=0x%08x\n";
+            var f4: []u8 = "[diag]   node@%08x next=%08x fn1=%08x fn2=%08x\n";
+            var i: u32 = 0;
+            while (i < 4) {
+                const chainHead: u32 = busRead32(bus, excbPtr + i*8);
+                printf(f3.ptr, i, chainHead);
+                var node: u32 = chainHead;
+                var depth: u32 = 0;
+                while (node != 0 and depth < 16) {
+                    const next: u32 = busRead32(bus, node);
+                    const fn1: u32 = busRead32(bus, node+4);
+                    const fn2: u32 = busRead32(bus, node+8);
+                    printf(f4.ptr, node, next, fn1, fn2);
+                    node = next;
+                    depth = depth + 1;
+                }
+                i = i + 1;
+            }
+        }
+        const counter: u32 = busRead32(bus, 0x80089D9C);
+        const irqMask: u32 = busRead32(bus, 0x1F801074);
+        const irqStat: u32 = busRead32(bus, 0x1F801070);
+        const sr: u32 = cop0Read(cop0, C0_SR);
+        const cause: u32 = cop0Read(cop0, C0_CAUSE);
+        var f5: []u8 = "[diag] mem[0x80089D9C]=%08x I_MASK=%08x I_STAT=%08x SR=%08x CAUSE=%08x\n";
+        printf(f5.ptr, counter, irqMask, irqStat, sr, cause);
+        fflush(0);
+    }
+    if (c.pc == 0x80000080) {
+        c.diagExcCount = c.diagExcCount + 1;
+        if (c.diagExcCount <= 6) {
+            const cause: u32 = cop0Read(cop0, C0_CAUSE);
+            const sr: u32 = cop0Read(cop0, C0_SR);
+            const epc: u32 = cop0Read(cop0, C0_EPC);
+            const istat: u32 = busRead32(bus, 0x1F801070);
+            const imask: u32 = busRead32(bus, 0x1F801074);
+            const ex100: u32 = busRead32(bus, 0x100);
+            var fe: []u8 = "[diag-exc %u] CAUSE=%08x SR=%08x EPC=%08x ISTAT=%08x IMASK=%08x *0x100=%08x\n";
+            printf(fe.ptr, c.diagExcCount, cause, sr, epc, istat, imask, ex100);
+            fflush(0);
+        }
+    }
+    if (c.pc == 0x800000E8 and c.diagWalkCount < 4) {
+        c.diagWalkCount = c.diagWalkCount + 1;
+        const s3: u32 = gprRead(regs, 19);
+        const s6: u32 = gprRead(regs, 22);
+        var fw: []u8 = "[diag-walk %u] @e8 s3=%08x s6(head)=%08x\n";
+        printf(fw.ptr, c.diagWalkCount, s3, s6);
+        fflush(0);
+    }
+}
+
 pub fn runHooked(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
                  maxSteps: u32) {
     var i: u32 = 0;
     while (i < maxSteps and c.halted == 0) {
         biosHook(c, bus, regs);
+        biosHookDiag(c, bus, regs, cop0);
         step(c, bus, regs, cop0);
         i = i + 1;
     }
