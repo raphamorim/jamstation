@@ -53,9 +53,10 @@ const SR_BEV: u32 = 0x00400000;
 const Disc = struct {
     file: *mut[] u8,
     loaded: u8,
-    pad0: u8,
+    isCue: u8,
     pad1: u8,
     pad2: u8,
+    cuePtr: *mut[] u8,
 };
 
 const Bus = struct {

@@ -40,9 +40,10 @@ const { discRead, discLoaded } = import("disc");
 const Disc = struct {
     file: *mut[] u8,
     loaded: u8,
-    pad0: u8,
+    isCue: u8,
     pad1: u8,
     pad2: u8,
+    cuePtr: *mut[] u8,
 };
 
 // State block — single u8 buffer with byte offsets. Total ~256 bytes.

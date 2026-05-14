@@ -41,9 +41,10 @@ const { mcdAlloc, mcdRamAlloc, mcdFree, mcdRamFree } = import("mcd");
 const Disc = struct {
     file: *mut[] u8,
     loaded: u8,
-    pad0: u8,
+    isCue: u8,
     pad1: u8,
     pad2: u8,
+    cuePtr: *mut[] u8,
 };
 
 pub extern fn malloc(size: u64) *mut[] u8;
@@ -131,10 +132,20 @@ pub fn bufWrite8(buf: *mut[] u8, off: u32, val: u32) {
 }
 
 // Per-region routing. Same as psxe's static IO-base/size table inlined
-// into an address comparator.
+// into an address comparator. `kind` values:
+//   0 = unmapped (reads return 0)
+//   1 = RAM
+//   2 = BIOS ROM
+//   3 = scratchpad
+//   4 = I/O register file
+//   5 = EXP1 (returns 0xFF on read — psxe psx_exp1_read* with no cart loaded)
 pub fn route(paddr: u32) BusRoute {
     if (paddr < 0x00800000) {
         var r: BusRoute = { kind: 1, off: paddr & 0x001FFFFF };
+        return r;
+    }
+    if (paddr >= 0x1F000000 and paddr < 0x1F080000) {
+        var r: BusRoute = { kind: 5, off: paddr - 0x1F000000 };
         return r;
     }
     if (paddr >= 0x1F800000 and paddr < 0x1F800400) {
@@ -334,6 +345,8 @@ pub fn busRead32(bus: Bus, addr: u32) u32 {
     if (r.kind == 2) { return bufRead32(bus.bios, r.off & (BIOS_SIZE - 1)); }
     if (r.kind == 3) { return bufRead32(bus.spad, r.off & (SPAD_SIZE - 1)); }
     if (r.kind == 4) { return ioRead32(bus, r.off); }
+    // kind 5: EXP1 (no cart loaded) — psxe exp1.c reads return 0xFF per byte.
+    if (r.kind == 5) { return 0xFFFFFFFF; }
     return 0;
 }
 
@@ -344,6 +357,7 @@ pub fn busRead16(bus: Bus, addr: u32) u32 {
     if (r.kind == 2) { return bufRead16(bus.bios, r.off & (BIOS_SIZE - 1)); }
     if (r.kind == 3) { return bufRead16(bus.spad, r.off & (SPAD_SIZE - 1)); }
     if (r.kind == 4) { return ioRead16(bus, r.off); }
+    if (r.kind == 5) { return 0xFFFF; }
     return 0;
 }
 
@@ -354,6 +368,7 @@ pub fn busRead8(bus: Bus, addr: u32) u32 {
     if (r.kind == 2) { return bufRead8(bus.bios, r.off & (BIOS_SIZE - 1)); }
     if (r.kind == 3) { return bufRead8(bus.spad, r.off & (SPAD_SIZE - 1)); }
     if (r.kind == 4) { return ioRead8(bus, r.off); }
+    if (r.kind == 5) { return 0xFF; }
     return 0;
 }
 

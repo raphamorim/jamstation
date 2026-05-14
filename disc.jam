@@ -1,9 +1,15 @@
-// CD-ROM disc image (Mode2/2352 .bin reader).
+// CD-ROM disc image. Supports two backends:
 //
-// Owns a `FILE*` handle to the data track and exposes one operation —
-// `discRead(disc, lba, buf)` — that reads one 2352-byte sector at the
-// requested LBA. The CD-ROM controller in `cdrom.jam` calls into this
-// during the `CdlReadN` / `CdlReadS` state machine.
+//   1. Raw .bin (Mode2/2352): single-file image, one data track. The
+//      historical layout for our test discs and most plain dumps.
+//   2. .cue + .bin(s): multi-track support via the CUE parser in
+//      cue.jam. Required for games shipping CDDA tracks after the
+//      data track (Brave Fencer Musashi, Wipeout, etc.).
+//
+// Disc.cue is non-null when we loaded a .cue. discRead then routes
+// through cueRead, which handles per-track file offsets, pregaps, and
+// audio/data type tagging. With raw .bin we treat the whole file as a
+// single Mode2/2352 data track.
 //
 // LBA convention follows the PSX BIOS / psxe:
 //   LBA = 150 → start of track 1 data (00:02:00 on the disc)
@@ -11,11 +17,9 @@
 // We subtract the 150-sector lead-in when seeking inside the .bin —
 // real discs prefix the data with 2 seconds (150 sectors) of pregap
 // that's not part of the image file.
-//
-// The .cue file isn't parsed here — for now we open the .bin path
-// directly. Multi-track / audio reads will need a CUE parser later
-// (Brave Fencer Musashi has three CDDA tracks after the data track,
-// but those only matter for music playback which we don't have).
+
+const { cueAlloc, cueFree, cueParse, cueRead, cueQuery,
+        cueGetTrackCount } = import("cue");
 
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
@@ -31,30 +35,67 @@ const SECTOR_SIZE: u32 = 2352;
 const LEAD_IN_SECTORS: u32 = 150;
 
 const Disc = struct {
-    file: *mut[] u8,   // libc FILE* (opaque)
+    file: *mut[] u8,   // libc FILE* (opaque) — set when raw .bin loaded
     loaded: u8,        // 1 once discOpen succeeds
-    pad0: u8,
+    isCue: u8,         // 1 if cue-loaded (cuePtr is valid)
     pad1: u8,
     pad2: u8,
+    cuePtr: *mut[] u8, // opaque *mut[] Cue stored as bytes for struct-mirror compat
 };
 
 pub fn discAlloc() *mut[] Disc {
-    var raw: *mut[] u8 = malloc(16);
-    memset(raw, 0, 16);
+    // Disc struct: file ptr (16) + 4*u8 + cuePtr (16) = ~40 with align.
+    // Bump to 48 to be safe.
+    var raw: *mut[] u8 = malloc(48);
+    memset(raw, 0, 48);
     return raw as *mut[] Disc;
 }
 
 pub fn discFree(d: *mut[] Disc) {
-    if (d[0].loaded != 0) { fclose(d[0].file); }
+    if (d[0].isCue != 0) {
+        cueFree(d[0].cuePtr);
+    } else if (d[0].loaded != 0) {
+        fclose(d[0].file);
+    }
     free(d as *mut[] u8);
 }
 
-// Open `path` as the Mode2/2352 .bin for track 1. Returns 1 on success.
+// Detect .cue extension on a path. Case-insensitive on the suffix bytes.
+pub fn pathEndsWithCue(p: []u8) bool {
+    var n: u32 = 0;
+    while (p.ptr[n] != 0) { n = n + 1; }
+    if (n < 4) { return false; }
+    const a: u32 = p.ptr[n - 4] as u32;
+    const b: u32 = p.ptr[n - 3] as u32;
+    const cC: u32 = p.ptr[n - 2] as u32;
+    const e: u32 = p.ptr[n - 1] as u32;
+    // ".cue" or ".CUE"
+    if (a == 0x2E and (b == 0x63 or b == 0x43)
+                  and (cC == 0x75 or cC == 0x55)
+                  and (e == 0x65 or e == 0x45)) {
+        return true;
+    }
+    return false;
+}
+
+// Open a disc image. Paths ending in `.cue` parse the cue sheet (which
+// opens its own .bin files); everything else is treated as a raw
+// single-track Mode2/2352 .bin.
 pub fn discOpen(d: *mut[] Disc, path: []u8) i32 {
-    // access() with mode=4 checks read permission; we use it as a
-    // null-pointer-free way to validate the path before fopen, since
-    // Jam currently can't cast `*mut[] u8` to an integer for NULL checks.
     if (access(path.ptr, 4) != 0) { return 0; }
+    if (pathEndsWithCue(path)) {
+        var c: *mut[] u8 = cueAlloc();
+        if (cueParse(c, path.ptr) != 0) {
+            cueFree(c);
+            return 0;
+        }
+        d[0].cuePtr = c;
+        d[0].isCue = 1;
+        d[0].loaded = 1;
+        var fmt: []u8 = "Opened CUE: %s (%u tracks)\n";
+        printf(fmt.ptr, path.ptr, cueGetTrackCount(c));
+        return 1;
+    }
     var mode: []u8 = "rb";
     var f: *mut[] u8 = fopen(path.ptr, mode.ptr);
     d[0].file = f;
@@ -68,6 +109,9 @@ pub fn discOpen(d: *mut[] Disc, path: []u8) i32 {
 // `buf`. Returns 1 on success, 0 on out-of-range or no-disc.
 pub fn discRead(d: *mut[] Disc, lba: u32, buf: *mut[] u8) i32 {
     if (d[0].loaded == 0) { return 0; }
+    if (d[0].isCue != 0) {
+        return cueRead(d[0].cuePtr, lba, buf);
+    }
     if (lba < LEAD_IN_SECTORS) {
         // Pre-gap: real CDs have 2 sec of silence here; we return zeros
         // so the BIOS sees a "blank" sector and doesn't fault.
