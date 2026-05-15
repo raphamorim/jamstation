@@ -256,6 +256,7 @@ pub fn timerUpdateOne(t: *mut[] u32, idx: u32, cyc: u32,
     if (t[b + F_PAUSED] != 0) { return; }
     // Timer 1 sourced from hblank is incremented in the hblank handler.
     if (idx == 1 && (t[b + F_CLKSRC] & 1) != 0) { return; }
+    const prevCounter: u32 = t[b + F_COUNTER];
     // Timer 2 with clk_source >= 2 ticks at sysclk/8. psxe uses a float
     // counter; we accumulate sub-cycles in F_SUBTICK and add whole /8
     // increments to the clean 16-bit counter so timerRead32 returns a
@@ -267,6 +268,23 @@ pub fn timerUpdateOne(t: *mut[] u32, idx: u32, cyc: u32,
         t[b + F_COUNTER] = (t[b + F_COUNTER] + incr) & 0xFFFF;
     } else {
         t[b + F_COUNTER] = (t[b + F_COUNTER] + cyc) & 0xFFFFFFFF;
+    }
+    // ps1-tests timers testTimerTargetBehaviour reads the counter in a
+    // tight loop and asserts the value `target` is observed before
+    // reset_target snaps it back to 0. Our cycle-aggregated tick can
+    // leap past the target value (e.g. counter += 2 jumps target=10
+    // from 8 straight to 12). When this happens with RESET_TGT set,
+    // land at target this update — the next call will pick up from
+    // target+1 and clear via the normal reset path.
+    const target: u32 = t[b + F_TARGET];
+    // Use prevCounter < target (strict) — once we've landed at target
+    // we want the next call to advance past and fire the normal reset
+    // path in timerHandleIrq, otherwise we'd be pinned at target.
+    if (t[b + F_RESET_TGT] != 0 &&
+        prevCounter < target &&
+        t[b + F_COUNTER] > target &&
+        t[b + F_COUNTER] <= 0xFFFF) {
+        t[b + F_COUNTER] = target;
     }
     timerHandleIrq(t, idx, ic, cop0);
 }

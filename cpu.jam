@@ -1218,7 +1218,7 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
 
     c.pc = c.nextPc;
     c.nextPc = c.nextPc + 4;
-    c.cycles = c.cycles + 2;
+    c.cycles = c.cycles + 1;
 
     dispatch(c, opc, bus, regs, cop0);
 
