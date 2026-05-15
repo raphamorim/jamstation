@@ -123,13 +123,32 @@ pub fn ramWrite16(bus: Bus, addr: u32, val: u32) {
 
 // ---------- IO surface --------------------------------------------------
 
+// Per-channel CHCR hardwiring masks (psxe dma.c lines 14-24). Channels
+// 0..5 expose the full 32-bit CHCR through these mask bits; channel 6
+// (OTC) hardwires bit 1 to 1 and only allows bits 24, 28, 30 to be set
+// via writes — everything else reads back as zero. ps1-tests dma/otc-test
+// exercises this exactly.
+pub fn chcrHw1(ch: u32) u32 {
+    if (ch == 6) { return 0x00000002; }
+    return 0x00000000;
+}
+pub fn chcrHw0(ch: u32) u32 {
+    if (ch == 6) { return 0x50000002; }
+    return 0x71770703;
+}
+
 pub fn dmaRead32(d: *mut[] u32, off: u32) u32 {
     if (off < 0x70) {
         const ch:  u32 = (off >> 4) & 0x7;
         const reg: u32 = (off >> 2) & 0x3;
         if (reg == 0) { return d[chBase(ch) + F_MADR]; }
         if (reg == 1) { return d[chBase(ch) + F_BCR];  }
-        if (reg == 2) { return d[chBase(ch) + F_CHCR]; }
+        if (reg == 2) {
+            var cr: u32 = d[chBase(ch) + F_CHCR];
+            cr = cr | chcrHw1(ch);
+            cr = cr & chcrHw0(ch);
+            return cr;
+        }
         return 0;
     }
     if (off == 0x70) { return d[21]; }
@@ -410,7 +429,14 @@ pub fn dmaDoSpu(d: *mut[] u32, bus: Bus) {
 }
 
 pub fn dmaDoOtc(d: *mut[] u32, bus: Bus) {
-    if (!chcrBusy(d, 6)) { return; }
+    // OTC runs only when all three gates are set: DPCR.DMA6EN (master
+    // enable, bit 27 of DPCR), CHCR.TRIG (bit 28), CHCR.BUSY (bit 24).
+    // ps1-tests dma/otc-test verifies that disabling DPCR master holds
+    // the transfer back; previously we only gated on BUSY.
+    if ((d[21] & 0x08000000) == 0) { return; }       // DPCR.DMA6EN
+    const cr: u32 = d[chBase(6) + F_CHCR];
+    if ((cr & CHCR_TRIG) == 0) { return; }
+    if ((cr & CHCR_BUSY) == 0) { return; }
     var size: u32 = bcrSize(d, 6);
     if (size == 0) { size = 0x10000; }
     var addr: u32 = d[chBase(6) + F_MADR];
