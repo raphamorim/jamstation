@@ -34,6 +34,11 @@ pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 
 const { irqRaise, IC_CDROM } = import("irq");
 const { discRead, discLoaded } = import("disc");
+const {
+    xaSectorIsAudio, xaSectorMatchesFilter, xaSectorIsStereo,
+    xaDecodeSector
+} = import("xa");
+const { spuPushCdSample } = import("spu");
 
 // Disc struct redeclaration (same shape as disc.jam) so we can hold a
 // `*mut[] Disc` pointer here without an explicit Disc import.
@@ -100,6 +105,10 @@ const C_SEEK_PREC:   u32 = 0x2C;    // SeekL sets this; GetLocP reads it
 const C_PREV_SPEED:  u32 = 0x2D;    // Previous MODE.SPEED for SetMode delay
 const C_DATA_RIDX:   u32 = 0x20;    // u32 LE — data FIFO read cursor
 const C_DATA_WIDX:   u32 = 0x24;    // u32 LE — data FIFO write cursor
+// XA-ADPCM decoder per-channel history (n-1, n-2 i32 each). Persists
+// across sectors so block-N's predictor sees block-(N-1)'s tail.
+const C_XA_LH:       u32 = 0x30;    // 2 × i32 = 8 bytes
+const C_XA_RH:       u32 = 0x38;    // 2 × i32 = 8 bytes
 const C_PARAM_BUF:   u32 = 0x40;
 const C_PARAM_R:     u32 = 0x60;
 const C_PARAM_W:     u32 = 0x61;
@@ -157,6 +166,7 @@ const CDL_READTOC:    u32 = 0x1E;
 // MODE register bits.
 const MODE_SECTOR_SIZE: u32 = 0x20;   // 0 = 0x800 payload, 1 = 0x924 raw
 const MODE_SPEED:       u32 = 0x80;   // 0 = 1x, 1 = 2x
+const MODE_XA_ADPCM:    u32 = 0x40;   // 1 = enable XA-ADPCM streaming
 const CDL_SEEKL:    u32 = 0x15;
 const CDL_TEST:     u32 = 0x19;
 const CDL_GETID:    u32 = 0x1A;
@@ -802,7 +812,7 @@ pub fn cdromError(d: *mut[] u8, stat: u32, err: u32) {
 
 // Per-scanline tick. Mirror of psxe's psx_cdrom_update. `disc` is the
 // attached image (may have loaded == 0 when there's no .bin/.cue).
-pub fn cdromUpdate(d: *mut[] u8, disc: *mut[] Disc,
+pub fn cdromUpdate(d: *mut[] u8, disc: *mut[] Disc, spu: *mut[] u8,
                    ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
     var delay: u32 = cdGetU32(d, C_DELAY);
     if (delay > 0) {
@@ -837,7 +847,7 @@ pub fn cdromUpdate(d: *mut[] u8, disc: *mut[] Disc,
             cdSetU32(d, C_DELAY, cdromReadDelay(d) + 4 * 33869);
         }
     } else if (d[C_STATE] == CD_STATE_READ as u8) {
-        cdromHandleRead(d, disc);
+        cdromHandleRead(d, disc, spu);
     }
     // Only raise CPU IRQ if the corresponding IER bit is enabled.
     if ((d[C_IFR] as u32 & d[C_IER] as u32 & 0x1F) == 0) { return; }
@@ -847,7 +857,7 @@ pub fn cdromUpdate(d: *mut[] u8, disc: *mut[] Disc,
 // One sector of CdlReadN / CdlReadS: pull 2352 bytes from the disc
 // image into our data FIFO, raise INT1+stat, advance the LBA, and
 // schedule the next sector delay. Mirror of psxe's cdrom_handle_read.
-pub fn cdromHandleRead(d: *mut[] u8, disc: *mut[] Disc) {
+pub fn cdromHandleRead(d: *mut[] u8, disc: *mut[] Disc, spu: *mut[] u8) {
     cdromProcessSetloc(d);
     if (d[C_HAS_DISC] == 0) {
         cdromError(d, CD_STAT_SPINDLE, CD_ERR_NO_DISC);
@@ -873,12 +883,93 @@ pub fn cdromHandleRead(d: *mut[] u8, disc: *mut[] Disc) {
     cdSetU32(d, C_DATA_RIDX, rIdx);
     cdSetU32(d, C_DATA_WIDX, wEnd);
 
+    // XA-ADPCM streaming. If MODE.XA bit is set, the sector is an audio
+    // subheader sector, and (if a CdlSetFilter is in effect) the file/
+    // channel match, decode it and push samples into the SPU CD-audio
+    // FIFO. The BIOS keeps sending sector reads through this path; the
+    // SPU drains one stereo sample per audio output tick.
+    if ((d[C_MODE] as u32 & MODE_XA_ADPCM) != 0) {
+        cdromTryDecodeXa(d, spu);
+    }
+
     d[C_IFR] = 1;
     qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
 
     // Advance LBA and schedule the next sector.
     cdSetU32(d, C_LBA, lba + 1);
     cdSetU32(d, C_DELAY, cdromReadDelay(d));
+}
+
+// Decode the current sector's XA-ADPCM payload and push the resulting
+// stereo samples into the SPU's CD-audio FIFO. Copies the data-FIFO
+// region into a scratch buffer first because Jam v0.1.0 can't form a
+// `*mut[] u8` offset view into a larger buffer. History buffers (i32
+// pairs per channel) live in the cdrom state at C_XA_LH / C_XA_RH so
+// block N's predictor still sees block N-1's tail.
+pub fn cdromTryDecodeXa(d: *mut[] u8, spu: *mut[] u8) {
+    var scratch: *mut[] u8 = malloc(SECTOR_BYTES as u64);
+    var i: u32 = 0;
+    while (i < SECTOR_BYTES) {
+        scratch[i] = d[C_DATA_BUF + i];
+        i = i + 1;
+    }
+    if (!xaSectorIsAudio(scratch)) {
+        free(scratch);
+        return;
+    }
+    if (!xaSectorMatchesFilter(scratch,
+            d[C_XA_FILE] as u32, d[C_XA_CHANNEL] as u32)) {
+        free(scratch);
+        return;
+    }
+    var leftBuf:  *mut[] i32 = malloc(2016 * 4) as *mut[] i32;
+    var rightBuf: *mut[] i32 = malloc(2016 * 4) as *mut[] i32;
+    var monoBuf:  *mut[] i32 = malloc(4032 * 4) as *mut[] i32;
+    // Carry history out via a small scratch buffer (8 bytes per channel)
+    // and write it back into the cdrom state when done. Direct slice
+    // offset into `d` would be cleaner but Jam can't form the view.
+    var hist: *mut[] u8 = malloc(16);
+    var i2: u32 = 0;
+    while (i2 < 8) {
+        hist[i2]     = d[C_XA_LH + i2];
+        hist[i2 + 8] = d[C_XA_RH + i2];
+        i2 = i2 + 1;
+    }
+    var leftH:    *mut[] i32 = hist as *mut[] i32;
+    var rightH:   *mut[] i32 = (hist as *mut[] i32) + 2 as u32;
+    const stereo: bool = xaSectorIsStereo(scratch);
+    const n: u32 = xaDecodeSector(scratch, leftBuf, rightBuf, monoBuf,
+                                  leftH, rightH);
+    var k: u32 = 0;
+    while (k < n) {
+        var l: i32 = 0;
+        var r: i32 = 0;
+        if (stereo) {
+            l = leftBuf[k];
+            r = rightBuf[k];
+        } else {
+            l = monoBuf[k];
+            r = monoBuf[k];
+        }
+        if (l < -32768) { l = -32768; }
+        if (l > 32767)  { l = 32767; }
+        if (r < -32768) { r = -32768; }
+        if (r > 32767)  { r = 32767; }
+        spuPushCdSample(spu, (l as u32) & 0xFFFF, (r as u32) & 0xFFFF);
+        k = k + 1;
+    }
+    // Persist history back into the cdrom state.
+    var i3: u32 = 0;
+    while (i3 < 8) {
+        d[C_XA_LH + i3] = hist[i3];
+        d[C_XA_RH + i3] = hist[i3 + 8];
+        i3 = i3 + 1;
+    }
+    free(hist);
+    free(leftBuf as *mut[] u8);
+    free(rightBuf as *mut[] u8);
+    free(monoBuf as *mut[] u8);
+    free(scratch);
 }
 
 // Read one sector at `lba` into the state's data-FIFO slot. Uses a

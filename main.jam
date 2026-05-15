@@ -25,6 +25,7 @@ const { padAlloc, padUpdate } = import("pad");
 const { spuAlloc, spuRamAlloc, spuUpdate } = import("spu");
 const { sio1Update } = import("sio1");
 const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
+const { mcdRamLoad, mcdRamSave } = import("mcd");
 const {
     timerAlloc, timerUpdate, timerUpdateCyc,
     timerHblankBegin, timerHblankEnd,
@@ -296,7 +297,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         timerUpdateCyc(bus.timer, bus.irq, cop0, delta);
         dmaTickSpu(bus.dma, delta);
         dmaUpdate(bus.dma, bus.irq, cop0);
-        cdromUpdate(bus.cdrom, bus.disc, bus.irq, cop0, delta);
+        cdromUpdate(bus.cdrom, bus.disc, bus.spu, bus.irq, cop0, delta);
         padUpdate(bus.pad, bus.irq, cop0, delta);
         sio1Update(bus.sio1, bus.irq, cop0, delta);
         spuUpdate(bus.spu, bus.spuram, bus.irq, cop0, delta);
@@ -376,6 +377,16 @@ fn main() {
     var cop0: *mut[] u32 = allocRegFile(16);
     var bus: Bus = allocBus();
     var c: Cpu = freshCpu();
+
+    // Memory card slot 1 — pull saved data from ./slot1.mcd if it
+    // exists. On exit we write the (possibly modified) 128 KB buffer
+    // back to the same file so saves survive across runs. Mirrors
+    // psxe's psx_mcd_init / psx_mcd_destroy lifecycle.
+    var mcdPath: []u8 = "./slot1.mcd";
+    if (mcdRamLoad(bus.mcdRam, mcdPath) != 0) {
+        var loadMsg: []u8 = "Loaded memcard: ./slot1.mcd\n";
+        write(STDOUT, loadMsg.ptr, loadMsg.len);
+    }
 
     // Match psxe's initial COP0 state. The 0x10900000 value seeds COP0
     // SR with CU0 enabled, BEV set, and a few breakpoint controls.
@@ -543,6 +554,10 @@ fn main() {
         // input wired up yet.
         if (frames > 100000) { quit = 1; }
     }
+
+    // Persist memcard slot 1 to disk before freeing the bus. psxe does
+    // the equivalent in psx_mcd_destroy.
+    mcdRamSave(bus.mcdRam, mcdPath);
 
     sdlQuit(sdl);
     freeRegFile(regs);

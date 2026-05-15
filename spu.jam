@@ -27,7 +27,14 @@ const VS_SIZE:        u32 = 256;
 const VOICE_COUNT:    u32 = 24;
 const VOICE_BASE:     u32 = 0x400;
 const GLOBAL_BASE:    u32 = 0x400 + 24 * 256;     // 0x1C00
-const SPU_STATE_SIZE: u32 = 0x400 + 24 * 256 + 256; // 0x1D00
+// CD-audio FIFO for XA samples decoded by cdrom.jam. Producer = cdrom
+// XA path, consumer = spuGetSample (one stereo sample per call). 1024
+// stereo entries × 4 bytes = 4 KB, lives at 0x1D00.
+const CD_FIFO_BASE:   u32 = 0x1D00;
+const CD_FIFO_CAP:    u32 = 1024;        // entries (power of two)
+const CD_FIFO_MASK:   u32 = 1023;
+const CD_FIFO_BYTES:  u32 = 4096;        // 1024 × 4 bytes (i16 L + i16 R)
+const SPU_STATE_SIZE: u32 = 0x1D00 + 4096; // 0x2D00
 const SPU_RAM_SIZE:   u32 = 0x80000;
 
 // Voice-register offsets inside a 16-byte voice slot.
@@ -60,6 +67,8 @@ const R_TFIFO:    u32 = 0x1A8;
 const R_SPUCNT:   u32 = 0x1AA;
 const R_TCTRL:    u32 = 0x1AC;
 const R_SPUSTAT:  u32 = 0x1AE;
+const R_CDVOLL:   u32 = 0x1B0;
+const R_CDVOLR:   u32 = 0x1B2;
 
 // Per-voice runtime offsets (added to VOICE_BASE + v * VS_SIZE).
 const D_PLAYING:    u32 = 0x00;
@@ -97,6 +106,11 @@ const G_EVEN_CYC:   u32 = 0x48;
 const G_REVBADDR:   u32 = 0x4C;
 const G_LRSL:       u32 = 0x50;
 const G_LRSR:       u32 = 0x54;
+// CD-audio FIFO head/tail. 32-bit ring indices that mod-mask down to
+// CD_FIFO_MASK for the slot. Producer-only writes head; consumer-only
+// writes tail. Equal head == tail → empty.
+const G_CD_HEAD:    u32 = 0x60;
+const G_CD_TAIL:    u32 = 0x64;
 
 // ADSR phases.
 const ADSR_ATTACK:  u32 = 0;
@@ -155,6 +169,37 @@ pub fn spuRamAlloc() *mut[] u8 {
 
 pub fn spuFree(p: *mut[] u8) { free(p); }
 pub fn spuRamFree(p: *mut[] u8) { free(p); }
+
+// ---------- CD-audio FIFO ---------------------------------------------
+//
+// XA samples decoded by cdrom.jam land here as packed (left, right) i16
+// pairs. spuGetSample drains one entry per call and adds it (volume-
+// scaled by R_CDVOLL / R_CDVOLR) into the main mix. Producer drops
+// samples on full to keep the consumer in lock-step with the output
+// rate — favouring "current" audio over a runaway backlog.
+
+pub fn spuPushCdSample(s: *mut[] u8, leftI16: u32, rightI16: u32) {
+    const head: u32 = getU32(s, GLOBAL_BASE + G_CD_HEAD);
+    const tail: u32 = getU32(s, GLOBAL_BASE + G_CD_TAIL);
+    if ((head - tail) >= CD_FIFO_CAP) { return; }      // full → drop
+    const slot: u32 = CD_FIFO_BASE + ((head & CD_FIFO_MASK) << 2);
+    setU16(s, slot,     leftI16  & 0xFFFF);
+    setU16(s, slot + 2, rightI16 & 0xFFFF);
+    setU32(s, GLOBAL_BASE + G_CD_HEAD, head + 1);
+}
+
+// Pop one stereo sample. Returns packed left|right<<16; on empty
+// returns 0 (both channels silent).
+pub fn spuPopCdSample(s: *mut[] u8) u32 {
+    const head: u32 = getU32(s, GLOBAL_BASE + G_CD_HEAD);
+    const tail: u32 = getU32(s, GLOBAL_BASE + G_CD_TAIL);
+    if (head == tail) { return 0; }
+    const slot: u32 = CD_FIFO_BASE + ((tail & CD_FIFO_MASK) << 2);
+    const l: u32 = getU16(s, slot);
+    const r: u32 = getU16(s, slot + 2);
+    setU32(s, GLOBAL_BASE + G_CD_TAIL, tail + 1);
+    return l | (r << 16);
+}
 
 // ---------- byte-buffer access helpers --------------------------------
 
@@ -620,6 +665,21 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
 
     const spucnt: u32 = getU16(s, R_SPUCNT);
     if ((spucnt & 0x4000) == 0) { return 0; }
+
+    // Mix one CD-audio sample into the voice sum. SPUCNT bit 0 = CD audio
+    // enable; when clear, the FIFO is drained (so producer doesn't back
+    // up) but the sample is muted before scaling.
+    const cd: u32 = spuPopCdSample(s);
+    if ((spucnt & 0x0001) != 0) {
+        var cdl: i32 = (cd & 0xFFFF) as i32;
+        if ((cdl & 0x8000) != 0) { cdl = (cdl as u32 | 0xFFFF0000) as i32; }
+        var cdr: i32 = ((cd >> 16) & 0xFFFF) as i32;
+        if ((cdr & 0x8000) != 0) { cdr = (cdr as u32 | 0xFFFF0000) as i32; }
+        const cdvL: i32 = getI16(s, R_CDVOLL);
+        const cdvR: i32 = getI16(s, R_CDVOLR);
+        left  = left  + ((cdl * cdvL) >> 15);
+        right = right + ((cdr * cdvR) >> 15);
+    }
 
     const mainl: i32 = getI16(s, R_MAINLVOL);
     const mainr: i32 = getI16(s, R_MAINRVOL);

@@ -1,15 +1,16 @@
 // COP2 / GTE — Geometry Transformation Engine.
 //
-// Partial port of psxe's GTE in src/cpu.c (~3000 lines of fixed-point
-// math with saturation flags). This module covers the *register file*
-// — 32 data registers + 32 control registers — and dispatches the
-// register-move instructions (MFC2/MTC2/CFC2/CTC2/LWC2/SWC2). The
-// math instructions (RTPS, NCLIP, NCDS, AVSZ3/4, OP, SQR, ...) all
-// land in `gteExec` which currently does the *minimum* the BIOS needs
-// to not stall: for RTPS we just copy the input vertex straight into
-// the screen-space FIFO with no rotation/perspective. Vertices end up
-// "static" but reachable, which is a step up from the previous swallow
-// stub (vertices collapsed to origin).
+// Port of psxe's GTE (cpu.c ~3000 lines of fixed-point math with
+// saturation flags). This module covers the register file (32 data +
+// 32 control regs), the register-move instructions (MFC2 / MTC2 /
+// CFC2 / CTC2 / LWC2 / SWC2), and the math ops dispatched by gteExec.
+//
+// Implemented ops: RTPS, RTPT (3xRTPS), NCLIP, OP, MVMVA, NCDS, NCDT,
+// SQR, AVSZ3, AVSZ4, DPCS, INTPL, CDP, NCCS, CC, NCS, NCT, DCPL, DPCT,
+// GPF, GPL, NCCT — 22 of psxe's 22 GTE ops.
+//
+// Saturation FLAG bookkeeping is approximate (we set IR/SXY/SZ3 clamp
+// bits where it matters for the BIOS, but skip rare overflow markers).
 //
 // Data register layout (32 × u32):
 //   0  V0  (xy packed, low half of vertex 0)
@@ -45,7 +46,6 @@
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
 pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
-pub extern fn printf(format: *const[] u8, ...) i32;
 
 const GTE_REGS: u32 = 144;     // 0..63 = data/control regs, 64..143 = debug counters
 const D_V0: u32 = 0;
@@ -722,19 +722,6 @@ pub fn gteRtps(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     g[D_SXY1] = g[D_SXY2];
     g[D_SXY2] = (satSxy(sx) & 0xFFFF) | ((satSxy(sy) & 0xFFFF) << 16);
 
-    // Debug: log the first few RTPS calls so we can compare vertex
-    // projections with psxe's reference output.
-    if (g[65] < 6) {
-        var fmt: []u8 = "RTPS sf=%u V[%u]=(%d,%d,%d) RT=%08X %08X %08X %08X %08X TR=(%d,%d,%d) OF=(%08X,%08X) H=%04X SZ3=%04X div=%05X SX=%d SY=%d\n";
-        printf(fmt.ptr, sf, vidx,
-            vx as i32, vy as i32, vzS as i32,
-            g[32 + 0], g[32 + 1], g[32 + 2], g[32 + 3], g[32 + 4],
-            (trx as i32), (try_ as i32), (trz as i32),
-            g[32 + 24], g[32 + 25], h, sz3, div,
-            sx as i32, sy as i32);
-        g[65] = g[65] + 1;
-    }
-
     // Write IR back and MAC for further pipeline stages.
     g[9]  = (ir1 as u64 & 0xFFFF) as u32;
     g[10] = (ir2 as u64 & 0xFFFF) as u32;
@@ -933,17 +920,6 @@ pub fn gteNcds(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     const g2: u32 = clampU8(m2c >> 4);
     const b2: u32 = clampU8(m3c >> 4);
     g[22] = r2 | (g2 << 8) | (b2 << 16) | (code << 24);
-
-    // Debug: print first few NCDS calls so we can compare with psxe.
-    if (g[64] < 5) {
-        var fmt: []u8 = "NCDS sf=%u lm=%u V=(%d,%d,%d) RGBC=%08X IR0=%04X RFC=%08X RBK=%08X -> RGB=%02X%02X%02X (mac=%08X %08X %08X)\n";
-        printf(fmt.ptr, sf, lm,
-            vx as i32, vy as i32, vz as i32, g[6],
-            g[8] & 0xFFFF, g[32 + 21], g[32 + 13],
-            r2, g2, b2,
-            g[D_MAC1], g[D_MAC2], g[D_MAC3]);
-        g[64] = g[64] + 1;
-    }
 }
 
 // 8-bit unsigned clamp used by the RGB FIFO writes.

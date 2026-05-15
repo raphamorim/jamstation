@@ -24,6 +24,11 @@
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
 pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+pub extern fn fopen(path: *const[] u8, mode: *const[] u8) *mut[] u8;
+pub extern fn fclose(file: *mut[] u8) i32;
+pub extern fn fread(buf: *mut[] u8, size: u64, n: u64, file: *mut[] u8) u64;
+pub extern fn fwrite(buf: *const[] u8, size: u64, n: u64, file: *mut[] u8) u64;
+pub extern fn access(path: *const[] u8, mode: i32) i32;
 
 const MCD_MEMORY_SIZE: u64 = 0x20000;       // 128 KB
 const MCD_STATE_SIZE:  u64 = 32;            // small control block
@@ -88,6 +93,30 @@ pub fn mcdRamAlloc() *mut[] u8 {
 
 pub fn mcdFree(s: *mut[] u8) { free(s); }
 pub fn mcdRamFree(r: *mut[] u8) { free(r); }
+
+// Read a 128 KB memory-card image from `path` into `ram`. Returns 1 on
+// success, 0 if the file is absent or unreadable. We use access(R_OK=4)
+// first because Jam v0.1.0 can't null-check fopen's return.
+pub fn mcdRamLoad(ram: *mut[] u8, path: []u8) i32 {
+    if (access(path.ptr, 4) != 0) { return 0; }
+    var modeRb: []u8 = "rb";
+    var f: *mut[] u8 = fopen(path.ptr, modeRb.ptr);
+    const got: u64 = fread(ram, 1, MCD_MEMORY_SIZE, f);
+    fclose(f);
+    if (got != MCD_MEMORY_SIZE) { return 0; }
+    return 1;
+}
+
+// Write the 128 KB memory-card image at `ram` to `path`. Used at
+// shutdown so player progress isn't lost across emulator runs.
+pub fn mcdRamSave(ram: *mut[] u8, path: []u8) i32 {
+    var modeWb: []u8 = "wb";
+    var f: *mut[] u8 = fopen(path.ptr, modeWb.ptr);
+    const put: u64 = fwrite(ram, 1, MCD_MEMORY_SIZE, f);
+    fclose(f);
+    if (put != MCD_MEMORY_SIZE) { return 0; }
+    return 1;
+}
 
 pub fn mcdReset(s: *mut[] u8) {
     s[S_STATE] = MCD_TX_HIZ as u8;
