@@ -69,6 +69,38 @@ extern fn SDL_GetTicks() u32;
 // We use push-mode SDL audio (callback=NULL, SDL_QueueAudio for
 // submission). That sidesteps the cross-thread callback machinery and
 // lets us drain the SPU output FIFO from the main loop once per frame.
+//
+// TODO(callback-driven audio, needs Jam compiler work):
+//   psxe matches the PSX audio behavior naturally because SDL runs the
+//   audio callback on its own thread at exactly 44.1 kHz, and that
+//   callback calls psx_spu_get_sample 588 times per 13.3 ms — so SPU
+//   voice playback advances purely from the audio device's clock,
+//   independent of how fast the emulator core is running. Voices play
+//   at the correct pitch even when the CPU is 2× speed.
+//
+//   To match that here we'd need to:
+//     1. Pass a Jam-defined function as SDL_AudioSpec.callback. SDL
+//        invokes it via the standard C calling convention from a
+//        dedicated audio thread.
+//        → blocker: Jam v0.1.0 doesn't export `pub fn` with the C ABI
+//          / a stable function-pointer type that can be handed to a
+//          foreign callsite. Need compiler support for either:
+//             - an `extern "C"` (or equivalent) attribute on pub fn, or
+//             - a `&fn (...)` value coercion to a C function pointer.
+//
+//     2. Make the SPU mixer safe to call from a thread that isn't the
+//        emulator core thread. Today the SPU state buffer is mutated
+//        freely from CPU writes on the main thread; concurrent reads
+//        from an audio callback would race.
+//        → either need a lock around the SPU state, a lock-free
+//          double-buffer, or accept a small race (psxe does — it's
+//          mostly invisible).
+//
+//   Until that lands, we stay in push mode and the emulator clocks
+//   audio off its own CPU-cycle accumulator. On hosts with the wrong
+//   vsync (anything other than 60 Hz), audio rate drifts from real-
+//   time — workaround is the queue-watching throttle in main.jam
+//   (currently commented out).
 // SDL_OpenAudioDevice's first arg is `const char*`. We need to pass
 // NULL to mean "use the default playback device"; Jam can't express
 // a null `*const[] u8` directly, so we declare the arg as u64 and
