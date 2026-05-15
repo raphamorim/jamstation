@@ -70,9 +70,9 @@ pub fn pathEndsWithCue(p: []u8) bool {
     const cC: u32 = p.ptr[n - 2] as u32;
     const e: u32 = p.ptr[n - 1] as u32;
     // ".cue" or ".CUE"
-    if (a == 0x2E and (b == 0x63 or b == 0x43)
-                  and (cC == 0x75 or cC == 0x55)
-                  and (e == 0x65 or e == 0x45)) {
+    if (a == 0x2E && (b == 0x63 || b == 0x43)
+                  && (cC == 0x75 || cC == 0x55)
+                  && (e == 0x65 || e == 0x45)) {
         return true;
     }
     return false;

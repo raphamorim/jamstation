@@ -113,14 +113,14 @@ pub fn timerSetMode(t: *mut[] u32, idx: u32, val: u32) {
     const syncMode: u32 = t[b + F_SYNC_MODE];
     const syncEn: u32 = t[b + F_SYNC_EN];
     if (idx == 0) {
-        if (syncMode != 1 and syncMode != 2 and syncEn != 0) {
+        if (syncMode != 1 && syncMode != 2 && syncEn != 0) {
             var p: u32 = t[0];   // hblank
             if (syncMode == 3) { p = 1; }
             t[b + F_PAUSED] = p;
         }
     }
     if (idx == 1) {
-        if (syncMode != 1 and syncMode != 2 and syncEn != 0) {
+        if (syncMode != 1 && syncMode != 2 && syncEn != 0) {
             var p: u32 = t[2];   // vblank
             if (syncMode == 3) { p = 1; }
             t[b + F_PAUSED] = p;
@@ -128,7 +128,7 @@ pub fn timerSetMode(t: *mut[] u32, idx: u32, val: u32) {
     }
     if (idx == 2) {
         if (syncEn != 0) {
-            if (syncMode == 0 or syncMode == 3) {
+            if (syncMode == 0 || syncMode == 3) {
                 t[b + F_PAUSED] = 1;
             }
         }
@@ -168,7 +168,7 @@ pub fn timerHandleIrq(t: *mut[] u32, idx: u32,
     const trigger: bool = t[b + F_IRQ] == 0;
 
     if (t[b + F_IRQ_REPEAT] == 0) {
-        if (trigger and t[b + F_IRQ_FIRED] == 0) {
+        if (trigger && t[b + F_IRQ_FIRED] == 0) {
             t[b + F_IRQ_FIRED] = 1;
         } else {
             return;
@@ -179,8 +179,11 @@ pub fn timerHandleIrq(t: *mut[] u32, idx: u32,
 
     if (trigger) {
         var line: u32 = IC_TIMER0();
-        if (idx == 1) { line = IC_TIMER1(); }
-        if (idx == 2) { line = IC_TIMER2(); }
+        match (idx) {
+            1 { line = IC_TIMER1(); }
+            2 { line = IC_TIMER2(); }
+            _ {}
+        }
         irqRaise(ic, cop0, line);
     }
 }
@@ -193,10 +196,12 @@ pub fn timerRead32(t: *mut[] u32, off: u32) u32 {
     const idx: u32 = off >> 4;
     const reg: u32 = off & 0xF;
     if (idx >= 3) { return 0; }
-    if (reg == 0) { return timerGetField(t, idx, F_COUNTER); }
-    if (reg == 4) { return timerGetMode(t, idx); }
-    if (reg == 8) { return timerGetField(t, idx, F_TARGET);  }
-    return 0;
+    match (reg) {
+        0 { return timerGetField(t, idx, F_COUNTER); }
+        4 { return timerGetMode(t, idx); }
+        8 { return timerGetField(t, idx, F_TARGET);  }
+        _ { return 0; }
+    }
 }
 
 pub fn timerRead16(t: *mut[] u32, off: u32) u32 {
@@ -212,9 +217,12 @@ pub fn timerWrite32(t: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32,
     const idx: u32 = off >> 4;
     const reg: u32 = off & 0xF;
     if (idx >= 3) { return; }
-    if (reg == 0) { timerSetField(t, idx, F_COUNTER, val & 0xFFFF); }
-    if (reg == 4) { timerSetMode(t, idx, val); }
-    if (reg == 8) { timerSetField(t, idx, F_TARGET, val & 0xFFFF); }
+    match (reg) {
+        0 { timerSetField(t, idx, F_COUNTER, val & 0xFFFF); }
+        4 { timerSetMode(t, idx, val); }
+        8 { timerSetField(t, idx, F_TARGET, val & 0xFFFF); }
+        _ {}
+    }
     timerHandleIrq(t, idx, ic, cop0);
 }
 
@@ -247,12 +255,12 @@ pub fn timerUpdateOne(t: *mut[] u32, idx: u32, cyc: u32,
     const b: u32 = timerBase(idx);
     if (t[b + F_PAUSED] != 0) { return; }
     // Timer 1 sourced from hblank is incremented in the hblank handler.
-    if (idx == 1 and (t[b + F_CLKSRC] & 1) != 0) { return; }
+    if (idx == 1 && (t[b + F_CLKSRC] & 1) != 0) { return; }
     // Timer 2 with clk_source >= 2 ticks at sysclk/8. psxe uses a float
     // counter; we accumulate sub-cycles in F_SUBTICK and add whole /8
     // increments to the clean 16-bit counter so timerRead32 returns a
     // value the game can compare against F_TARGET without garbage bits.
-    if (idx == 2 and t[b + F_CLKSRC] >= 2) {
+    if (idx == 2 && t[b + F_CLKSRC] >= 2) {
         const acc: u32 = t[F_SUBTICK] + cyc;
         const incr: u32 = acc >> 3;
         t[F_SUBTICK] = acc & 7;
@@ -268,7 +276,7 @@ pub fn timerHblankBegin(t: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32) {
     t[1] = t[0];      // prev = current
     t[0] = 1;         // hblank = 1
 
-    if ((timerGetField(t, 1, F_CLKSRC) & 1) != 0 and
+    if ((timerGetField(t, 1, F_CLKSRC) & 1) != 0 &&
         timerGetField(t, 1, F_PAUSED) == 0) {
         timerSetField(t, 1, F_COUNTER,
                       (timerGetField(t, 1, F_COUNTER) + 1) & 0xFFFF);
@@ -276,28 +284,32 @@ pub fn timerHblankBegin(t: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32) {
     }
 
     if (timerGetField(t, 0, F_SYNC_EN) == 0) { return; }
-    const mode: u32 = timerGetField(t, 0, F_SYNC_MODE);
-    if (mode == 0) { timerSetField(t, 0, F_PAUSED, 1); }
-    if (mode == 1) { timerSetField(t, 0, F_COUNTER, 0); }
-    if (mode == 2) {
-        timerSetField(t, 0, F_COUNTER, 0);
-        timerSetField(t, 0, F_PAUSED, 0);
-    }
-    if (mode == 3) {
-        if (timerGetField(t, 0, F_BLANK_ONCE) == 0) {
-            timerSetField(t, 0, F_BLANK_ONCE, 1);
-            timerSetField(t, 0, F_SYNC_EN, 0);
+    match (timerGetField(t, 0, F_SYNC_MODE)) {
+        0 { timerSetField(t, 0, F_PAUSED, 1); }
+        1 { timerSetField(t, 0, F_COUNTER, 0); }
+        2 {
+            timerSetField(t, 0, F_COUNTER, 0);
             timerSetField(t, 0, F_PAUSED, 0);
         }
+        3 {
+            if (timerGetField(t, 0, F_BLANK_ONCE) == 0) {
+                timerSetField(t, 0, F_BLANK_ONCE, 1);
+                timerSetField(t, 0, F_SYNC_EN, 0);
+                timerSetField(t, 0, F_PAUSED, 0);
+            }
+        }
+        _ {}
     }
 }
 
 pub fn timerHblankEnd(t: *mut[] u32) {
     t[0] = 0;
     if (timerGetField(t, 0, F_SYNC_EN) == 0) { return; }
-    const mode: u32 = timerGetField(t, 0, F_SYNC_MODE);
-    if (mode == 0) { timerSetField(t, 0, F_PAUSED, 0); }
-    if (mode == 2) { timerSetField(t, 0, F_PAUSED, 1); }
+    match (timerGetField(t, 0, F_SYNC_MODE)) {
+        0 { timerSetField(t, 0, F_PAUSED, 0); }
+        2 { timerSetField(t, 0, F_PAUSED, 1); }
+        _ {}
+    }
 }
 
 pub fn timerVblankBegin(t: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32) {
@@ -305,26 +317,30 @@ pub fn timerVblankBegin(t: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32) {
     t[2] = 1;
 
     if (timerGetField(t, 1, F_SYNC_EN) == 0) { return; }
-    const mode: u32 = timerGetField(t, 1, F_SYNC_MODE);
-    if (mode == 0) { timerSetField(t, 1, F_PAUSED, 1); }
-    if (mode == 1) { timerSetField(t, 1, F_COUNTER, 0); }
-    if (mode == 2) {
-        timerSetField(t, 1, F_COUNTER, 0);
-        timerSetField(t, 1, F_PAUSED, 0);
-    }
-    if (mode == 3) {
-        if (timerGetField(t, 1, F_BLANK_ONCE) == 0) {
-            timerSetField(t, 1, F_BLANK_ONCE, 1);
-            timerSetField(t, 1, F_SYNC_EN, 0);
+    match (timerGetField(t, 1, F_SYNC_MODE)) {
+        0 { timerSetField(t, 1, F_PAUSED, 1); }
+        1 { timerSetField(t, 1, F_COUNTER, 0); }
+        2 {
+            timerSetField(t, 1, F_COUNTER, 0);
             timerSetField(t, 1, F_PAUSED, 0);
         }
+        3 {
+            if (timerGetField(t, 1, F_BLANK_ONCE) == 0) {
+                timerSetField(t, 1, F_BLANK_ONCE, 1);
+                timerSetField(t, 1, F_SYNC_EN, 0);
+                timerSetField(t, 1, F_PAUSED, 0);
+            }
+        }
+        _ {}
     }
 }
 
 pub fn timerVblankEnd(t: *mut[] u32) {
     t[2] = 0;
     if (timerGetField(t, 1, F_SYNC_EN) == 0) { return; }
-    const mode: u32 = timerGetField(t, 1, F_SYNC_MODE);
-    if (mode == 0) { timerSetField(t, 1, F_PAUSED, 0); }
-    if (mode == 2) { timerSetField(t, 1, F_PAUSED, 1); }
+    match (timerGetField(t, 1, F_SYNC_MODE)) {
+        0 { timerSetField(t, 1, F_PAUSED, 0); }
+        2 { timerSetField(t, 1, F_PAUSED, 1); }
+        _ {}
+    }
 }

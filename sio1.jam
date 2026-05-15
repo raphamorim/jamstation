@@ -1,0 +1,277 @@
+// SIO1 serial port (link cable / serial-port) at 0x1F801050..0x1F80105F.
+// psxe has no real implementation — only two hardcoded reads in bus.c
+// (STAT=0x05, CTRL=0). We build the real device per psx-spx so games
+// that wait on its events (Harvest Moon opens class 0xF0000009 spec 0x20
+// = SIO COMMAND_COMPLETE) can complete the SIO transaction loop.
+//
+// Register map:
+//   0x00 SIO_DATA  R/W  (RX FIFO read / TX FIFO write)         8-bit
+//   0x04 SIO_STAT  R    Status register                        32-bit
+//   0x08 SIO_MODE  R/W  Baud / parity / character length       16-bit
+//   0x0A SIO_CTRL  R/W  Control register                       16-bit
+//   0x0E SIO_BAUD  R/W  Baud reload value                      16-bit
+//
+// SIO_STAT bits (psx-spx):
+//   0    TX_RDY1   TX FIFO not full
+//   1    RX_NE     RX FIFO has data
+//   2    TX_RDY2   TX shift idle (TX FIFO empty)
+//   3    RX_PERR   parity error (sticky; cleared by CTRL.ACK)
+//   4    RX_OVERR  FIFO overrun (sticky)
+//   5    RX_BSB    bad stop bit (sticky)
+//   6    RX_INPUT  current SI/RX input level
+//   7    DSR_LVL   DSR input level (0 = no remote)
+//   8    CTS_LVL   CTS input level
+//   9    IRQ       interrupt request (set by HW, cleared by CTRL.ACK)
+//   10   reserved
+//   11+  baud-timer countdown bits
+//
+// SIO_CTRL bits:
+//   0    TX_EN     transmit enable
+//   1    DTR_LVL   DTR output level
+//   2    RX_EN     receive enable
+//   3    SO_LVL    TX manual output level (loopback)
+//   4    ACK_IRQ   write 1 → clear STAT[3,4,5,9]; self-clears
+//   5    RTS_LVL   RTS output level
+//   6    RESET     master reset
+//   7    reserved
+//   8-9  RX_IM     RX interrupt mode (bytes to receive before IRQ)
+//   10   TX_IE     TX interrupt enable (IRQ when TX FIFO empties)
+//   11   RX_IE     RX interrupt enable (IRQ at RX threshold)
+//   12   DSR_IE    DSR interrupt enable
+//   13-15 reserved
+//
+// With no link cable connected, every TX byte echoes 0xFF onto the RX
+// line after a short delay; if the appropriate CTRL.x_IE bit is set, we
+// raise IC_SIO. Games typically:
+//   1. Write SIO_DATA (their command byte)
+//   2. Poll SIO_STAT.IRQ (or wait on WaitEvent class F0000009 spec 0x20)
+//   3. Read SIO_DATA (the response — 0xFF if no peer)
+
+const { irqRaise, IC_SIO } = import("irq");
+
+pub extern fn malloc(size: u64) *mut[] u8;
+pub extern fn free(ptr: *mut[] u8);
+pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+
+const SIO1_STATE_SIZE: u32 = 64;
+
+// State buffer layout (u8 array).
+const S_STAT_B0:   u32 = 0;
+const S_STAT_B1:   u32 = 1;
+const S_STAT_B2:   u32 = 2;
+const S_STAT_B3:   u32 = 3;
+const S_MODE_LO:   u32 = 4;
+const S_MODE_HI:   u32 = 5;
+const S_CTRL_LO:   u32 = 6;
+const S_CTRL_HI:   u32 = 7;
+const S_BAUD_LO:   u32 = 8;
+const S_BAUD_HI:   u32 = 9;
+const S_RX_FIFO:   u32 = 0x10;     // 8 bytes ring buffer
+const S_RX_HEAD:   u32 = 0x18;
+const S_RX_TAIL:   u32 = 0x19;
+const S_TX_PENDING:u32 = 0x1A;
+const S_CYC_B0:    u32 = 0x1C;     // cycles_until_irq u32
+const S_CYC_B1:    u32 = 0x1D;
+const S_CYC_B2:    u32 = 0x1E;
+const S_CYC_B3:    u32 = 0x1F;
+
+// CTRL bits.
+const CTRL_TXEN:   u32 = 0x0001;
+const CTRL_DTR:    u32 = 0x0002;
+const CTRL_RXEN:   u32 = 0x0004;
+const CTRL_ACKN:   u32 = 0x0010;
+const CTRL_RESET:  u32 = 0x0040;
+const CTRL_TX_IE:  u32 = 0x0400;
+const CTRL_RX_IE:  u32 = 0x0800;
+const CTRL_DSR_IE: u32 = 0x1000;
+
+// STAT bits.
+const STAT_TXR1:   u32 = 0x0001;
+const STAT_RXNE:   u32 = 0x0002;
+const STAT_TXR2:   u32 = 0x0004;
+const STAT_PERR:   u32 = 0x0008;
+const STAT_OVERR:  u32 = 0x0010;
+const STAT_BSB:    u32 = 0x0020;
+const STAT_IRQ:    u32 = 0x0200;
+
+// IRQ delay (CPU cycles). 200 ≈ ~6 µs at 33 MHz, plausible for one byte
+// at link-cable baud rates. Real hardware delay depends on SIO_BAUD; for
+// games that only use SIO1 as a presence probe the exact value doesn't
+// matter as long as IRQ eventually fires.
+const SIO_IRQ_DELAY: u32 = 200;
+
+pub fn sio1Alloc() *mut[] u8 {
+    var raw: *mut[] u8 = malloc(SIO1_STATE_SIZE as u64);
+    memset(raw, 0, SIO1_STATE_SIZE as u64);
+    return raw;
+}
+
+pub fn sio1Free(s: *mut[] u8) { free(s); }
+
+// ---------- helpers ----------------------------------------------------
+
+pub fn sioGetU32(s: *mut[] u8, off: u32) u32 {
+    return  (s[off]     as u32)
+         | ((s[off + 1] as u32) << 8)
+         | ((s[off + 2] as u32) << 16)
+         | ((s[off + 3] as u32) << 24);
+}
+
+pub fn sioSetU32(s: *mut[] u8, off: u32, v: u32) {
+    s[off]     = (v         & 0xFF) as u8;
+    s[off + 1] = ((v >>  8) & 0xFF) as u8;
+    s[off + 2] = ((v >> 16) & 0xFF) as u8;
+    s[off + 3] = ((v >> 24) & 0xFF) as u8;
+}
+
+pub fn sioGetU16(s: *mut[] u8, off: u32) u32 {
+    return (s[off] as u32) | ((s[off + 1] as u32) << 8);
+}
+
+pub fn sioSetU16(s: *mut[] u8, off: u32, v: u32) {
+    s[off]     = (v        & 0xFF) as u8;
+    s[off + 1] = ((v >> 8) & 0xFF) as u8;
+}
+
+// ---------- RX FIFO ----------------------------------------------------
+
+pub fn sioRxPush(s: *mut[] u8, b: u32) {
+    const tail: u32 = s[S_RX_TAIL] as u32;
+    s[S_RX_FIFO + (tail & 0x07)] = (b & 0xFF) as u8;
+    s[S_RX_TAIL] = ((tail + 1) & 0xFF) as u8;
+}
+
+pub fn sioRxPop(s: *mut[] u8) u32 {
+    var head: u32 = s[S_RX_HEAD] as u32;
+    const tail: u32 = s[S_RX_TAIL] as u32;
+    if (head == tail) { return 0xFF; }
+    const b: u32 = s[S_RX_FIFO + (head & 0x07)] as u32;
+    head = (head + 1) & 0xFF;
+    s[S_RX_HEAD] = head as u8;
+    return b;
+}
+
+pub fn sioRxEmpty(s: *mut[] u8) bool {
+    return s[S_RX_HEAD] == s[S_RX_TAIL];
+}
+
+// ---------- STAT compose -----------------------------------------------
+//
+// STAT is internally stored at S_STAT_B0..B3 holding the sticky/irq bits.
+// On read we OR in the dynamic bits — TX_RDY1 always 1 (FIFO never full
+// since we transmit immediately), TX_RDY2 = 1 when no TX in flight,
+// RX_NE = 1 when RX FIFO has data.
+pub fn sioReadStat(s: *mut[] u8) u32 {
+    var stat: u32 = sioGetU32(s, S_STAT_B0);
+    stat = stat | STAT_TXR1;
+    if (s[S_TX_PENDING] == 0) { stat = stat | STAT_TXR2; }
+    if (!sioRxEmpty(s)) { stat = stat | STAT_RXNE; }
+    return stat;
+}
+
+// ---------- writes -----------------------------------------------------
+
+// SIO_DATA write: push a byte through the transmit path. If CTRL.TX_EN
+// is clear, drop. Otherwise schedule the IRQ deadline; with no remote
+// link cable the response byte 0xFF is staged in the RX FIFO.
+pub fn sioWriteData(s: *mut[] u8, val: u32) {
+    const ctrl: u32 = sioGetU16(s, S_CTRL_LO);
+    if ((ctrl & CTRL_TXEN) == 0) { return; }
+    // Stage the loopback response immediately (real HW transmits then
+    // latches the line level into RX; we just push 0xFF on the line
+    // since DSR is low).
+    sioRxPush(s, 0xFF);
+    s[S_TX_PENDING] = 1;
+    sioSetU32(s, S_CYC_B0, SIO_IRQ_DELAY);
+}
+
+// SIO_CTRL write. RESET clears the buffer entirely; ACK clears the
+// sticky error bits and IRQ. TX_EN / RX_EN flips just gate transmission.
+pub fn sioWriteCtrl(s: *mut[] u8, val: u32) {
+    const v: u32 = val & 0xFFFF;
+    if ((v & CTRL_RESET) != 0) {
+        // Clear everything except BAUD/MODE which the BIOS sets up once.
+        const mode: u32 = sioGetU16(s, S_MODE_LO);
+        const baud: u32 = sioGetU16(s, S_BAUD_LO);
+        memset(s, 0, SIO1_STATE_SIZE as u64);
+        sioSetU16(s, S_MODE_LO, mode);
+        sioSetU16(s, S_BAUD_LO, baud);
+        return;
+    }
+    sioSetU16(s, S_CTRL_LO, v);
+    if ((v & CTRL_ACKN) != 0) {
+        // Clear sticky STAT bits PERR/OVERR/BSB/IRQ.
+        var stat: u32 = sioGetU32(s, S_STAT_B0);
+        stat = stat & (~(STAT_PERR | STAT_OVERR | STAT_BSB | STAT_IRQ));
+        sioSetU32(s, S_STAT_B0, stat);
+        // Self-clear the ACK bit so a re-read of CTRL doesn't keep
+        // signaling.
+        var ctrl: u32 = sioGetU16(s, S_CTRL_LO);
+        ctrl = ctrl & (~CTRL_ACKN);
+        sioSetU16(s, S_CTRL_LO, ctrl);
+    }
+}
+
+// ---------- IO surface -------------------------------------------------
+
+pub fn sio1Read32(s: *mut[] u8, off: u32) u32 {
+    match (off) {
+        0x00 { return sioRxPop(s); }
+        0x04 { return sioReadStat(s); }
+        0x08 { return sioGetU16(s, S_MODE_LO); }
+        0x0A { return sioGetU16(s, S_CTRL_LO); }
+        0x0E { return sioGetU16(s, S_BAUD_LO); }
+        _    { return 0; }
+    }
+}
+
+pub fn sio1Read16(s: *mut[] u8, off: u32) u32 {
+    return sio1Read32(s, off) & 0xFFFF;
+}
+
+pub fn sio1Read8(s: *mut[] u8, off: u32) u32 {
+    return sio1Read32(s, off) & 0xFF;
+}
+
+pub fn sio1Write32(s: *mut[] u8, off: u32, val: u32) {
+    match (off) {
+        0x00 { sioWriteData(s, val); }
+        0x08 { sioSetU16(s, S_MODE_LO, val & 0xFFFF); }
+        0x0A { sioWriteCtrl(s, val); }
+        0x0E { sioSetU16(s, S_BAUD_LO, val & 0xFFFF); }
+        _    {}
+    }
+}
+
+pub fn sio1Write16(s: *mut[] u8, off: u32, val: u32) {
+    sio1Write32(s, off, val & 0xFFFF);
+}
+
+pub fn sio1Write8(s: *mut[] u8, off: u32, val: u32) {
+    sio1Write32(s, off, val & 0xFF);
+}
+
+// ---------- per-cycle tick --------------------------------------------
+//
+// Mirrors padUpdate's pattern: countdown cycles_until_irq, then raise
+// STAT.IRQ and the IC_SIO line. We respect the CTRL.x_IE bits so a game
+// that didn't enable interrupts doesn't see spurious IRQs.
+pub fn sio1Update(s: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
+    var cd: u32 = sioGetU32(s, S_CYC_B0);
+    if (cd == 0) { return; }
+    if (cd > cyc) {
+        sioSetU32(s, S_CYC_B0, cd - cyc);
+        return;
+    }
+    sioSetU32(s, S_CYC_B0, 0);
+    s[S_TX_PENDING] = 0;
+    const ctrl: u32 = sioGetU16(s, S_CTRL_LO);
+    // TX completion triggers if TX_IE or RX_IE is enabled (the response
+    // byte we staged in sioWriteData is "received").
+    if ((ctrl & (CTRL_TX_IE | CTRL_RX_IE)) != 0) {
+        var stat: u32 = sioGetU32(s, S_STAT_B0);
+        stat = stat | STAT_IRQ;
+        sioSetU32(s, S_STAT_B0, stat);
+        irqRaise(ic, cop0, IC_SIO());
+    }
+}

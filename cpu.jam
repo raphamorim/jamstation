@@ -116,6 +116,8 @@ const SR_BEV: u32 = 0x00400000;
 
 // Cause codes, already pre-shifted into bits 6..2 of CAUSE.
 const CAUSE_INT:     u32 = 0x00;
+const CAUSE_IBE:     u32 = 0x18;   // Bus Error on Instruction fetch
+const CAUSE_DBE:     u32 = 0x1C;   // Bus Error on Data access
 const CAUSE_ADEL:    u32 = 0x10;
 const CAUSE_ADES:    u32 = 0x14;
 const CAUSE_SYSCALL: u32 = 0x20;
@@ -192,8 +194,8 @@ pub fn lessThanSigned(a: u32, b: u32) bool {
 }
 
 pub fn signedLtZero(a: u32) bool { return (a & 0x80000000) != 0; }
-pub fn signedGtZero(a: u32) bool { return a != 0 and (a & 0x80000000) == 0; }
-pub fn signedLeZero(a: u32) bool { return a == 0 or  (a & 0x80000000) != 0; }
+pub fn signedGtZero(a: u32) bool { return a != 0 && (a & 0x80000000) == 0; }
+pub fn signedLeZero(a: u32) bool { return a == 0 ||  (a & 0x80000000) != 0; }
 pub fn signedGeZero(a: u32) bool { return (a & 0x80000000) == 0; }
 
 // ---------- integer division -------------------------------------------
@@ -225,13 +227,13 @@ pub fn divI32(a: u32, b: u32) u32 {
         return 0xFFFFFFFF;
     }
     // MIPS quirk: INT_MIN / -1 == INT_MIN (no overflow trap).
-    if (a == 0x80000000 and b == 0xFFFFFFFF) { return 0x80000000; }
+    if (a == 0x80000000 && b == 0xFFFFFFFF) { return 0x80000000; }
     return ((a as i32) / (b as i32)) as u32;
 }
 
 pub fn modI32(a: u32, b: u32) u32 {
     if (b == 0) { return a; }
-    if (a == 0x80000000 and b == 0xFFFFFFFF) { return 0; }
+    if (a == 0x80000000 && b == 0xFFFFFFFF) { return 0; }
     return ((a as i32) % (b as i32)) as u32;
 }
 
@@ -417,7 +419,7 @@ pub fn iRegimm(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     // Link only on the two explicit AL variants (0x10/0x11). For
     // unknown rt values psxe's default path treats the op as a plain
     // BLTZ/BGEZ depending on bit 16 — no link.
-    if (variant == 0x10 or variant == 0x11) {
+    if (variant == 0x10 || variant == 0x11) {
         gprWrite(regs, 31, c.nextPc);
     }
 
@@ -612,7 +614,7 @@ pub fn iSra(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     const sa: u32 = opSa(opc);
     commitLoad(c, regs);
     var v: u32 = t >> sa;
-    if ((t & 0x80000000) != 0 and sa != 0) {
+    if ((t & 0x80000000) != 0 && sa != 0) {
         const fill: u32 = (0xFFFFFFFF << (32 - sa)) & 0xFFFFFFFF;
         v = v | fill;
     }
@@ -639,7 +641,7 @@ pub fn iSrav(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     const sa: u32 = s & 0x1F;
     commitLoad(c, regs);
     var v: u32 = t >> sa;
-    if ((t & 0x80000000) != 0 and sa != 0) {
+    if ((t & 0x80000000) != 0 && sa != 0) {
         const fill: u32 = (0xFFFFFFFF << (32 - sa)) & 0xFFFFFFFF;
         v = v | fill;
     }
@@ -735,7 +737,7 @@ pub fn iDiv(c: mut Cpu, opc: u32, regs: *mut[] u32) {
         if (signedLtZero(s)) { c.lo = 1; } else { c.lo = 0xFFFFFFFF; }
         return;
     }
-    if (s == 0x80000000 and t == 0xFFFFFFFF) {
+    if (s == 0x80000000 && t == 0xFFFFFFFF) {
         c.hi = 0;
         c.lo = 0x80000000;
         return;
@@ -1004,7 +1006,10 @@ pub fn dispatchCop0(c: mut Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) {
     if (rs == 0x00) { iMfc0(c, opc, regs, cop0); return; }
     if (rs == 0x04) { iMtc0(c, opc, regs, cop0); return; }
     if (rs == 0x10) { iRfe(c, regs, cop0); return; }
-    illegal(c, opc, regs, cop0); return;
+    // Unknown COP0 rs — real R3000 silently treats this as a NOP
+    // (verified via ps1-tests cpu/cop testCop0InvalidOpcode). psxe
+    // raises CAUSE_RI here, which is more aggressive than hardware.
+    commitLoad(c, regs);
 }
 
 pub fn dispatch(c: mut Cpu, opc: u32, bus: Bus,
@@ -1026,8 +1031,54 @@ pub fn dispatch(c: mut Cpu, opc: u32, bus: Bus,
     if (p == 0x0D) { iOri(c, opc, regs); return; }
     if (p == 0x0E) { iXori(c, opc, regs); return; }
     if (p == 0x0F) { iLui(c, opc, regs); return; }
-    if (p == 0x10) { dispatchCop0(c, opc, regs, cop0); return; }
-    if (p == 0x12) { iCop2Unimpl(c, opc, bus, regs, cop0); return; }
+    // COPx instructions gate on SR.CUx (bits 28-31). Real R3000 raises
+    // CAUSE_CPU (excode 0xB) when an instruction targets a disabled
+    // coprocessor — even for COP1/COP3 which the PSX doesn't physically
+    // wire up (the CU bits still cover them). COP0 is always considered
+    // usable in kernel mode (KUc=0) regardless of CU0. Test reference:
+    // JaCzekanski/ps1-tests cpu/cop verifies this exact behavior.
+    if (p == 0x10) {
+        const sr10: u32 = cop0Read(cop0, C0_SR);
+        if ((sr10 & 0x10000000) == 0 && (sr10 & 0x02) != 0) {
+            // User mode without CU0 → coprocessor unusable.
+            commitLoad(c, regs);
+            raiseException(c, cop0, CAUSE_CPU);
+            return;
+        }
+        dispatchCop0(c, opc, regs, cop0); return;
+    }
+    if (p == 0x11) {
+        // COP1 — not present on PSX, but the SR.CU1 bit still gates the
+        // CAUSE_CPU exception. With CU1 set, the op silently no-ops.
+        const sr11: u32 = cop0Read(cop0, C0_SR);
+        if ((sr11 & 0x20000000) == 0) {
+            commitLoad(c, regs);
+            raiseException(c, cop0, CAUSE_CPU);
+            return;
+        }
+        commitLoad(c, regs);
+        return;
+    }
+    if (p == 0x12) {
+        const sr12: u32 = cop0Read(cop0, C0_SR);
+        if ((sr12 & 0x40000000) == 0) {
+            commitLoad(c, regs);
+            raiseException(c, cop0, CAUSE_CPU);
+            return;
+        }
+        iCop2Unimpl(c, opc, bus, regs, cop0); return;
+    }
+    if (p == 0x13) {
+        // COP3 — same as COP1: not present, gated by CU3.
+        const sr13: u32 = cop0Read(cop0, C0_SR);
+        if ((sr13 & 0x80000000) == 0) {
+            commitLoad(c, regs);
+            raiseException(c, cop0, CAUSE_CPU);
+            return;
+        }
+        commitLoad(c, regs);
+        return;
+    }
     if (p == 0x20) { iLb(c, opc, bus, regs); return; }
     if (p == 0x21) { iLh(c, opc, bus, regs, cop0); return; }
     if (p == 0x22) { iLwl(c, opc, bus, regs); return; }
@@ -1043,18 +1094,69 @@ pub fn dispatch(c: mut Cpu, opc: u32, bus: Bus,
     // COPx load/store opcodes (LWC0/1/2/3, SWC0/1/2/3). COP2 (the GTE)
     // gets the swallow stub; the other coprocessors don't exist on the
     // PSX, so we raise coprocessor-unusable as before.
-    if (p == 0x32) { iCop2Lwc(c, opc, bus, regs, cop0); return; }
-    if (p == 0x3A) { iCop2Swc(c, opc, bus, regs, cop0); return; }
-    // COP0/COP1/COP3 load/store — none exist on the PSX. psxe raises
-    // CAUSE_CPU (coprocessor unusable, code 0xB) per cpu.c lwc0/lwc1/
-    // lwc3/swc0/swc1/swc3 stubs. Previously we routed these through
-    // iCop2Unimpl which silently ran them as GTE math — masking real
-    // illegal instructions in games.
-    if (p == 0x30 or p == 0x31 or p == 0x33 or
-        p == 0x38 or p == 0x39 or p == 0x3B) {
-        commitLoad(c, regs);
-        raiseException(c, cop0, CAUSE_CPU);
-        return;
+    // LWCx/SWCx all gate on SR.CUx. If the corresponding CU bit is set,
+    // the load/store either runs (COP2 only on PSX) or is a silent NOP
+    // for COP0/COP1/COP3. If CU is clear, raise CAUSE_CPU.
+    // Note: COP0 also accepts !CU0 in kernel mode (KUc=0).
+    if (p == 0x30) {
+        // LWC0 — gated by SR.CU0 alone (LWCx/SWCx don't get the kernel-
+        // mode exemption that COPx ops have, per ps1-tests cpu/cop and
+        // psx-spx).
+        const sr30: u32 = cop0Read(cop0, C0_SR);
+        if ((sr30 & 0x10000000) == 0) {
+            commitLoad(c, regs); raiseException(c, cop0, CAUSE_CPU); return;
+        }
+        commitLoad(c, regs); return;
+    }
+    if (p == 0x31) {
+        const sr31: u32 = cop0Read(cop0, C0_SR);
+        if ((sr31 & 0x20000000) == 0) {
+            commitLoad(c, regs); raiseException(c, cop0, CAUSE_CPU); return;
+        }
+        commitLoad(c, regs); return;
+    }
+    if (p == 0x32) {
+        const sr32: u32 = cop0Read(cop0, C0_SR);
+        if ((sr32 & 0x40000000) == 0) {
+            commitLoad(c, regs); raiseException(c, cop0, CAUSE_CPU); return;
+        }
+        iCop2Lwc(c, opc, bus, regs, cop0); return;
+    }
+    if (p == 0x33) {
+        const sr33: u32 = cop0Read(cop0, C0_SR);
+        if ((sr33 & 0x80000000) == 0) {
+            commitLoad(c, regs); raiseException(c, cop0, CAUSE_CPU); return;
+        }
+        commitLoad(c, regs); return;
+    }
+    if (p == 0x38) {
+        // SWC0 — same as LWC0, gated by CU0 alone.
+        const sr38: u32 = cop0Read(cop0, C0_SR);
+        if ((sr38 & 0x10000000) == 0) {
+            commitLoad(c, regs); raiseException(c, cop0, CAUSE_CPU); return;
+        }
+        commitLoad(c, regs); return;
+    }
+    if (p == 0x39) {
+        const sr39: u32 = cop0Read(cop0, C0_SR);
+        if ((sr39 & 0x20000000) == 0) {
+            commitLoad(c, regs); raiseException(c, cop0, CAUSE_CPU); return;
+        }
+        commitLoad(c, regs); return;
+    }
+    if (p == 0x3A) {
+        const sr3A: u32 = cop0Read(cop0, C0_SR);
+        if ((sr3A & 0x40000000) == 0) {
+            commitLoad(c, regs); raiseException(c, cop0, CAUSE_CPU); return;
+        }
+        iCop2Swc(c, opc, bus, regs, cop0); return;
+    }
+    if (p == 0x3B) {
+        const sr3B: u32 = cop0Read(cop0, C0_SR);
+        if ((sr3B & 0x80000000) == 0) {
+            commitLoad(c, regs); raiseException(c, cop0, CAUSE_CPU); return;
+        }
+        commitLoad(c, regs); return;
     }
     illegal(c, opc, regs, cop0); return;
 }
@@ -1080,6 +1182,22 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     if ((c.savedPc & 3) != 0) {
         cop0Write(cop0, C0_BADVADDR, c.savedPc);
         raiseException(c, cop0, CAUSE_ADEL);
+    }
+
+    // Instruction fetch is allowed from cached RAM/BIOS and from a few
+    // IO regions that happen to respond as if they're memory (SPU and
+    // DMA register banks). Everything else — scratchpad, MDEC, IRQ
+    // controller, GPU, CDROM, etc. — triggers Bus Error on Instruction
+    // (excode 6). Verified by ps1-tests cpu/code-in-io.
+    const pcPhys: u32 = c.savedPc & 0x1FFFFFFF;
+    const inRam:  bool = pcPhys < 0x00800000;
+    const inBios: bool = pcPhys >= 0x1FC00000 && pcPhys < 0x1FC80000;
+    const inDma:  bool = pcPhys >= 0x1F801080 && pcPhys < 0x1F801100;
+    const inSpu:  bool = pcPhys >= 0x1F801C00 && pcPhys < 0x1F802000;
+    if (!inRam && !inBios && !inDma && !inSpu) {
+        cop0Write(cop0, C0_BADVADDR, c.savedPc);
+        raiseException(c, cop0, CAUSE_IBE);
+        return;
     }
 
     // Take an external interrupt before issuing the next instruction —
@@ -1110,7 +1228,7 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
 pub fn run(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
            maxSteps: u32) {
     var i: u32 = 0;
-    while (i < maxSteps and c.halted == 0) {
+    while (i < maxSteps && c.halted == 0) {
         step(c, bus, regs, cop0);
         i = i + 1;
     }
@@ -1132,7 +1250,7 @@ pub fn biosHook(c: mut Cpu, bus: Bus, regs: *mut[] u32) {
     const pcMasked: u32 = c.pc & 0x3FFFFFFF;
     if (pcMasked == 0xA0) {
         const op: u32 = gprRead(regs, 9);
-        if (op == 0x09 or op == 0x3C) { biosPutc(gprRead(regs, 4)); }
+        if (op == 0x09 || op == 0x3C) { biosPutc(gprRead(regs, 4)); }
         if (op == 0x3E) {
             var src: u32 = gprRead(regs, 4);
             var ch: u32 = busRead8(bus, src);
@@ -1145,7 +1263,7 @@ pub fn biosHook(c: mut Cpu, bus: Bus, regs: *mut[] u32) {
     }
     if (pcMasked == 0xB0) {
         const op: u32 = gprRead(regs, 9);
-        if (op == 0x3B or op == 0x3D) { biosPutc(gprRead(regs, 4)); }
+        if (op == 0x3B || op == 0x3D) { biosPutc(gprRead(regs, 4)); }
         if (op == 0x3F) {
             var src: u32 = gprRead(regs, 4);
             var ch: u32 = busRead8(bus, src);
@@ -1165,14 +1283,14 @@ pub fn biosHookDiag(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     const pcMaskedSyscall: u32 = c.pc & 0x3FFFFFFF;
     if (pcMaskedSyscall == 0xC0) {
         const op: u32 = gprRead(regs, 9);
-        if (op == 0x02 or op == 0x03 or op == 0x0A or op == 0x0B) {
+        if (op == 0x02 || op == 0x03 || op == 0x0A || op == 0x0B) {
             const a0: u32 = gprRead(regs, 4);
             const a1: u32 = gprRead(regs, 5);
             const ra: u32 = gprRead(regs, 31);
             var fmt: []u8 = "[diag-C0] op=%02x a0=%08x a1=%08x ra=%08x\n";
             printf(fmt.ptr, op, a0, a1, ra);
             // For C0:02, dereference *a0 to see what handler is being registered
-            if (op == 0x02 and a0 != 0) {
+            if (op == 0x02 && a0 != 0) {
                 const n0: u32 = busRead32(bus, a0);
                 const n1: u32 = busRead32(bus, a0+4);
                 const n2: u32 = busRead32(bus, a0+8);
@@ -1183,7 +1301,7 @@ pub fn biosHookDiag(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
             fflush(0);
         }
     }
-    if (c.pc == 0x80059DCC and c.diagDumped == 0) {
+    if (c.pc == 0x80059DCC && c.diagDumped == 0) {
         c.diagDumped = 1;
         var hdr: []u8 = "[diag] ===== mem[0x100..0x150] =====\n";
         printf(hdr.ptr);
@@ -1211,7 +1329,7 @@ pub fn biosHookDiag(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
                 printf(f3.ptr, i, chainHead);
                 var node: u32 = chainHead;
                 var depth: u32 = 0;
-                while (node != 0 and depth < 16) {
+                while (node != 0 && depth < 16) {
                     const next: u32 = busRead32(bus, node);
                     const fn1: u32 = busRead32(bus, node+4);
                     const fn2: u32 = busRead32(bus, node+8);
@@ -1245,7 +1363,7 @@ pub fn biosHookDiag(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
             fflush(0);
         }
     }
-    if (c.pc == 0x800000E8 and c.diagWalkCount < 4) {
+    if (c.pc == 0x800000E8 && c.diagWalkCount < 4) {
         c.diagWalkCount = c.diagWalkCount + 1;
         const s3: u32 = gprRead(regs, 19);
         const s6: u32 = gprRead(regs, 22);
@@ -1258,7 +1376,7 @@ pub fn biosHookDiag(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
 pub fn runHooked(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
                  maxSteps: u32) {
     var i: u32 = 0;
-    while (i < maxSteps and c.halted == 0) {
+    while (i < maxSteps && c.halted == 0) {
         biosHook(c, bus, regs);
         biosHookDiag(c, bus, regs, cop0);
         step(c, bus, regs, cop0);

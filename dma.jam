@@ -141,15 +141,17 @@ pub fn dmaRead32(d: *mut[] u32, off: u32) u32 {
     if (off < 0x70) {
         const ch:  u32 = (off >> 4) & 0x7;
         const reg: u32 = (off >> 2) & 0x3;
-        if (reg == 0) { return d[chBase(ch) + F_MADR]; }
-        if (reg == 1) { return d[chBase(ch) + F_BCR];  }
-        if (reg == 2) {
-            var cr: u32 = d[chBase(ch) + F_CHCR];
-            cr = cr | chcrHw1(ch);
-            cr = cr & chcrHw0(ch);
-            return cr;
+        match (reg) {
+            0 { return d[chBase(ch) + F_MADR]; }
+            1 { return d[chBase(ch) + F_BCR];  }
+            2 {
+                var cr: u32 = d[chBase(ch) + F_CHCR];
+                cr = cr | chcrHw1(ch);
+                cr = cr & chcrHw0(ch);
+                return cr;
+            }
+            _ { return 0; }
         }
-        return 0;
     }
     if (off == 0x70) { return d[21]; }
     if (off == 0x74) { return d[22]; }
@@ -174,7 +176,7 @@ pub fn dmaWriteDicr(d: *mut[] u32, val: u32) {
     const forceB: u32 = nd & DICR_FORCE;
     const fl:     u32 = nd & DICR_FLAGS;
     nd = nd & (~DICR_IRQSI);
-    if (forceB != 0 or (fl != 0 and irqEn != 0)) { nd = nd | DICR_IRQSI; }
+    if (forceB != 0 || (fl != 0 && irqEn != 0)) { nd = nd | DICR_IRQSI; }
     d[22] = nd;
 }
 
@@ -182,29 +184,41 @@ pub fn dmaWrite32(d: *mut[] u32, bus: Bus, cop0: *mut[] u32, off: u32, val: u32)
     if (off < 0x70) {
         const ch:  u32 = (off >> 4) & 0x7;
         const reg: u32 = (off >> 2) & 0x3;
-        if (reg == 0) { d[chBase(ch) + F_MADR] = val; }
-        if (reg == 1) { d[chBase(ch) + F_BCR]  = val; }
-        if (reg == 2) {
-            d[chBase(ch) + F_CHCR] = val;
-            dmaTrigger(d, bus, cop0, ch);
+        match (reg) {
+            0 { d[chBase(ch) + F_MADR] = val; }
+            1 { d[chBase(ch) + F_BCR]  = val; }
+            2 {
+                d[chBase(ch) + F_CHCR] = val;
+                dmaTrigger(d, bus, cop0, ch);
+            }
+            _ {}
         }
         return;
     }
-    if (off == 0x70) { d[21] = val; return; }
-    if (off == 0x74) { dmaWriteDicr(d, val); return; }
+    match (off) {
+        0x70 { d[21] = val; }
+        0x74 { dmaWriteDicr(d, val); }
+        _    {}
+    }
 }
 
 pub fn dmaWrite16(d: *mut[] u32, bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
-    if (off == 0x74) { dmaWriteDicr(d, val & 0xFFFF); return; }
-    if (off == 0x76) { dmaWriteDicr(d, (val & 0xFFFF) << 16); return; }
+    match (off) {
+        0x74 { dmaWriteDicr(d, val & 0xFFFF); return; }
+        0x76 { dmaWriteDicr(d, (val & 0xFFFF) << 16); return; }
+        _    {}
+    }
     dmaWrite32(d, bus, cop0, off, val & 0xFFFF);
 }
 
 pub fn dmaWrite8(d: *mut[] u32, bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
-    if (off == 0x74) { dmaWriteDicr(d, val & 0xFF); return; }
-    if (off == 0x75) { dmaWriteDicr(d, (val & 0xFF) << 8);  return; }
-    if (off == 0x76) { dmaWriteDicr(d, (val & 0xFF) << 16); return; }
-    if (off == 0x77) { dmaWriteDicr(d, (val & 0xFF) << 24); return; }
+    match (off) {
+        0x74 { dmaWriteDicr(d, val & 0xFF); return; }
+        0x75 { dmaWriteDicr(d, (val & 0xFF) << 8);  return; }
+        0x76 { dmaWriteDicr(d, (val & 0xFF) << 16); return; }
+        0x77 { dmaWriteDicr(d, (val & 0xFF) << 24); return; }
+        _    {}
+    }
     dmaWrite32(d, bus, cop0, off, val & 0xFF);
 }
 
@@ -216,12 +230,15 @@ pub fn dmaWrite8(d: *mut[] u32, bus: Bus, cop0: *mut[] u32, off: u32, val: u32) 
 // polls DICR right after CHCR (Brave Fencer's audio bank loader does
 // exactly this around 0x80042510).
 pub fn dmaTrigger(d: *mut[] u32, bus: Bus, cop0: *mut[] u32, ch: u32) {
-    if (ch == 0) { dmaDoMdecIn(d, bus); }
-    if (ch == 1) { dmaDoMdecOut(d, bus); }
-    if (ch == 2) { dmaDoGpu(d, bus); }
-    if (ch == 3) { dmaDoCdrom(d, bus); }
-    if (ch == 4) { dmaDoSpu(d, bus); }
-    if (ch == 6) { dmaDoOtc(d, bus); }
+    match (ch) {
+        0 { dmaDoMdecIn(d, bus); }
+        1 { dmaDoMdecOut(d, bus); }
+        2 { dmaDoGpu(d, bus); }
+        3 { dmaDoCdrom(d, bus); }
+        4 { dmaDoSpu(d, bus); }
+        6 { dmaDoOtc(d, bus); }
+        _ {}
+    }
     dmaUpdate(d, bus.irq, cop0);
 }
 
@@ -254,10 +271,11 @@ pub fn dmaClear(d: *mut[] u32, ch: u32) {
 
 pub fn dmaDoGpu(d: *mut[] u32, bus: Bus) {
     if (!chcrBusy(d, 2)) { return; }
-    const sync: u32 = chcrSync(d, 2);
-    if (sync == 0)      { dmaDoGpuRequest(d, bus); }
-    else if (sync == 1) { dmaDoGpuRequest(d, bus); }
-    else if (sync == 2) { dmaDoGpuLinked(d, bus); }
+    match (chcrSync(d, 2)) {
+        0 | 1 { dmaDoGpuRequest(d, bus); }
+        2     { dmaDoGpuLinked(d, bus); }
+        _     {}
+    }
     dmaClear(d, 2);
     d[25] = 1;
 }
@@ -391,35 +409,39 @@ pub fn dmaDoCdrom(d: *mut[] u32, bus: Bus) {
 // SPU RAM and the BIOS "wait for SPU drain" loops would never advance.
 pub fn dmaDoSpu(d: *mut[] u32, bus: Bus) {
     if (!chcrBusy(d, 4)) { return; }
-    const size:   u32 = bcrSize(d, 4);
-    const blocks: u32 = bcrBlocks(d, 4);
-    const step:   u32 = chcrStep(d, 4);
+    // Sync mode 0 (burst/immediate): BCR low 16 = word count, hi 16 = 0.
+    // Sync mode 1 (block-to-DMA-request): BCR low 16 = block size (words),
+    // BCR hi 16 = block count. Treat as a flat word count for the loop —
+    // ps1-tests testDMAReadToRamSyncMode0 was getting 0 transfers because
+    // blocks was 0 in mode 0.
+    var words: u32 = 0;
+    match (chcrSync(d, 4)) {
+        0 {
+            words = bcrSize(d, 4);
+            if (words == 0) { words = 0x10000; }
+        }
+        1 { words = bcrSize(d, 4) * bcrBlocks(d, 4); }
+        _ { return; }
+    }
+    const step: u32 = chcrStep(d, 4);
     var addr: u32 = d[chBase(4) + F_MADR];
     if (chcrTdir(d, 4)) {
-        var j: u32 = 0;
-        while (j < blocks) {
-            var i: u32 = 0;
-            while (i < size) {
-                const data: u32 = ramRead32(bus, addr);
-                spuWrite16(bus.spu, bus.spuram, SPU_TFIFO_OFF, data & 0xFFFF);
-                spuWrite16(bus.spu, bus.spuram, SPU_TFIFO_OFF, (data >> 16) & 0xFFFF);
-                addr = addr + step;
-                i = i + 1;
-            }
-            j = j + 1;
+        var i: u32 = 0;
+        while (i < words) {
+            const data: u32 = ramRead32(bus, addr);
+            spuWrite16(bus.spu, bus.spuram, SPU_TFIFO_OFF, data & 0xFFFF);
+            spuWrite16(bus.spu, bus.spuram, SPU_TFIFO_OFF, (data >> 16) & 0xFFFF);
+            addr = addr + step;
+            i = i + 1;
         }
     } else {
-        var j: u32 = 0;
-        while (j < blocks) {
-            var i: u32 = 0;
-            while (i < size) {
-                const lo: u32 = spuRead16(bus.spu, bus.spuram, SPU_TFIFO_OFF);
-                const hi: u32 = spuRead16(bus.spu, bus.spuram, SPU_TFIFO_OFF);
-                ramWrite32(bus, addr, lo | (hi << 16));
-                addr = addr + step;
-                i = i + 1;
-            }
-            j = j + 1;
+        var i: u32 = 0;
+        while (i < words) {
+            const lo: u32 = spuRead16(bus.spu, bus.spuram, SPU_TFIFO_OFF);
+            const hi: u32 = spuRead16(bus.spu, bus.spuram, SPU_TFIFO_OFF);
+            ramWrite32(bus, addr, lo | (hi << 16));
+            addr = addr + step;
+            i = i + 1;
         }
     }
     d[chBase(4) + F_MADR] = addr;
@@ -467,9 +489,9 @@ pub fn dmaUpdate(d: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32) {
     const forceB: bool = (d[22] & DICR_FORCE) != 0;
     const flagsB: bool = (d[22] & DICR_FLAGS) != 0;
 
-    const signal: bool = forceB or (flagsB and irqEn);
+    const signal: bool = forceB || (flagsB && irqEn);
 
-    if (signal and !prev) { irqRaise(ic, cop0, IC_DMA()); }
+    if (signal && !prev) { irqRaise(ic, cop0, IC_DMA()); }
 
     d[22] = d[22] & (~DICR_IRQSI);
     if (signal) { d[22] = d[22] | DICR_IRQSI; }

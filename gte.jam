@@ -84,7 +84,7 @@ pub fn gteFree(g: *mut[] u32) { free(g as *mut[] u8); }
 pub fn gteDataRead(g: *mut[] u32, idx: u32) u32 {
     const i: u32 = idx & 0x1F;
     if (i == 15) { return g[14]; }                  // SXYP mirrors SXY2
-    if (i == 28 or i == 29) {
+    if (i == 28 || i == 29) {
         // Re-pack IR1/IR2/IR3 (>> 7, clamped 0..0x1F) into 15-bit RGB.
         var r: i64 = (g[9] as i32) as i64 >> 7;
         var grn: i64 = (g[10] as i32) as i64 >> 7;
@@ -146,7 +146,7 @@ pub fn gteCountLeadingSign(v: u32) u32 {
     var x: u32 = v;
     if ((x & 0x80000000) != 0) { x = ~x; }
     var n: u32 = 0;
-    while ((x & 0x80000000) == 0 and n < 32) {
+    while ((x & 0x80000000) == 0 && n < 32) {
         x = x << 1;
         n = n + 1;
     }

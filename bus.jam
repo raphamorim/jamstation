@@ -93,10 +93,11 @@ const IO_SIZE:   u32 = 0x2000;
 const VRAM_SIZE: u32 = 0x100000;
 
 pub fn regionMask(addr: u32) u32 {
-    const seg: u32 = (addr >> 29) & 7;
-    if (seg == 4) { return 0x7FFFFFFF; }
-    if (seg == 5) { return 0x1FFFFFFF; }
-    return 0xFFFFFFFF;
+    match ((addr >> 29) & 7) {
+        4 { return 0x7FFFFFFF; }
+        5 { return 0x1FFFFFFF; }
+        _ { return 0xFFFFFFFF; }
+    }
 }
 
 pub fn bufRead32(buf: *mut[] u8, off: u32) u32 {
@@ -144,23 +145,23 @@ pub fn route(paddr: u32) BusRoute {
         var r: BusRoute = { kind: 1, off: paddr & 0x001FFFFF };
         return r;
     }
-    if (paddr >= 0x1F000000 and paddr < 0x1F080000) {
+    if (paddr >= 0x1F000000 && paddr < 0x1F080000) {
         var r: BusRoute = { kind: 5, off: paddr - 0x1F000000 };
         return r;
     }
-    if (paddr >= 0x1F800000 and paddr < 0x1F800400) {
+    if (paddr >= 0x1F800000 && paddr < 0x1F800400) {
         var r: BusRoute = { kind: 3, off: paddr - 0x1F800000 };
         return r;
     }
-    if (paddr >= 0x1F801000 and paddr < 0x1F803000) {
+    if (paddr >= 0x1F801000 && paddr < 0x1F803000) {
         var r: BusRoute = { kind: 4, off: paddr - 0x1F801000 };
         return r;
     }
-    if (paddr >= 0x1FC00000 and paddr < 0x1FC80000) {
+    if (paddr >= 0x1FC00000 && paddr < 0x1FC80000) {
         var r: BusRoute = { kind: 2, off: paddr - 0x1FC00000 };
         return r;
     }
-    if (paddr >= 0xFFFE0130 and paddr < 0xFFFE0134) {
+    if (paddr >= 0xFFFE0130 && paddr < 0xFFFE0134) {
         var r: BusRoute = { kind: 4, off: 0x1F00 + (paddr - 0xFFFE0130) };
         return r;
     }
@@ -246,44 +247,52 @@ pub fn freeBus(b: Bus) {
 // Dispatch an IO-region address to the right device. The offset is
 // relative to 0x1F801000 (i.e. r.off from the BusRoute).
 pub fn ioRead32(bus: Bus, off: u32) u32 {
-    if (off >= 0x040 and off < 0x050) { return padRead32(bus.pad, bus.mcd, bus.mcdRam, off - 0x040); }
-    if (off >= 0x050 and off < 0x060) { return sio1Read32(bus.sio1, off - 0x050); }
-    if (off >= 0x070 and off < 0x080) { return irqRead32(bus.irq, off - 0x070); }
-    if (off >= 0x080 and off < 0x100) { return dmaRead32(bus.dma, off - 0x080); }
-    if (off >= 0x100 and off < 0x130) { return timerRead32(bus.timer, off - 0x100); }
-    if (off >= 0x800 and off < 0x804) { return cdromRead32(bus.cdrom, off - 0x800); }
-    if (off >= 0x810 and off < 0x818) { return gpuRead32(bus.gpu, bus.vram, off - 0x810); }
-    if (off >= 0x820 and off < 0x828) { return mdecRead32(bus.mdec, bus.mdecOut, off - 0x820); }
-    if (off >= 0xC00 and off < 0x1000) { return spuRead32(bus.spu, bus.spuram, off - 0xC00); }
-    if (off == 0x814) { return 0x1C000000; }
+    match (off) {
+        0x040..=0x04F { return padRead32(bus.pad, bus.mcd, bus.mcdRam, off - 0x040); }
+        0x050..=0x05F { return sio1Read32(bus.sio1, off - 0x050); }
+        0x070..=0x07F { return irqRead32(bus.irq, off - 0x070); }
+        0x080..=0x0FF { return dmaRead32(bus.dma, off - 0x080); }
+        0x100..=0x12F { return timerRead32(bus.timer, off - 0x100); }
+        0x800..=0x803 { return cdromRead32(bus.cdrom, off - 0x800); }
+        0x810..=0x817 { return gpuRead32(bus.gpu, bus.vram, off - 0x810); }
+        0x820..=0x827 { return mdecRead32(bus.mdec, bus.mdecOut, off - 0x820); }
+        0xC00..=0xFFF { return spuRead32(bus.spu, bus.spuram, off - 0xC00); }
+        _ {}
+    }
     if (off >= IO_SIZE) { return 0; }
     return bufRead32(bus.io, off);
 }
 
 pub fn ioRead16(bus: Bus, off: u32) u32 {
-    if (off >= 0x040 and off < 0x050) { return padRead16(bus.pad, bus.mcd, bus.mcdRam, off - 0x040); }
-    if (off >= 0x050 and off < 0x060) { return sio1Read16(bus.sio1, off - 0x050); }
-    if (off >= 0x070 and off < 0x080) { return irqRead16(bus.irq, off - 0x070); }
-    if (off >= 0x080 and off < 0x100) { return dmaRead16(bus.dma, off - 0x080); }
-    if (off >= 0x100 and off < 0x130) { return timerRead16(bus.timer, off - 0x100); }
-    if (off >= 0x800 and off < 0x804) { return cdromRead16(bus.cdrom, off - 0x800); }
-    if (off >= 0x810 and off < 0x818) { return gpuRead16(bus.gpu, bus.vram, off - 0x810); }
-    if (off >= 0x820 and off < 0x828) { return mdecRead16(bus.mdec, bus.mdecOut, off - 0x820); }
-    if (off >= 0xC00 and off < 0x1000) { return spuRead16(bus.spu, bus.spuram, off - 0xC00); }
+    match (off) {
+        0x040..=0x04F { return padRead16(bus.pad, bus.mcd, bus.mcdRam, off - 0x040); }
+        0x050..=0x05F { return sio1Read16(bus.sio1, off - 0x050); }
+        0x070..=0x07F { return irqRead16(bus.irq, off - 0x070); }
+        0x080..=0x0FF { return dmaRead16(bus.dma, off - 0x080); }
+        0x100..=0x12F { return timerRead16(bus.timer, off - 0x100); }
+        0x800..=0x803 { return cdromRead16(bus.cdrom, off - 0x800); }
+        0x810..=0x817 { return gpuRead16(bus.gpu, bus.vram, off - 0x810); }
+        0x820..=0x827 { return mdecRead16(bus.mdec, bus.mdecOut, off - 0x820); }
+        0xC00..=0xFFF { return spuRead16(bus.spu, bus.spuram, off - 0xC00); }
+        _ {}
+    }
     if (off >= IO_SIZE) { return 0; }
     return bufRead16(bus.io, off);
 }
 
 pub fn ioRead8(bus: Bus, off: u32) u32 {
-    if (off >= 0x040 and off < 0x050) { return padRead8(bus.pad, bus.mcd, bus.mcdRam, off - 0x040); }
-    if (off >= 0x050 and off < 0x060) { return sio1Read8(bus.sio1, off - 0x050); }
-    if (off >= 0x070 and off < 0x080) { return irqRead8(bus.irq, off - 0x070); }
-    if (off >= 0x080 and off < 0x100) { return dmaRead8(bus.dma, off - 0x080); }
-    if (off >= 0x100 and off < 0x130) { return timerRead8(bus.timer, off - 0x100); }
-    if (off >= 0x800 and off < 0x804) { return cdromRead8(bus.cdrom, off - 0x800); }
-    if (off >= 0x810 and off < 0x818) { return gpuRead8(bus.gpu, bus.vram, off - 0x810); }
-    if (off >= 0x820 and off < 0x828) { return mdecRead8(bus.mdec, bus.mdecOut, off - 0x820); }
-    if (off >= 0xC00 and off < 0x1000) { return spuRead8(bus.spu, bus.spuram, off - 0xC00); }
+    match (off) {
+        0x040..=0x04F { return padRead8(bus.pad, bus.mcd, bus.mcdRam, off - 0x040); }
+        0x050..=0x05F { return sio1Read8(bus.sio1, off - 0x050); }
+        0x070..=0x07F { return irqRead8(bus.irq, off - 0x070); }
+        0x080..=0x0FF { return dmaRead8(bus.dma, off - 0x080); }
+        0x100..=0x12F { return timerRead8(bus.timer, off - 0x100); }
+        0x800..=0x803 { return cdromRead8(bus.cdrom, off - 0x800); }
+        0x810..=0x817 { return gpuRead8(bus.gpu, bus.vram, off - 0x810); }
+        0x820..=0x827 { return mdecRead8(bus.mdec, bus.mdecOut, off - 0x820); }
+        0xC00..=0xFFF { return spuRead8(bus.spu, bus.spuram, off - 0xC00); }
+        _ {}
+    }
     if (off >= IO_SIZE) { return 0; }
     return bufRead8(bus.io, off);
 }
@@ -293,43 +302,52 @@ pub fn ioRead8(bus: Bus, off: u32) u32 {
 // irq writes need cop0 to keep the COP0 cause register coherent. We
 // require those parameters at the outer interface.
 pub fn ioWrite32(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
-    if (off >= 0x040 and off < 0x050) { padWrite32(bus.pad, bus.mcd, off - 0x040, val); return; }
-    if (off >= 0x050 and off < 0x060) { sio1Write32(bus.sio1, off - 0x050, val); return; }
-    if (off >= 0x070 and off < 0x080) { irqWrite32(bus.irq, cop0, off - 0x070, val); return; }
-    if (off >= 0x080 and off < 0x100) { dmaWrite32(bus.dma, bus, cop0, off - 0x080, val); return; }
-    if (off >= 0x100 and off < 0x130) { timerWrite32(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
-    if (off >= 0x800 and off < 0x804) { cdromWrite32(bus.cdrom, off - 0x800, val); return; }
-    if (off >= 0x810 and off < 0x818) { gpuWrite32(bus.gpu, bus.vram, off - 0x810, val); return; }
-    if (off >= 0x820 and off < 0x828) { mdecWrite32(bus.mdec, bus.mdecIn, bus.mdecOut, off - 0x820, val); return; }
-    if (off >= 0xC00 and off < 0x1000) { spuWrite32(bus.spu, bus.spuram, off - 0xC00, val); return; }
+    match (off) {
+        0x040..=0x04F { padWrite32(bus.pad, bus.mcd, off - 0x040, val); return; }
+        0x050..=0x05F { sio1Write32(bus.sio1, off - 0x050, val); return; }
+        0x070..=0x07F { irqWrite32(bus.irq, cop0, off - 0x070, val); return; }
+        0x080..=0x0FF { dmaWrite32(bus.dma, bus, cop0, off - 0x080, val); return; }
+        0x100..=0x12F { timerWrite32(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
+        0x800..=0x803 { cdromWrite32(bus.cdrom, off - 0x800, val); return; }
+        0x810..=0x817 { gpuWrite32(bus.gpu, bus.vram, off - 0x810, val); return; }
+        0x820..=0x827 { mdecWrite32(bus.mdec, bus.mdecIn, bus.mdecOut, off - 0x820, val); return; }
+        0xC00..=0xFFF { spuWrite32(bus.spu, bus.spuram, off - 0xC00, val); return; }
+        _ {}
+    }
     if (off >= IO_SIZE) { return; }
     bufWrite32(bus.io, off, val);
 }
 
 pub fn ioWrite16(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
-    if (off >= 0x040 and off < 0x050) { padWrite16(bus.pad, bus.mcd, off - 0x040, val); return; }
-    if (off >= 0x050 and off < 0x060) { sio1Write16(bus.sio1, off - 0x050, val); return; }
-    if (off >= 0x070 and off < 0x080) { irqWrite16(bus.irq, cop0, off - 0x070, val); return; }
-    if (off >= 0x080 and off < 0x100) { dmaWrite16(bus.dma, bus, cop0, off - 0x080, val); return; }
-    if (off >= 0x100 and off < 0x130) { timerWrite16(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
-    if (off >= 0x800 and off < 0x804) { cdromWrite16(bus.cdrom, off - 0x800, val); return; }
-    if (off >= 0x810 and off < 0x818) { gpuWrite16(bus.gpu, bus.vram, off - 0x810, val); return; }
-    if (off >= 0x820 and off < 0x828) { mdecWrite16(bus.mdec, bus.mdecIn, bus.mdecOut, off - 0x820, val); return; }
-    if (off >= 0xC00 and off < 0x1000) { spuWrite16(bus.spu, bus.spuram, off - 0xC00, val); return; }
+    match (off) {
+        0x040..=0x04F { padWrite16(bus.pad, bus.mcd, off - 0x040, val); return; }
+        0x050..=0x05F { sio1Write16(bus.sio1, off - 0x050, val); return; }
+        0x070..=0x07F { irqWrite16(bus.irq, cop0, off - 0x070, val); return; }
+        0x080..=0x0FF { dmaWrite16(bus.dma, bus, cop0, off - 0x080, val); return; }
+        0x100..=0x12F { timerWrite16(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
+        0x800..=0x803 { cdromWrite16(bus.cdrom, off - 0x800, val); return; }
+        0x810..=0x817 { gpuWrite16(bus.gpu, bus.vram, off - 0x810, val); return; }
+        0x820..=0x827 { mdecWrite16(bus.mdec, bus.mdecIn, bus.mdecOut, off - 0x820, val); return; }
+        0xC00..=0xFFF { spuWrite16(bus.spu, bus.spuram, off - 0xC00, val); return; }
+        _ {}
+    }
     if (off >= IO_SIZE) { return; }
     bufWrite16(bus.io, off, val);
 }
 
 pub fn ioWrite8(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
-    if (off >= 0x040 and off < 0x050) { padWrite8(bus.pad, bus.mcd, off - 0x040, val); return; }
-    if (off >= 0x050 and off < 0x060) { sio1Write8(bus.sio1, off - 0x050, val); return; }
-    if (off >= 0x070 and off < 0x080) { irqWrite8(bus.irq, cop0, off - 0x070, val); return; }
-    if (off >= 0x080 and off < 0x100) { dmaWrite8(bus.dma, bus, cop0, off - 0x080, val); return; }
-    if (off >= 0x100 and off < 0x130) { timerWrite8(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
-    if (off >= 0x800 and off < 0x804) { cdromWrite8(bus.cdrom, off - 0x800, val); return; }
-    if (off >= 0x810 and off < 0x818) { gpuWrite8(bus.gpu, bus.vram, off - 0x810, val); return; }
-    if (off >= 0x820 and off < 0x828) { mdecWrite8(bus.mdec, bus.mdecIn, bus.mdecOut, off - 0x820, val); return; }
-    if (off >= 0xC00 and off < 0x1000) { spuWrite8(bus.spu, bus.spuram, off - 0xC00, val); return; }
+    match (off) {
+        0x040..=0x04F { padWrite8(bus.pad, bus.mcd, off - 0x040, val); return; }
+        0x050..=0x05F { sio1Write8(bus.sio1, off - 0x050, val); return; }
+        0x070..=0x07F { irqWrite8(bus.irq, cop0, off - 0x070, val); return; }
+        0x080..=0x0FF { dmaWrite8(bus.dma, bus, cop0, off - 0x080, val); return; }
+        0x100..=0x12F { timerWrite8(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
+        0x800..=0x803 { cdromWrite8(bus.cdrom, off - 0x800, val); return; }
+        0x810..=0x817 { gpuWrite8(bus.gpu, bus.vram, off - 0x810, val); return; }
+        0x820..=0x827 { mdecWrite8(bus.mdec, bus.mdecIn, bus.mdecOut, off - 0x820, val); return; }
+        0xC00..=0xFFF { spuWrite8(bus.spu, bus.spuram, off - 0xC00, val); return; }
+        _ {}
+    }
     if (off >= IO_SIZE) { return; }
     bufWrite8(bus.io, off, val);
 }
@@ -341,59 +359,74 @@ pub fn ioWrite8(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
 pub fn busRead32(bus: Bus, addr: u32) u32 {
     const paddr: u32 = addr & regionMask(addr);
     const r: BusRoute = route(paddr);
-    if (r.kind == 1) { return bufRead32(bus.ram,  r.off & (RAM_SIZE  - 1)); }
-    if (r.kind == 2) { return bufRead32(bus.bios, r.off & (BIOS_SIZE - 1)); }
-    if (r.kind == 3) { return bufRead32(bus.spad, r.off & (SPAD_SIZE - 1)); }
-    if (r.kind == 4) { return ioRead32(bus, r.off); }
-    // kind 5: EXP1 (no cart loaded) — psxe exp1.c reads return 0xFF per byte.
-    if (r.kind == 5) { return 0xFFFFFFFF; }
-    return 0;
+    match (r.kind) {
+        1 { return bufRead32(bus.ram,  r.off & (RAM_SIZE  - 1)); }
+        2 { return bufRead32(bus.bios, r.off & (BIOS_SIZE - 1)); }
+        3 { return bufRead32(bus.spad, r.off & (SPAD_SIZE - 1)); }
+        4 { return ioRead32(bus, r.off); }
+        // kind 5: EXP1 (no cart loaded) — psxe exp1.c reads return 0xFF per byte.
+        5 { return 0xFFFFFFFF; }
+        _ { return 0; }
+    }
 }
 
 pub fn busRead16(bus: Bus, addr: u32) u32 {
     const paddr: u32 = addr & regionMask(addr);
     const r: BusRoute = route(paddr);
-    if (r.kind == 1) { return bufRead16(bus.ram,  r.off & (RAM_SIZE  - 1)); }
-    if (r.kind == 2) { return bufRead16(bus.bios, r.off & (BIOS_SIZE - 1)); }
-    if (r.kind == 3) { return bufRead16(bus.spad, r.off & (SPAD_SIZE - 1)); }
-    if (r.kind == 4) { return ioRead16(bus, r.off); }
-    if (r.kind == 5) { return 0xFFFF; }
-    return 0;
+    match (r.kind) {
+        1 { return bufRead16(bus.ram,  r.off & (RAM_SIZE  - 1)); }
+        2 { return bufRead16(bus.bios, r.off & (BIOS_SIZE - 1)); }
+        3 { return bufRead16(bus.spad, r.off & (SPAD_SIZE - 1)); }
+        4 { return ioRead16(bus, r.off); }
+        5 { return 0xFFFF; }
+        _ { return 0; }
+    }
 }
 
 pub fn busRead8(bus: Bus, addr: u32) u32 {
     const paddr: u32 = addr & regionMask(addr);
     const r: BusRoute = route(paddr);
-    if (r.kind == 1) { return bufRead8(bus.ram,  r.off & (RAM_SIZE  - 1)); }
-    if (r.kind == 2) { return bufRead8(bus.bios, r.off & (BIOS_SIZE - 1)); }
-    if (r.kind == 3) { return bufRead8(bus.spad, r.off & (SPAD_SIZE - 1)); }
-    if (r.kind == 4) { return ioRead8(bus, r.off); }
-    if (r.kind == 5) { return 0xFF; }
-    return 0;
+    match (r.kind) {
+        1 { return bufRead8(bus.ram,  r.off & (RAM_SIZE  - 1)); }
+        2 { return bufRead8(bus.bios, r.off & (BIOS_SIZE - 1)); }
+        3 { return bufRead8(bus.spad, r.off & (SPAD_SIZE - 1)); }
+        4 { return ioRead8(bus, r.off); }
+        5 { return 0xFF; }
+        _ { return 0; }
+    }
 }
 
 pub fn busWrite32(bus: Bus, cop0: *mut[] u32, addr: u32, val: u32) {
     const paddr: u32 = addr & regionMask(addr);
     const r: BusRoute = route(paddr);
-    if (r.kind == 1) { bufWrite32(bus.ram,  r.off & (RAM_SIZE  - 1), val); return; }
-    if (r.kind == 3) { bufWrite32(bus.spad, r.off & (SPAD_SIZE - 1), val); return; }
-    if (r.kind == 4) { ioWrite32(bus, cop0, r.off, val); return; }
+    match (r.kind) {
+        1 { bufWrite32(bus.ram,  r.off & (RAM_SIZE  - 1), val); }
+        3 { bufWrite32(bus.spad, r.off & (SPAD_SIZE - 1), val); }
+        4 { ioWrite32(bus, cop0, r.off, val); }
+        _ {}
+    }
 }
 
 pub fn busWrite16(bus: Bus, cop0: *mut[] u32, addr: u32, val: u32) {
     const paddr: u32 = addr & regionMask(addr);
     const r: BusRoute = route(paddr);
-    if (r.kind == 1) { bufWrite16(bus.ram,  r.off & (RAM_SIZE  - 1), val); return; }
-    if (r.kind == 3) { bufWrite16(bus.spad, r.off & (SPAD_SIZE - 1), val); return; }
-    if (r.kind == 4) { ioWrite16(bus, cop0, r.off, val); return; }
+    match (r.kind) {
+        1 { bufWrite16(bus.ram,  r.off & (RAM_SIZE  - 1), val); }
+        3 { bufWrite16(bus.spad, r.off & (SPAD_SIZE - 1), val); }
+        4 { ioWrite16(bus, cop0, r.off, val); }
+        _ {}
+    }
 }
 
 pub fn busWrite8(bus: Bus, cop0: *mut[] u32, addr: u32, val: u32) {
     const paddr: u32 = addr & regionMask(addr);
     const r: BusRoute = route(paddr);
-    if (r.kind == 1) { bufWrite8(bus.ram,  r.off & (RAM_SIZE  - 1), val); return; }
-    if (r.kind == 3) { bufWrite8(bus.spad, r.off & (SPAD_SIZE - 1), val); return; }
-    if (r.kind == 4) { ioWrite8(bus, cop0, r.off, val); return; }
+    match (r.kind) {
+        1 { bufWrite8(bus.ram,  r.off & (RAM_SIZE  - 1), val); }
+        3 { bufWrite8(bus.spad, r.off & (SPAD_SIZE - 1), val); }
+        4 { ioWrite8(bus, cop0, r.off, val); }
+        _ {}
+    }
 }
 
 // Direct buffer accessors.

@@ -80,14 +80,32 @@ pub fn gpuFamilyCount(g: *mut[] u32, family: u32) u32 {
 // pixels. These helpers convert between a (x, y) pair and a VRAM byte
 // offset and read/write a single pixel.
 pub fn vramWritePixel(vram: *mut[] u8, x: u32, y: u32, bgr555: u32) {
-    if (x >= 1024 or y >= 512) { return; }
+    if (x >= 1024 || y >= 512) { return; }
     const off: u32 = (y * 1024 + x) * 2;
     vram[off]     = (bgr555         & 0xFF) as u8;
     vram[off + 1] = ((bgr555 >> 8)  & 0xFF) as u8;
 }
 
+// Mask-bit-aware write. Honors GP0(0xE6) state from `g[58]` (set-mask =
+// always OR 0x8000 into the written value) and `g[59]` (check-mask =
+// skip if destination already has bit 15 set). Used by command paths
+// that draw pixels — the raw `vramWritePixel` stays available for paths
+// where the GPU command logic intentionally bypasses the mask.
+pub fn vramWritePixelMasked(g: *mut[] u32, vram: *mut[] u8, x: u32, y: u32, bgr555: u32) {
+    if (x >= 1024 || y >= 512) { return; }
+    if (g[59] != 0) {
+        const cur: u32 = vramReadPixel(vram, x, y);
+        if ((cur & 0x8000) != 0) { return; }
+    }
+    var v: u32 = bgr555;
+    if (g[58] != 0) { v = v | 0x8000; }
+    const off: u32 = (y * 1024 + x) * 2;
+    vram[off]     = (v        & 0xFF) as u8;
+    vram[off + 1] = ((v >> 8) & 0xFF) as u8;
+}
+
 pub fn vramReadPixel(vram: *mut[] u8, x: u32, y: u32) u32 {
-    if (x >= 1024 or y >= 512) { return 0; }
+    if (x >= 1024 || y >= 512) { return 0; }
     const off: u32 = (y * 1024 + x) * 2;
     return (vram[off] as u32) | ((vram[off + 1] as u32) << 8);
 }
@@ -131,6 +149,9 @@ pub fn gpuRead8(g: *mut[] u32, vram: *mut[] u8, off: u32) u32 {
 }
 
 // Pack two adjacent VRAM pixels into a single u32 for the GPUREAD port.
+// For odd-pixel transfers (e.g. 1×1), the high 16 bits are zero — real
+// hardware doesn't read past the rect bounds. ps1-tests gpu/mask-bit
+// verifies this with `vramGet(x,y) == 0x8000` after a single-pixel write.
 pub fn vramPackTwo(g: *mut[] u32, vram: *mut[] u8) u32 {
     const baseX: u32 = g[43] & 0x3FF;
     const baseY: u32 = (g[43] >> 10) & 0x1FF;
@@ -139,19 +160,29 @@ pub fn vramPackTwo(g: *mut[] u32, vram: *mut[] u8) u32 {
     var data: u32 = vramReadPixel(vram, x0, y0);
     g[38] = g[38] + 1;
     if (g[38] == g[40]) { g[39] = g[39] + 1; g[38] = 0; }
-    var x1: u32 = (baseX + g[38]) & 0x3FF;
-    var y1: u32 = (baseY + g[39]) & 0x1FF;
-    data = data | (vramReadPixel(vram, x1, y1) << 16);
-    g[38] = g[38] + 1;
-    if (g[38] == g[40]) { g[39] = g[39] + 1; g[38] = 0; }
+    g[45] = g[45] - 1;
+    // Second half-pixel: only fetch if at least one more real pixel
+    // remains in the transfer. Odd-sized reads (e.g. 1×1) leave the
+    // high half of the final word as zero.
+    if (g[45] > 0) {
+        var x1: u32 = (baseX + g[38]) & 0x3FF;
+        var y1: u32 = (baseY + g[39]) & 0x1FF;
+        data = data | (vramReadPixel(vram, x1, y1) << 16);
+        g[38] = g[38] + 1;
+        if (g[38] == g[40]) { g[39] = g[39] + 1; g[38] = 0; }
+        g[45] = g[45] - 1;
+    }
     return data;
 }
 
 // ---------- GP0 (command/data) writes ----------------------------------
 
 pub fn gpuWrite32(g: *mut[] u32, vram: *mut[] u8, off: u32, val: u32) {
-    if (off == 0x00) { gpuGp0(g, vram, val); return; }
-    if (off == 0x04) { gpuGp1(g, val); return; }
+    match (off) {
+        0x00 { gpuGp0(g, vram, val); }
+        0x04 { gpuGp1(g, val); }
+        _    {}
+    }
 }
 
 pub fn gpuWrite16(g: *mut[] u32, vram: *mut[] u8, off: u32, val: u32) {
@@ -185,61 +216,48 @@ pub fn gpuGp0(g: *mut[] u32, vram: *mut[] u8, val: u32) {
 
 // GP1 (control) — display enable, DMA direction, display area, etc.
 pub fn gpuGp1(g: *mut[] u32, val: u32) {
-    const cmd: u32 = (val >> 24) & 0xFF;
-    if (cmd == 0x00) {
-        // psxe ignores GP1(0x00) (gpu.c:1841-1874 switch has no case 0).
-        // Our previous clobber of gpustat to 0x14802000 wiped texpage /
-        // display-enable bits accumulated from prior GP0 commands —
-        // diff-trace showed Musashi reading GPUSTAT and getting the
-        // wrong value at PC=0x8005C204 after BIOS GPU init. Just reset
-        // the command-buffer state; leave gpustat alone.
-        g[19] = GP_RECV_CMD;
-        g[16] = 0;
-        g[17] = 0;
-        g[18] = 0;
-        return;
-    }
-    if (cmd == 0x01) {
-        // Reset command buffer.
-        g[19] = GP_RECV_CMD;
-        g[16] = 0;
-        g[17] = 0;
-        g[18] = 0;
-        return;
-    }
-    if (cmd == 0x02) {
+    match ((val >> 24) & 0xFF) {
+        // GP1(0x00): psxe ignores it (gpu.c:1841-1874 switch has no case 0).
+        // A previous clobber of gpustat wiped texpage / display-enable bits
+        // accumulated from prior GP0 commands; diff-trace showed Musashi
+        // reading GPUSTAT and getting the wrong value at PC=0x8005C204.
+        // Just reset the command-buffer state; leave gpustat alone.
+        0x00 | 0x01 {
+            g[19] = GP_RECV_CMD;
+            g[16] = 0;
+            g[17] = 0;
+            g[18] = 0;
+        }
         // Acknowledge GPU IRQ (clear bit 24 of GPUSTAT).
-        g[46] = g[46] & (~0x01000000);
-        return;
-    }
-    if (cmd == 0x03) {
+        0x02 { g[46] = g[46] & (~0x01000000); }
         // Display enable: bit 23 of GPUSTAT = 1 when disabled (psxe).
-        g[46] = g[46] & (~0x00800000);
-        g[46] = g[46] | ((val << 23) & 0x00800000);
-        return;
-    }
-    if (cmd == 0x04) {
+        0x03 {
+            g[46] = g[46] & (~0x00800000);
+            g[46] = g[46] | ((val << 23) & 0x00800000);
+        }
         // DMA direction — stored in GPUSTAT bits 30..29.
-        g[46] = (g[46] & (~0x60000000)) | ((val & 3) << 29);
-        return;
+        0x04 { g[46] = (g[46] & (~0x60000000)) | ((val & 3) << 29); }
+        0x05 {
+            g[63] = val & 0x3FF;
+            g[64] = (val >> 10) & 0x1FF;
+        }
+        0x06 {
+            g[65] = val & 0xFFF;
+            g[66] = (val >> 12) & 0xFFF;
+        }
+        0x07 {
+            g[67] = val & 0x1FF;
+            g[68] = (val >> 10) & 0x1FF;
+        }
+        0x08 { g[47] = val & 0xFFFFFF; }
+        // GP1(0x09) — Allow Texture Disable. Stores the allow flag in g[71];
+        // GPUSTAT.15 is NOT updated immediately (ps1-tests
+        // testUnsetAllowTextureDisablePreservesBit verifies that the
+        // current bit-15 stays put until the next GP0_E1 write).
+        0x09 { g[71] = val & 1; }
+        0x10 { g[44] = val & 7; }
+        _    {}
     }
-    if (cmd == 0x05) {
-        g[63] = val & 0x3FF;
-        g[64] = (val >> 10) & 0x1FF;
-        return;
-    }
-    if (cmd == 0x06) {
-        g[65] = val & 0xFFF;
-        g[66] = (val >> 12) & 0xFFF;
-        return;
-    }
-    if (cmd == 0x07) {
-        g[67] = val & 0x1FF;
-        g[68] = (val >> 10) & 0x1FF;
-        return;
-    }
-    if (cmd == 0x08) { g[47] = val & 0xFFFFFF; return; }
-    if (cmd == 0x10) { g[44] = val & 7; return; }
 }
 
 // GP0 command parser — branches on the top three bits of buf[0] for
@@ -256,64 +274,84 @@ pub fn gpuUpdateCmd(g: *mut[] u32, vram: *mut[] u8) {
         g[72 + family] = g[72 + family] + 1;
     }
 
-    if (family == 1) { gpuPolyCmd(g, vram); return; }
-    if (family == 2) { gpuLineCmd(g, vram); return; }
-    if (family == 3) { gpuRectCmd(g, vram); return; }
+    match (family) {
+        1 { gpuPolyCmd(g, vram); return; }
+        2 { gpuLineCmd(g, vram); return; }
+        3 { gpuRectCmd(g, vram); return; }
+        _ {}
+    }
 
-    // family 0 — misc commands and drawing settings.
-    if (cmd == 0x00) { g[19] = GP_RECV_CMD; return; }   // nop
-    if (cmd == 0x01) { g[19] = GP_RECV_CMD; return; }   // clear cache
-    if (cmd == 0x02) { gpuFillRect(g, vram); return; }
+    match (cmd) {
+        // family 0 — misc commands and drawing settings.
+        0x00 | 0x01 { g[19] = GP_RECV_CMD; return; }   // nop / clear cache
+        0x02        { gpuFillRect(g, vram); return; }
 
-    // family 7 (drawing settings) — single-word commands.
-    if (cmd == 0xE1) {
-        g[46] = (g[46] & 0xFFFFF800) | (g[0] & 0x7FF);
-        g[60] = (g[46] & 0xF) << 6;
-        g[61] = (g[46] & 0x10) << 4;
-        g[62] = (g[46] >> 7) & 3;
-        g[19] = GP_RECV_CMD;
-        return;
-    }
-    if (cmd == 0xE2) {
-        g[54] = (g[0] & 0x1F) << 3;
-        g[55] = ((g[0] >> 5) & 0x1F) << 3;
-        g[56] = ((g[0] >> 10) & 0x1F) << 3;
-        g[57] = ((g[0] >> 15) & 0x1F) << 3;
-        g[19] = GP_RECV_CMD;
-        return;
-    }
-    if (cmd == 0xE3) {
-        g[48] = g[0] & 0x3FF;
-        g[49] = (g[0] >> 10) & 0x1FF;
-        g[19] = GP_RECV_CMD;
-        return;
-    }
-    if (cmd == 0xE4) {
-        g[50] = g[0] & 0x3FF;
-        g[51] = (g[0] >> 10) & 0x1FF;
-        g[19] = GP_RECV_CMD;
-        return;
-    }
-    if (cmd == 0xE5) {
-        // Sign-extend the 11-bit signed offsets.
-        var ox: u32 = g[0] & 0x7FF;
-        var oy: u32 = (g[0] >> 11) & 0x7FF;
-        if ((ox & 0x400) != 0) { ox = ox | 0xFFFFF800; }
-        if ((oy & 0x400) != 0) { oy = oy | 0xFFFFF800; }
-        g[52] = ox;
-        g[53] = oy;
-        g[19] = GP_RECV_CMD;
-        return;
-    }
-    if (cmd == 0xE6) { g[19] = GP_RECV_CMD; return; }
+        // family 7 (drawing settings) — single-word commands.
+        0xE1 {
+            g[46] = (g[46] & 0xFFFFF800) | (g[0] & 0x7FF);
+            // Latch E1.bit11 unconditionally into g[70] (the "raw" texture-
+            // disable input). GPUSTAT.15 is the gated output: g[71] & g[70].
+            // GP1(0x09) updates the gate without touching g[70].
+            g[70] = (g[0] >> 11) & 1;
+            g[46] = (g[46] & 0xFFFF7FFF) | ((g[71] & g[70]) << 15);
+            g[60] = (g[46] & 0xF) << 6;
+            g[61] = (g[46] & 0x10) << 4;
+            g[62] = (g[46] >> 7) & 3;
+            g[19] = GP_RECV_CMD;
+            return;
+        }
+        0xE2 {
+            g[54] = (g[0] & 0x1F) << 3;
+            g[55] = ((g[0] >> 5) & 0x1F) << 3;
+            g[56] = ((g[0] >> 10) & 0x1F) << 3;
+            g[57] = ((g[0] >> 15) & 0x1F) << 3;
+            g[19] = GP_RECV_CMD;
+            return;
+        }
+        0xE3 {
+            g[48] = g[0] & 0x3FF;
+            g[49] = (g[0] >> 10) & 0x1FF;
+            g[19] = GP_RECV_CMD;
+            return;
+        }
+        0xE4 {
+            g[50] = g[0] & 0x3FF;
+            g[51] = (g[0] >> 10) & 0x1FF;
+            g[19] = GP_RECV_CMD;
+            return;
+        }
+        0xE5 {
+            // Sign-extend the 11-bit signed offsets.
+            var ox: u32 = g[0] & 0x7FF;
+            var oy: u32 = (g[0] >> 11) & 0x7FF;
+            if ((ox & 0x400) != 0) { ox = ox | 0xFFFFF800; }
+            if ((oy & 0x400) != 0) { oy = oy | 0xFFFFF800; }
+            g[52] = ox;
+            g[53] = oy;
+            g[19] = GP_RECV_CMD;
+            return;
+        }
+        0xE6 {
+            // GP0(0xE6) — Mask Bit Setting. Two bits matter:
+            //   bit 0: Set Mask while drawing (force pixel bit 15 = 1)
+            //   bit 1: Check Mask before draw (skip if existing pixel bit 15 = 1)
+            // These reflect into GPUSTAT bits 11 and 12 respectively. ps1-tests
+            // gpu/mask-bit verifies write-back of the 0x8000 pixel bit.
+            g[46] = (g[46] & 0xFFFFE7FF) | (((g[0] & 0x03) << 11) & 0x1800);
+            g[58] = g[0] & 0x01;            // set-mask flag (raster-time)
+            g[59] = (g[0] >> 1) & 0x01;     // check-mask flag
+            g[19] = GP_RECV_CMD;
+            return;
+        }
 
-    // VRAM blits.
-    if (cmd == 0x80) { gpuVramToVram(g, vram); return; }
-    if (cmd == 0xA0) { gpuCpuToVram(g, vram); return; }
-    if (cmd == 0xC0) { gpuVramToCpu(g, vram); return; }
+        // VRAM blits.
+        0x80 { gpuVramToVram(g, vram); return; }
+        0xA0 { gpuCpuToVram(g, vram); return; }
+        0xC0 { gpuVramToCpu(g, vram); return; }
 
-    // Unrecognized — drop and return to idle to avoid a permanent stall.
-    g[19] = GP_RECV_CMD;
+        // Unrecognized — drop and return to idle to avoid a permanent stall.
+        _    { g[19] = GP_RECV_CMD; }
+    }
 }
 
 // 0x02 fill rect in VRAM. The colour is taken straight from buf[0]
@@ -393,15 +431,16 @@ pub fn gpuCpuToVram(g: *mut[] u32, vram: *mut[] u8) {
         g[19] = GP_RECV_DATA;
         return;
     }
-    // RECV_DATA — one 32-bit word delivers two VRAM pixels.
+    // RECV_DATA — one 32-bit word delivers two VRAM pixels. Honor mask-
+    // bit semantics so GP0(0xE6) actually does something visible.
     const x0: u32 = (g[22] + g[28]) & 0x3FF;
     const y0: u32 = (g[23] + g[29]) & 0x1FF;
-    vramWritePixel(vram, x0, y0, g[20] & 0xFFFF);
+    vramWritePixelMasked(g, vram, x0, y0, g[20] & 0xFFFF);
     g[28] = g[28] + 1;
     if (g[28] == g[24]) { g[29] = g[29] + 1; g[28] = 0; }
     const x1: u32 = (g[22] + g[28]) & 0x3FF;
     const y1: u32 = (g[23] + g[29]) & 0x1FF;
-    vramWritePixel(vram, x1, y1, (g[20] >> 16) & 0xFFFF);
+    vramWritePixelMasked(g, vram, x1, y1, (g[20] >> 16) & 0xFFFF);
     g[28] = g[28] + 1;
     if (g[28] == g[24]) { g[29] = g[29] + 1; g[28] = 0; }
     g[26] = g[26] - 2;
@@ -433,6 +472,10 @@ pub fn gpuVramToCpu(g: *mut[] u32, vram: *mut[] u8) {
     g[41] = ys;
     g[42] = ((xs * ys) + 1) & 0xFFFFFFFE;
     g[43] = x0 | (y0 << 10);
+    // Track ACTUAL pixel count so vramPackTwo knows when the last word
+    // carries a single real pixel + a zero padding half (e.g. for 1×1
+    // reads). g[42] is rounded UP to even; g[45] keeps the true count.
+    g[45] = xs * ys;
     g[19] = GP_RECV_CMD;
 }
 
@@ -514,7 +557,7 @@ pub fn gpuTopLeftRule(z: i64, ax: u32, ay: u32, bx: u32, by: u32) bool {
     const axs: i64 = sext32(ax);
     const bxs: i64 = sext32(bx);
     if (bys > ays) { return true; }
-    if (bys == ays and bxs < axs) { return true; }
+    if (bys == ays && bxs < axs) { return true; }
     return false;
 }
 
@@ -571,7 +614,7 @@ pub fn gpuFlatTriangle(g: *mut[] u32, vram: *mut[] u8,
     const dy2: u32 = g[51];
 
     // Bail on pathologically large bounding boxes (PSX hardware caps).
-    if (sext32(xmax - xmin) > 1024 or sext32(ymax - ymin) > 512) { return; }
+    if (sext32(xmax - xmin) > 1024 || sext32(ymax - ymin) > 512) { return; }
 
     // Use signed comparisons throughout. The drawing-area registers
     // are non-negative, so an unsigned `x >= dx1` would erroneously
@@ -581,13 +624,13 @@ pub fn gpuFlatTriangle(g: *mut[] u32, vram: *mut[] u8,
     while (sext32(y) <= sext32(ymax)) {
         var x: u32 = xmin;
         while (sext32(x) <= sext32(xmax)) {
-            if (sext32(x) >= sext32(dx1) and sext32(x) <= sext32(dx2) and
-                sext32(y) >= sext32(dy1) and sext32(y) <= sext32(dy2)) {
+            if (sext32(x) >= sext32(dx1) && sext32(x) <= sext32(dx2) &&
+                sext32(y) >= sext32(dy1) && sext32(y) <= sext32(dy2)) {
                 const z0: i64 = gpuEdge(bx, by, cx, cy, x, y);
                 const z1: i64 = gpuEdge(cx, cy, ax, ay, x, y);
                 const z2: i64 = gpuEdge(ax, ay, bx, by, x, y);
-                if (!gpuTopLeftRule(z0, bx, by, cx, cy) and
-                    !gpuTopLeftRule(z1, cx, cy, ax, ay) and
+                if (!gpuTopLeftRule(z0, bx, by, cx, cy) &&
+                    !gpuTopLeftRule(z1, cx, cy, ax, ay) &&
                     !gpuTopLeftRule(z2, ax, ay, bx, by)) {
                     vramWritePixel(vram, x & 0x3FF, y & 0x1FF, color);
                 }
@@ -654,7 +697,7 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
     //   mono shaded     buf[0]=col0+cmd, then per-vert (xy, colN+pad)
     //   tex shaded      buf[0]=col0+cmd, then per-vert (xy, page/clut+uv, colN)
     // The shaded textured layout matches psxe gpu_cmd_3c.
-    if (isTex and isGour) {
+    if (isTex && isGour) {
         // texture + gouraud (cmd 0x34, 0x3C, 0x3E)
         v0x = gpuVertX(g[1]); v0y = gpuVertY(g[1]);
         uu0 = g[2] & 0xFF;  vv0 = (g[2] >> 8) & 0xFF;
@@ -673,7 +716,13 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
         // bits 0-8 from the polygon's tpage byte. Without this, GPUSTAT
         // texpage bits drift from psxe's value (diff trace at instruction
         // 470014 confirmed this is the source).
+        // Undocumented behaviour: textured polys also update GPUSTAT
+        // bits 0-8 from the tpage byte, and (when GP1(0x09) "allow
+        // texture disable" is on) also drive bit 15 from tpage bit 11.
+        // ps1-tests gpu/gp0-e1 testTexturedPolygonsTextureDisable verifies.
         g[46] = (g[46] & 0xFFFFFE00) | (page & 0x1FF);
+        g[70] = (page >> 11) & 1;
+        g[46] = (g[46] & 0xFFFF7FFF) | ((g[71] & g[70]) << 15);
         c2 = g[6] & 0xFFFFFF;
         v2x = gpuVertX(g[7]); v2y = gpuVertY(g[7]);
         uu2 = g[8] & 0xFF;  vv2 = (g[8] >> 8) & 0xFF;
@@ -695,7 +744,13 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
         tpx = (page & 0xF) << 6;
         tpy = (page & 0x10) << 4;
         depth = (page >> 7) & 3;
+        // Undocumented behaviour: textured polys also update GPUSTAT
+        // bits 0-8 from the tpage byte, and (when GP1(0x09) "allow
+        // texture disable" is on) also drive bit 15 from tpage bit 11.
+        // ps1-tests gpu/gp0-e1 testTexturedPolygonsTextureDisable verifies.
         g[46] = (g[46] & 0xFFFFFE00) | (page & 0x1FF);
+        g[70] = (page >> 11) & 1;
+        g[46] = (g[46] & 0xFFFF7FFF) | ((g[71] & g[70]) << 15);
         v2x = gpuVertX(g[5]); v2y = gpuVertY(g[5]);
         uu2 = g[6] & 0xFF;  vv2 = (g[6] >> 8) & 0xFF;
         if (isQuad) {
@@ -730,7 +785,7 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
     // untextured / shaded polys read it from GPUSTAT bits 5-6.
     const isTransp: bool = (flags & 0x02) != 0;
     var transpMode: u32 = (g[46] >> 5) & 3;
-    if (isTex and !isGour) {
+    if (isTex && !isGour) {
         const page: u32 = (g[4] >> 16) & 0xFFFF;
         transpMode = (page >> 5) & 3;
     }
@@ -792,7 +847,7 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
     const ymin: u32 = gpuMin3(ay, by, cy);
     const xmax: u32 = gpuMax3(ax, bx, cx);
     const ymax: u32 = gpuMax3(ay, by, cy);
-    if (sext32(xmax - xmin) > 1024 or sext32(ymax - ymin) > 512) { return; }
+    if (sext32(xmax - xmin) > 1024 || sext32(ymax - ymin) > 512) { return; }
 
     const absArea: i64 = gpuAbsI64(gpuEdge(ax, ay, bx, by, cx, cy));
     const dx1: u32 = g[48];
@@ -804,13 +859,13 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
     while (sext32(y) <= sext32(ymax)) {
         var x: u32 = xmin;
         while (sext32(x) <= sext32(xmax)) {
-            if (sext32(x) >= sext32(dx1) and sext32(x) <= sext32(dx2) and
-                sext32(y) >= sext32(dy1) and sext32(y) <= sext32(dy2)) {
+            if (sext32(x) >= sext32(dx1) && sext32(x) <= sext32(dx2) &&
+                sext32(y) >= sext32(dy1) && sext32(y) <= sext32(dy2)) {
                 const z0: i64 = gpuEdge(bx, by, cx, cy, x, y);
                 const z1: i64 = gpuEdge(cx, cy, ax, ay, x, y);
                 const z2: i64 = gpuEdge(ax, ay, bx, by, x, y);
-                if (!gpuTopLeftRule(z0, bx, by, cx, cy) and
-                    !gpuTopLeftRule(z1, cx, cy, ax, ay) and
+                if (!gpuTopLeftRule(z0, bx, by, cx, cy) &&
+                    !gpuTopLeftRule(z1, cx, cy, ax, ay) &&
                     !gpuTopLeftRule(z2, ax, ay, bx, by)) {
                     var color: u32 = 0;
                     if (isTex) {
@@ -836,7 +891,7 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
                         // Texel bit 15 → blend per transparency mode.
                         // For untextured polys, transparency applies
                         // unconditionally when isTransp is set.
-                        if (isTransp and (texel & 0x8000) != 0) {
+                        if (isTransp && (texel & 0x8000) != 0) {
                             const back: u32 = vramReadPixel(vram,
                                 x & 0x3FF, y & 0x1FF);
                             color = gpuBlend(color, back, transpMode);
@@ -899,22 +954,24 @@ pub fn gpuAbsI64(v: i64) i64 {
 // Values added to each interpolated channel before clamping reduce visible
 // banding on gouraud gradients (the BIOS's diamond logo uses this heavily).
 pub fn gpuDitherKernel(idx: u32) i64 {
-    if (idx == 0)  { return -4; }
-    if (idx == 1)  { return 0; }
-    if (idx == 2)  { return -3; }
-    if (idx == 3)  { return 1; }
-    if (idx == 4)  { return 2; }
-    if (idx == 5)  { return -2; }
-    if (idx == 6)  { return 3; }
-    if (idx == 7)  { return -1; }
-    if (idx == 8)  { return -3; }
-    if (idx == 9)  { return 1; }
-    if (idx == 10) { return -4; }
-    if (idx == 11) { return 0; }
-    if (idx == 12) { return 3; }
-    if (idx == 13) { return -1; }
-    if (idx == 14) { return 2; }
-    return -2;
+    match (idx) {
+        0  { return -4; }
+        1  { return  0; }
+        2  { return -3; }
+        3  { return  1; }
+        4  { return  2; }
+        5  { return -2; }
+        6  { return  3; }
+        7  { return -1; }
+        8  { return -3; }
+        9  { return  1; }
+        10 { return -4; }
+        11 { return  0; }
+        12 { return  3; }
+        13 { return -1; }
+        14 { return  2; }
+        _  { return -2; }
+    }
 }
 
 // Saturate one shaded channel: divide the barycentric numerator by the
@@ -1058,8 +1115,8 @@ pub fn gpuPlotPixel(g: *mut[] u32, vram: *mut[] u8,
     const dy1: i64 = sext32(g[49]);
     const dx2: i64 = sext32(g[50]);
     const dy2: i64 = sext32(g[51]);
-    if (x < dx1 or x > dx2 or y < dy1 or y > dy2) { return; }
-    if (x < 0 or x >= 1024 or y < 0 or y >= 512) { return; }
+    if (x < dx1 || x > dx2 || y < dy1 || y > dy2) { return; }
+    if (x < 0 || x >= 1024 || y < 0 || y >= 512) { return; }
     vramWritePixel(vram, (x as u32) & 0x3FF, (y as u32) & 0x1FF, color);
 }
 
@@ -1092,13 +1149,16 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
     }
     var w: u32 = 1;
     var h: u32 = 1;
-    if (sizeBits == 1) { w = 1;  h = 1;  }
-    if (sizeBits == 2) { w = 8;  h = 8;  }
-    if (sizeBits == 3) { w = 16; h = 16; }
-    if (sizeBits == 0) {
-        const sz: u32 = g[bufIdx];
-        w = sz & 0xFFFF;
-        h = (sz >> 16) & 0xFFFF;
+    match (sizeBits) {
+        1 { w = 1;  h = 1;  }
+        2 { w = 8;  h = 8;  }
+        3 { w = 16; h = 16; }
+        0 {
+            const sz: u32 = g[bufIdx];
+            w = sz & 0xFFFF;
+            h = (sz >> 16) & 0xFFFF;
+        }
+        _ {}
     }
     // psxe order: add the drawing offset first, *then* sign-extend
     // the 11-bit screen-space position. SE-after-offset is what the
@@ -1125,8 +1185,8 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
             while (ix < w) {
                 const px: i64 = sx + (ix as i64);
                 const py: i64 = sy + (iy as i64);
-                if (px >= dx1 and px <= dx2 and py >= dy1 and py <= dy2 and
-                    px >= 0 and px < 1024 and py >= 0 and py < 512) {
+                if (px >= dx1 && px <= dx2 && py >= dy1 && py <= dy2 &&
+                    px >= 0 && px < 1024 && py >= 0 && py < 512) {
                     var outColor: u32 = color;
                     if (isTransp) {
                         const back: u32 = vramReadPixel(vram,
@@ -1155,8 +1215,8 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
             while (ix < w) {
                 const px: i64 = sx + (ix as i64);
                 const py: i64 = sy + (iy as i64);
-                if (px >= dx1 and px <= dx2 and py >= dy1 and py <= dy2 and
-                    px >= 0 and px < 1024 and py >= 0 and py < 512) {
+                if (px >= dx1 && px <= dx2 && py >= dy1 && py <= dy2 &&
+                    px >= 0 && px < 1024 && py >= 0 && py < 512) {
                     const tx: u32 = (uu0 + ix) & 0xFF;
                     const ty: u32 = (vv0 + iy) & 0xFF;
                     const texel: u32 = gpuFetchTexel(vram, tx, ty, g[60], g[61],

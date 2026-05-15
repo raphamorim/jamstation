@@ -155,7 +155,7 @@ pub fn sdaWrite(p: *mut[] u8, data: u32) {
 pub fn padReadRx(p: *mut[] u8, mcd: *mut[] u8, mcdRam: *mut[] u8) u32 {
     const ctrl: u32 = padGetU16(p, P_CTRL_LO);
     if (p[P_DEST] == 0) { return 0xFFFFFFFF; }
-    if ((ctrl & CTRL_JOUT) == 0 and (ctrl & CTRL_RXEN) == 0) {
+    if ((ctrl & CTRL_JOUT) == 0 && (ctrl & CTRL_RXEN) == 0) {
         return 0xFFFFFFFF;
     }
     if (p[P_DEST] == DEST_JOY as u8) {
@@ -186,7 +186,7 @@ pub fn padWriteTx(p: *mut[] u8, mcd: *mut[] u8, data: u32) {
         // BIOS expects IC_JOY to assert while STAT.IRQ7 stays 0 until a
         // *subsequent* byte writes through.
         const b: u32 = data & 0xFF;
-        if (b == DEST_JOY or b == DEST_MCD) {
+        if (b == DEST_JOY || b == DEST_MCD) {
             p[P_DEST] = b as u8;
             if (b == DEST_JOY) {
                 p[P_SDA_STATE] = SDA_HIZ as u8;
@@ -260,12 +260,14 @@ pub fn padReadStat(p: *mut[] u8) u32 {
 // ---------- public IO surface ------------------------------------------
 
 pub fn padRead32(p: *mut[] u8, mcd: *mut[] u8, mcdRam: *mut[] u8, off: u32) u32 {
-    if (off == 0)  { return padReadRx(p, mcd, mcdRam); }
-    if (off == 4)  { return padReadStat(p); }
-    if (off == 8)  { return padGetU16(p, P_MODE_LO); }
-    if (off == 10) { return padGetU16(p, P_CTRL_LO); }
-    if (off == 14) { return padGetU16(p, P_BAUD_LO); }
-    return 0;
+    match (off) {
+        0  { return padReadRx(p, mcd, mcdRam); }
+        4  { return padReadStat(p); }
+        8  { return padGetU16(p, P_MODE_LO); }
+        10 { return padGetU16(p, P_CTRL_LO); }
+        14 { return padGetU16(p, P_BAUD_LO); }
+        _  { return 0; }
+    }
 }
 
 pub fn padRead16(p: *mut[] u8, mcd: *mut[] u8, mcdRam: *mut[] u8, off: u32) u32 {
@@ -277,10 +279,13 @@ pub fn padRead8(p: *mut[] u8, mcd: *mut[] u8, mcdRam: *mut[] u8, off: u32) u32 {
 }
 
 pub fn padWrite32(p: *mut[] u8, mcd: *mut[] u8, off: u32, val: u32) {
-    if (off == 0)  { padWriteTx(p, mcd, val); return; }
-    if (off == 8)  { padSetU16(p, P_MODE_LO, val & 0xFFFF); return; }
-    if (off == 10) { padHandleCtrlWrite(p, mcd, val); return; }
-    if (off == 14) { padSetU16(p, P_BAUD_LO, val & 0xFFFF); return; }
+    match (off) {
+        0  { padWriteTx(p, mcd, val); }
+        8  { padSetU16(p, P_MODE_LO, val & 0xFFFF); }
+        10 { padHandleCtrlWrite(p, mcd, val); }
+        14 { padSetU16(p, P_BAUD_LO, val & 0xFFFF); }
+        _  {}
+    }
 }
 
 pub fn padWrite16(p: *mut[] u8, mcd: *mut[] u8, off: u32, val: u32) {

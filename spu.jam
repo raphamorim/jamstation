@@ -118,17 +118,21 @@ const ADPCM_NEG_3: i32 = -55;
 const ADPCM_NEG_4: i32 = -60;
 
 pub fn adpcmPos(f: u32) i32 {
-    if (f == 1) { return ADPCM_POS_1; }
-    if (f == 2) { return ADPCM_POS_2; }
-    if (f == 3) { return ADPCM_POS_3; }
-    if (f == 4) { return ADPCM_POS_4; }
-    return ADPCM_POS_0;
+    match (f) {
+        1 { return ADPCM_POS_1; }
+        2 { return ADPCM_POS_2; }
+        3 { return ADPCM_POS_3; }
+        4 { return ADPCM_POS_4; }
+        _ { return ADPCM_POS_0; }
+    }
 }
 pub fn adpcmNeg(f: u32) i32 {
-    if (f == 2) { return ADPCM_NEG_2; }
-    if (f == 3) { return ADPCM_NEG_3; }
-    if (f == 4) { return ADPCM_NEG_4; }
-    return 0;
+    match (f) {
+        2 { return ADPCM_NEG_2; }
+        3 { return ADPCM_NEG_3; }
+        4 { return ADPCM_NEG_4; }
+        _ { return 0; }
+    }
 }
 
 // ---------- allocation -------------------------------------------------
@@ -261,8 +265,8 @@ pub fn adsrCalcValues(s: *mut[] u8, v: u32) {
     var cycles: i32 = 1 << maxI(0, shift - 11);
     var stepShifted: i32 = step << maxI(0, 11 - shift);
 
-    if (mode != 0 and level > 0x6000 and dir == 0) { cycles = cycles * 4; }
-    if (mode != 0 and dir != 0) { stepShifted = (stepShifted * level) >> 15; }
+    if (mode != 0 && level > 0x6000 && dir == 0) { cycles = cycles * 4; }
+    if (mode != 0 && dir != 0) { stepShifted = (stepShifted * level) >> 15; }
 
     setI32(s, base + D_ACYCLES, cycles);
     setI32(s, base + D_ACYRELOAD, cycles);
@@ -401,13 +405,13 @@ pub fn spuKoff(s: *mut[] u8, value: u32) {
 // ---------- write-side effects (psxe spu_handle_write) ----------------
 
 pub fn spuHandleWrite(s: *mut[] u8, ram: *mut[] u8, off: u32, val: u32) i32 {
-    if (off == R_KONL or off == R_KONH) {
+    if (off == R_KONL || off == R_KONH) {
         if (val == 0) { return 1; }
         const high: u32 = ((off & 2) != 0) as u32;
         spuKon(s, ram, val << (16 * high));
         return 1;
     }
-    if (off == R_KOFFL or off == R_KOFFH) {
+    if (off == R_KOFFL || off == R_KOFFH) {
         if (val == 0) { return 1; }
         const high: u32 = ((off & 2) != 0) as u32;
         spuKoff(s, val << (16 * high));
@@ -446,7 +450,13 @@ pub fn spuHandleWrite(s: *mut[] u8, ram: *mut[] u8, off: u32, val: u32) i32 {
         var stat: u32 = getU16(s, R_SPUSTAT);
         stat = (stat & 0xFFC0) | (val & 0x3F);
         setU16(s, R_SPUSTAT, stat);
-        if (((val >> 4) & 3) != 0) {
+        // Drain any pending TFIFO data on every SPUCNT write — covers both
+        // the psxe behavior (flush on entering an active mode) AND the
+        // hardware-spec behavior (flush on transition to Stop). Critically,
+        // this puts the flush BEFORE the next setStartAddress in
+        // setupDMARead, so data lands at the original TADDR (ps1-tests
+        // spu/memory-transfer testDMAWriteToSpuRam).
+        if (true) {
             var ta: u32 = getU32(s, GLOBAL_BASE + G_TADDR);
             const idx: u32 = getU32(s, GLOBAL_BASE + G_TFIFO_IDX);
             var i: u32 = 0;
@@ -507,7 +517,7 @@ pub fn spuWrite16(s: *mut[] u8, ram: *mut[] u8, off: u32, val: u32) {
     if (off + 1 >= SPU_REG_SIZE) { return; }
     if (spuHandleWrite(s, ram, off, val & 0xFFFF) != 0) { return; }
     // psxe skips writes at offset 0x0C inside the voice slot (volumer mirror).
-    if ((off & 0xF) == 0xC and off < 0x180) { return; }
+    if ((off & 0xF) == 0xC && off < 0x180) { return; }
     setU16(s, off, val & 0xFFFF);
 }
 
@@ -558,14 +568,14 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
                     setU32(s, rt + D_REPADDR, getU32(s, rt + D_CURADDR));
                 }
                 const lp: u32 = flags & 3;
-                if (lp == 0 or lp == 2) {
+                if (lp == 0 || lp == 2) {
                     const irq9: u32 = getU16(s, R_IRQADDR) << 3;
                     const spucnt: u32 = getU16(s, R_SPUCNT);
-                    if (irq9 == getU32(s, rt + D_CURADDR) and (spucnt & 0x40) != 0) {
+                    if (irq9 == getU32(s, rt + D_CURADDR) && (spucnt & 0x40) != 0) {
                         irqRaise(ic, cop0, IC_SPU());
                     }
                     setU32(s, rt + D_CURADDR, getU32(s, rt + D_CURADDR) + 0x10);
-                    if (irq9 == getU32(s, rt + D_CURADDR) and (spucnt & 0x40) != 0) {
+                    if (irq9 == getU32(s, rt + D_CURADDR) && (spucnt & 0x40) != 0) {
                         irqRaise(ic, cop0, IC_SPU());
                     }
                 } else if (lp == 1) {

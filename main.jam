@@ -189,7 +189,7 @@ fn dmodeWidth(dm: u32) i32 {
 
 fn dmodeHeight(dm: u32) i32 {
     // Vertical 480 requires interlace (bit 5).
-    if ((dm & 0x04) != 0 and (dm & 0x20) != 0) { return 480; }
+    if ((dm & 0x04) != 0 && (dm & 0x20) != 0) { return 480; }
     return 240;
 }
 
@@ -398,14 +398,20 @@ fn main() {
     // psxe uses for the same handoff).
     var demoPath: []u8 = "./demo.exe";
     var gamePath: []u8 = "./game.exe";
-    var discPath: []u8 = "./game.bin";
+    var cuePath:  []u8 = "./game.cue";
+    var binPath:  []u8 = "./game.bin";
     var pendingGameExe: bool = false;
-    // Attach a CD-ROM image at ./game.bin if present so the BIOS shell
-    // can read sectors via CdlReadN — this is the path that lets the
-    // BIOS bootstrap a real PS-X EXE off the disc instead of needing
-    // game.exe to be extracted manually.
-    if (fileExists(discPath)) {
-        if (discOpen(bus.disc, discPath) != 0) {
+    // Attach a CD-ROM image so the BIOS shell can read sectors via
+    // CdlReadN — this is the path that lets the BIOS bootstrap a real
+    // PS-X EXE off the disc instead of needing game.exe to be
+    // extracted manually. Prefer ./game.cue (multi-track aware) over
+    // a raw ./game.bin (single-track Mode2/2352).
+    if (fileExists(cuePath)) {
+        if (discOpen(bus.disc, cuePath) != 0) {
+            cdromAttachDisc(bus.cdrom, bus.disc);
+        }
+    } else if (fileExists(binPath)) {
+        if (discOpen(bus.disc, binPath) != 0) {
             cdromAttachDisc(bus.cdrom, bus.disc);
         }
     }
@@ -482,7 +488,12 @@ fn main() {
         //   1. BIOS jumps to 0x80030000 (real-disc boot handoff).
         //   2. BIOS shell is parked at the kernel idle loop with no disc;
         //      after IDLE_TRIGGER frames stuck there we sideload.
-        if (pendingGameExe and c.pc >= 0x80030000 and c.pc < 0x80031000) {
+        // Sideload trigger 1: BIOS jumps anywhere in the disc-boot handoff
+        // region (0x80030000-0x80040000). Real-disc boot lands at 0x80030000
+        // exactly, but the BIOS bootloader can also park at other addresses
+        // in this range when no disc is present (e.g. 0x8003D78C =
+        // ps1-tests run path).
+        if (pendingGameExe && c.pc >= 0x80030000 && c.pc < 0x80040000) {
             loadExe(gamePath, bus, regs, c);
             pendingGameExe = false;
             idleFrames = 0;
@@ -490,7 +501,7 @@ fn main() {
         }
         if (pendingGameExe) {
             const curPoly: u32 = gpuFamilyCount(bus.gpu, 1);
-            if (curPoly == lastPoly and curPoly >= MIN_POLY_DRAWN) {
+            if (curPoly == lastPoly && curPoly >= MIN_POLY_DRAWN) {
                 idleFrames = idleFrames + 1;
                 if (idleFrames >= IDLE_TRIGGER) {
                     var msg: []u8 = "BIOS shell idle — sideloading game.exe fallback\n";

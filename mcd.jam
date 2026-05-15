@@ -1,0 +1,234 @@
+// Memory Card (PSX BU01) — port of psxe/psx/dev/mcd.c.
+//
+// Memory cards live on SIO0 as a second device alongside the joypad.
+// When the host writes 0x81 to SIO0_DATA the bus selects the memcard;
+// subsequent bytes drive an SDA-style state machine that reads/writes
+// 128 bytes per frame. Our pad.jam handles slot selection — it routes
+// 0x81 dest writes through here.
+//
+// State machine (psxe mcd.c MCD_STATE_*):
+//
+//   TX_HIZ          → 0xFF on first read (line high-Z)
+//   TX_FLG          → flag byte (0x08 = "first access since power-on")
+//   TX_ID1 / TX_ID2 → 0x5A / 0x5D identification bytes
+//   R_*             → READ subprotocol: take MSB/LSB → addr<<7, then
+//                     ACK + 128 data bytes + checksum + 'G' end marker
+//   W_*             → WRITE subprotocol: take MSB/LSB + 128 data bytes
+//                     + checksum, then ACK + 'G' end marker
+//   S_*             → STATUS subprotocol (rarely used)
+//
+// We model a single-slot card with an in-memory 128 KB buffer; the buffer
+// is currently volatile (no file backing). Games that probe the card
+// will see "no error / first access" and proceed.
+
+pub extern fn malloc(size: u64) *mut[] u8;
+pub extern fn free(ptr: *mut[] u8);
+pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+
+const MCD_MEMORY_SIZE: u64 = 0x20000;       // 128 KB
+const MCD_STATE_SIZE:  u64 = 32;            // small control block
+
+// State buffer offsets.
+const S_STATE:     u32 = 0;
+const S_TX_DATA:   u32 = 1;
+const S_RX_DATA:   u32 = 2;
+const S_TX_READY:  u32 = 3;
+const S_MODE:      u32 = 4;       // 'R' / 'W' / 'S'
+const S_FLAG:      u32 = 5;
+const S_MSB:       u32 = 6;
+const S_LSB:       u32 = 7;
+const S_ADDR_LO:   u32 = 8;       // u16
+const S_ADDR_HI:   u32 = 9;
+const S_PEND_LO:   u32 = 10;      // u16 pending_bytes
+const S_PEND_HI:   u32 = 11;
+const S_CHECKSUM:  u32 = 12;
+
+// MCD state-machine states (mirrors psxe enum).
+const MCD_TX_HIZ:        u32 = 0;
+const MCD_TX_FLG:        u32 = 1;
+const MCD_TX_ID1:        u32 = 2;
+const MCD_TX_ID2:        u32 = 3;
+const MCD_R_RX_MSB:      u32 = 4;
+const MCD_R_RX_LSB:      u32 = 5;
+const MCD_R_TX_ACK1:     u32 = 6;
+const MCD_R_TX_ACK2:     u32 = 7;
+const MCD_R_TX_MSB:      u32 = 8;
+const MCD_R_TX_LSB:      u32 = 9;
+const MCD_R_TX_DATA:     u32 = 10;
+const MCD_R_TX_CHK:      u32 = 11;
+const MCD_R_TX_MEB:      u32 = 12;
+const MCD_W_RX_MSB:      u32 = 13;
+const MCD_W_RX_LSB:      u32 = 14;
+const MCD_W_RX_DATA:     u32 = 15;
+const MCD_W_RX_CHK:      u32 = 16;
+const MCD_W_RX_CHK2:     u32 = 17;
+const MCD_W_TX_ACK1:     u32 = 18;
+const MCD_W_TX_ACK2:     u32 = 19;
+const MCD_W_TX_MEB:      u32 = 20;
+const MCD_S_TX_ACK1:     u32 = 21;
+const MCD_S_TX_ACK2:     u32 = 22;
+const MCD_S_TX_DAT0:     u32 = 23;
+const MCD_S_TX_DAT1:     u32 = 24;
+const MCD_S_TX_DAT2:     u32 = 25;
+const MCD_S_TX_DAT3:     u32 = 26;
+
+pub fn mcdAlloc() *mut[] u8 {
+    var raw: *mut[] u8 = malloc(MCD_STATE_SIZE);
+    memset(raw, 0, MCD_STATE_SIZE);
+    raw[S_FLAG] = 0x08;     // psxe sets flag = 0x08 = "first access since power-on"
+    raw[S_STATE] = MCD_TX_HIZ as u8;
+    return raw;
+}
+
+pub fn mcdRamAlloc() *mut[] u8 {
+    var raw: *mut[] u8 = malloc(MCD_MEMORY_SIZE);
+    memset(raw, 0, MCD_MEMORY_SIZE);
+    return raw;
+}
+
+pub fn mcdFree(s: *mut[] u8) { free(s); }
+pub fn mcdRamFree(r: *mut[] u8) { free(r); }
+
+pub fn mcdReset(s: *mut[] u8) {
+    s[S_STATE] = MCD_TX_HIZ as u8;
+    s[S_TX_READY] = 0;
+}
+
+pub fn mcdQuery(s: *mut[] u8) bool {
+    return s[S_TX_READY] != 0;
+}
+
+pub fn mcdGetU16(s: *mut[] u8, off: u32) u32 {
+    return (s[off] as u32) | ((s[off + 1] as u32) << 8);
+}
+
+pub fn mcdSetU16(s: *mut[] u8, off: u32, v: u32) {
+    s[off]     = (v        & 0xFF) as u8;
+    s[off + 1] = ((v >> 8) & 0xFF) as u8;
+}
+
+// Read one byte from the card (psxe psx_mcd_read). The state advances
+// after each byte; the host clocks 8 bits per call. Returns the byte
+// the host should latch into SIO0's RX register.
+pub fn mcdRead(s: *mut[] u8, ram: *mut[] u8) u32 {
+    const st: u32 = s[S_STATE] as u32;
+    if (st == MCD_TX_HIZ) {
+        s[S_TX_DATA] = 0xFF;
+    } else if (st == MCD_TX_FLG) {
+        // psxe patch: if the host's last RX was 0x81/0x01 the card
+        // bails out — game-side probe code expects 0xFF when it tries
+        // to ping us by sending the dest byte twice.
+        const rx: u32 = s[S_RX_DATA] as u32;
+        if (rx == 0x81 || rx == 0x01) {
+            s[S_TX_READY] = 1;
+            s[S_TX_DATA] = 0xFF;
+            s[S_STATE] = MCD_TX_HIZ as u8;
+            return 0xFF;
+        }
+        s[S_TX_DATA] = s[S_FLAG];
+        s[S_FLAG] = 0;          // "first access" flag is one-shot
+    } else if (st == MCD_TX_ID1) {
+        s[S_TX_DATA] = 0x5A;
+    } else if (st == MCD_TX_ID2) {
+        // Choose subprotocol based on mode byte the host sent earlier.
+        s[S_TX_READY] = 1;
+        s[S_TX_DATA] = 0x5D;
+        const m: u32 = s[S_MODE] as u32;
+        if (m == 0x52) {                            // 'R' = read
+            s[S_STATE] = MCD_R_RX_MSB as u8;
+        } else if (m == 0x57) {                     // 'W' = write
+            s[S_STATE] = MCD_W_RX_MSB as u8;
+        } else if (m == 0x53) {                     // 'S' = status
+            s[S_STATE] = MCD_S_TX_ACK1 as u8;
+        } else {
+            // Unknown mode — drop the slot.
+            s[S_TX_READY] = 0;
+            s[S_TX_DATA] = 0xFF;
+            s[S_STATE] = MCD_TX_HIZ as u8;
+        }
+        return s[S_TX_DATA] as u32;
+    } else if (st == MCD_R_RX_MSB) {
+        s[S_TX_DATA] = 0x00;
+    } else if (st == MCD_R_RX_LSB) {
+        s[S_TX_DATA] = s[S_MSB];
+    } else if (st == MCD_R_TX_ACK1) {
+        s[S_TX_DATA] = 0x5C;
+    } else if (st == MCD_R_TX_ACK2) {
+        s[S_TX_DATA] = 0x5D;
+    } else if (st == MCD_R_TX_MSB) {
+        s[S_TX_DATA] = s[S_MSB];
+        s[S_CHECKSUM] = s[S_MSB];
+    } else if (st == MCD_R_TX_LSB) {
+        s[S_TX_DATA] = s[S_LSB];
+        s[S_CHECKSUM] = s[S_CHECKSUM] ^ s[S_LSB];
+        mcdSetU16(s, S_PEND_LO, 128);
+    } else if (st == MCD_R_TX_DATA) {
+        const pend: u32 = mcdGetU16(s, S_PEND_LO);
+        const addr: u32 = mcdGetU16(s, S_ADDR_LO);
+        const b: u8 = ram[addr];
+        mcdSetU16(s, S_ADDR_LO, addr + 1);
+        s[S_CHECKSUM] = s[S_CHECKSUM] ^ b;
+        mcdSetU16(s, S_PEND_LO, pend - 1);
+        if (pend - 1 == 0) {
+            s[S_TX_DATA] = b;
+        } else {
+            return b as u32;
+        }
+    } else if (st == MCD_R_TX_CHK) {
+        s[S_TX_DATA] = s[S_CHECKSUM];
+    } else if (st == MCD_R_TX_MEB) {
+        s[S_TX_READY] = 0;
+        s[S_STATE] = MCD_TX_HIZ as u8;
+        return 0x47;            // 'G' = good end marker
+    } else if (st == MCD_W_RX_MSB) {
+        s[S_TX_DATA] = 0x00;
+    } else if (st == MCD_W_RX_LSB) {
+        s[S_TX_DATA] = s[S_MSB];
+        mcdSetU16(s, S_PEND_LO, 128);
+    } else if (st == MCD_W_RX_DATA) {
+        const pend: u32 = mcdGetU16(s, S_PEND_LO);
+        const addr: u32 = mcdGetU16(s, S_ADDR_LO);
+        ram[addr] = s[S_RX_DATA];
+        mcdSetU16(s, S_ADDR_LO, addr + 1);
+        mcdSetU16(s, S_PEND_LO, pend - 1);
+        if (pend - 1 == 0) {
+            s[S_TX_DATA] = s[S_RX_DATA];
+        } else {
+            return s[S_RX_DATA] as u32;
+        }
+    } else if (st == MCD_W_RX_CHK || st == MCD_W_RX_CHK2) {
+        s[S_TX_DATA] = s[S_RX_DATA];
+    } else if (st == MCD_W_TX_ACK1) {
+        s[S_TX_DATA] = 0x5C;
+    } else if (st == MCD_W_TX_ACK2) {
+        s[S_TX_DATA] = 0x5D;
+    } else if (st == MCD_W_TX_MEB) {
+        s[S_TX_READY] = 0;
+        s[S_STATE] = MCD_TX_HIZ as u8;
+        return 0x47;
+    }
+    s[S_TX_READY] = 1;
+    s[S_STATE] = (s[S_STATE] + 1) as u8;
+    return s[S_TX_DATA] as u32;
+}
+
+// Latch a byte the host wrote. Some states use the byte (mode select,
+// address MSB/LSB, write data); others ignore it.
+pub fn mcdWrite(s: *mut[] u8, data: u32) {
+    const d: u8 = (data & 0xFF) as u8;
+    s[S_RX_DATA] = d;
+    const st: u32 = s[S_STATE] as u32;
+    if (st == MCD_TX_FLG) {
+        s[S_MODE] = d;
+    } else if (st == MCD_R_RX_MSB || st == MCD_W_RX_MSB) {
+        s[S_MSB] = d;
+    } else if (st == MCD_R_RX_LSB) {
+        s[S_LSB] = d;
+        const a: u32 = ((s[S_MSB] as u32) << 8) | (d as u32);
+        mcdSetU16(s, S_ADDR_LO, a << 7);
+    } else if (st == MCD_W_RX_LSB) {
+        s[S_LSB] = d;
+        const a: u32 = ((s[S_MSB] as u32) << 8) | (d as u32);
+        mcdSetU16(s, S_ADDR_LO, a << 7);
+    }
+}
