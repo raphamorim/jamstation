@@ -566,6 +566,18 @@ fn main() {
             const got: u32 = spuDrainOut(bus.spu, audioBuf, want);
             sdlAudioPush(audioDev, audioBuf, got << 2);
         }
+        // Audio throttle disabled — left here so we can re-enable if we
+        // pick this strategy over the callback / wall-clock approach.
+        //
+        // if (audioDev != 0) {
+        //     const high: u32 = 17640;        // ~100 ms
+        //     const low: u32  =  8820;        // ~ 50 ms
+        //     if (sdlAudioQueuedBytes(audioDev) > high) {
+        //         while (sdlAudioQueuedBytes(audioDev) > low) {
+        //             sdlDelay(1);
+        //         }
+        //     }
+        // }
         var vram: *mut[] u8 = busVramPtr(bus);
         // Read the current display origin out of the GPU state buffer
         // (g[63] disp_x, g[64] disp_y — set by GP1 0x05). The BIOS
