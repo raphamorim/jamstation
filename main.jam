@@ -20,7 +20,7 @@ const { gpuAlloc, gpuFamilyCount } = import("gpu");
 const { gteAlloc } = import("gte");
 const { cdromAlloc, cdromUpdate, cdromAttachDisc } = import("cdrom");
 const { discAlloc, discOpen } = import("disc");
-const { dmaAlloc, dmaUpdate } = import("dma");
+const { dmaAlloc, dmaTickSpu, dmaUpdate } = import("dma");
 const { padAlloc, padUpdate } = import("pad");
 const { spuAlloc, spuRamAlloc, spuUpdate } = import("spu");
 const { sio1Update } = import("sio1");
@@ -295,6 +295,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         step(c, bus, regs, cop0);
         const delta: u32 = (c.cycles - before) as u32;
         timerUpdateCyc(bus.timer, bus.irq, cop0, delta);
+        dmaTickSpu(bus.dma, delta);
         dmaUpdate(bus.dma, bus.irq, cop0);
         cdromUpdate(bus.cdrom, bus.disc, bus.irq, cop0, delta);
         padUpdate(bus.pad, bus.irq, cop0, delta);

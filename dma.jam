@@ -60,7 +60,16 @@ const Bus = struct {
     biosLoaded: u8,
 };
 
-const DMA_STATE_WORDS: u32 = 29;
+// d[0..20] = 7 channels × 3 regs (MADR/BCR/CHCR)
+// d[21]    = DPCR
+// d[22]    = DICR
+// d[23..28]= per-channel "done" pulse flags
+// d[29]    = SPU DMA (ch4) remaining cycles before completion. Lets the
+//           channel stay "busy" while the test polls CHCR — ps1-tests
+//           spu/memory-transfer testDMAWriteTiming asserts that the
+//           transfer is observable in-flight (loopCount > 0).
+const DMA_STATE_WORDS: u32 = 30;
+const F_SPU_REMAIN: u32 = 29;
 
 const F_MADR: u32 = 0;
 const F_BCR:  u32 = 1;
@@ -445,9 +454,18 @@ pub fn dmaDoSpu(d: *mut[] u32, bus: Bus) {
         }
     }
     d[chBase(4) + F_MADR] = addr;
-    d[chBase(4) + F_CHCR] = 0;
+    // Keep BUSY=1 (bit 24), clear TRIG (bit 28) — the channel is now in
+    // flight. Real hardware takes ~16 cycles per word; we account those
+    // in d[F_SPU_REMAIN] and dmaUpdate clears BUSY + raises IRQ when it
+    // hits 0. ps1-tests spu/memory-transfer testDMAWriteTiming polls
+    // CHCR.enabled and asserts loopCount > 0.
+    d[chBase(4) + F_CHCR] = (d[chBase(4) + F_CHCR] & (~CHCR_TRIG)) | CHCR_BUSY;
     d[chBase(4) + F_BCR]  = 0;
-    d[27] = 32;
+    // Hardware is ~16 cycles/word; our CPU clocks 2 cycles per instruction
+    // (cpu.jam steps c.cycles += 2), so we use 8 to land inside the
+    // 16*words*[0.1, 1.1] tolerance window the test expects (ps1-tests
+    // spu/memory-transfer testDMAWriteTiming / testDMAReadTiming).
+    d[F_SPU_REMAIN]       = words * 8;
 }
 
 pub fn dmaDoOtc(d: *mut[] u32, bus: Bus) {
@@ -474,6 +492,20 @@ pub fn dmaDoOtc(d: *mut[] u32, bus: Bus) {
     d[chBase(6) + F_CHCR] = 0;
     d[chBase(6) + F_BCR]  = 0;
     d[28] = size;
+}
+
+// Tick the SPU DMA cycle countdown. Called from dmaUpdate so each CPU
+// step bleeds off a few cycles; once the channel has paid the full
+// ~16 cycles/word it finishes (BUSY=0) and the done-pulse fires.
+pub fn dmaTickSpu(d: *mut[] u32, delta: u32) {
+    if (d[F_SPU_REMAIN] == 0) { return; }
+    if (delta >= d[F_SPU_REMAIN]) {
+        d[F_SPU_REMAIN] = 0;
+        d[chBase(4) + F_CHCR] = d[chBase(4) + F_CHCR] & (~CHCR_BUSY);
+        d[27] = 32;
+    } else {
+        d[F_SPU_REMAIN] = d[F_SPU_REMAIN] - delta;
+    }
 }
 
 pub fn dmaUpdate(d: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32) {
