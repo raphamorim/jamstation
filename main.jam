@@ -290,7 +290,6 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     var lineCyc: u32 = 0;
     while (line < SCANLINES_TOTAL) {
         biosHook(c, bus, regs);
-        biosHookDiag(c, bus, regs, cop0);
         const before: u64 = c.cycles;
         step(c, bus, regs, cop0);
         const delta: u32 = (c.cycles - before) as u32;
@@ -313,7 +312,11 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
             line = line + 1;
         }
     }
-    commitLoad(c, regs);
+    // NOTE: do NOT commitLoad here. Each instruction's own commitLoad
+    // handles the R3000 load-delay slot. Flushing at frame boundaries
+    // would eat the delay slot when a load lands on the last cycle of
+    // the frame (the delay-slot instruction runs in the next frame,
+    // and would see the new value instead of the old one).
     timerVblankEnd(bus.timer);
 }
 
@@ -535,84 +538,11 @@ fn main() {
         }
         quit = sdlPump();
         frames = frames + 1;
-        // Roll a wall-clock FPS print every second so we can profile
-        // without depending on the "Stopped after N frames" tail message
-        // (which only fires on a clean window close).
-        const nowMs: u32 = SDL_GetTicks();
-        if (nowMs - winStartMs >= 1000) {
-            const fpsFrames: u32 = frames - winStartFrames;
-            const elapsed: u32 = nowMs - winStartMs;
-            const f1: u32 = gpuFamilyCount(bus.gpu, 1);   // polygons
-            const f2: u32 = gpuFamilyCount(bus.gpu, 2);   // lines
-            const f3: u32 = gpuFamilyCount(bus.gpu, 3);   // rects
-            const f5: u32 = gpuFamilyCount(bus.gpu, 5);   // CPU→VRAM blits
-            var fpsFmt: []u8 = "[fps] %u f/%ums PC=%08X gp:poly=%u line=%u rect=%u blit=%u disp=(%d,%d) dm=%08X gte=%u\n";
-            const dx: i32 = bus.gpu[63] as i32;
-            const dy: i32 = bus.gpu[64] as i32;
-            const dm: u32 = bus.gpu[47];
-            const gteOps: u32 = bus.gte[70];
-            printf(fpsFmt.ptr, fpsFrames, elapsed, c.pc, f1, f2, f3, f5, dx, dy, dm, gteOps);
-            flushAll();
-            winStartMs = nowMs;
-            winStartFrames = frames;
-        }
-        // Dense VRAM snapshots during the BIOS boot sequence so we can
-        // see exactly when the SCE/PS-logo animation lives in VRAM.
-        if (frames == 60)   { var s: []u8 = "./vram-060.ppm"; dumpVramPpm(s, vram); }
-        if (frames == 90)   { var s: []u8 = "./vram-090.ppm"; dumpVramPpm(s, vram); }
-        if (frames == 120)  { var s: []u8 = "./vram-120.ppm"; dumpVramPpm(s, vram); }
-        if (frames == 150)  { var s: []u8 = "./vram-150.ppm"; dumpVramPpm(s, vram); }
-        if (frames == 180)  { var s: []u8 = "./vram-180.ppm"; dumpVramPpm(s, vram); }
-        if (frames == 210)  { var s: []u8 = "./vram-210.ppm"; dumpVramPpm(s, vram); }
-        if (frames == 240)  { var s: []u8 = "./vram-240.ppm"; dumpVramPpm(s, vram); }
-        if (frames == 250)  { var s: []u8 = "./vram-250.ppm"; dumpVramPpm(s, vram); }
-        if (frames == 260)  { var s: []u8 = "./vram-260.ppm"; dumpVramPpm(s, vram); }
-        if (frames == 270)  { var s: []u8 = "./vram-270.ppm"; dumpVramPpm(s, vram); }
-        if (frames == 280)  { var s: []u8 = "./vram-280.ppm"; dumpVramPpm(s, vram); }
-        if (frames == 290)  { var s: []u8 = "./vram-290.ppm"; dumpVramPpm(s, vram); }
-        if (frames == 300)  { var s: []u8 = "./vram-300.ppm"; dumpVramPpm(s, vram); }
-        if (frames == 600)  { var s: []u8 = "./vram-600.ppm"; dumpVramPpm(s, vram); }
-        if (frames == 1200) { var s: []u8 = "./vram-1200.ppm"; dumpVramPpm(s, vram); }
-        // Periodic GTE histogram dump at frame 350 so we can see what
-        // the BIOS did during the PS-logo animation phase (frames
-        // 240-300).
-        if (frames == 350) {
-            var fmtGte: []u8 = "GTE op 0x%02X: %u\n";
-            var op2: u32 = 0;
-            while (op2 < 0x40) {
-                const count: u32 = bus.gte[80 + op2];
-                if (count > 0) {
-                    printf(fmtGte.ptr, op2, count);
-                }
-                op2 = op2 + 1;
-            }
-            flushAll();
-        }
         // Bail after a long-but-finite session if no quit event comes —
         // protects users from a runaway window when there's no controller
         // input wired up yet.
         if (frames > 100000) { quit = 1; }
     }
-
-    var fmtState: []u8 = "Stopped after %u frames: PC=%08X SP=%08X RA=%08X cycles=%llu\n";
-    printf(fmtState.ptr, frames,
-        c.pc, gprRead(regs, 29), gprRead(regs, 31), c.cycles);
-
-    // Per-op GTE histogram (g[80..143] holds counters indexed by op).
-    var fmtGte: []u8 = "GTE op 0x%02X: %u\n";
-    var op: u32 = 0;
-    while (op < 0x40) {
-        const count: u32 = bus.gte[80 + op];
-        if (count > 0) {
-            printf(fmtGte.ptr, op, count);
-        }
-        op = op + 1;
-    }
-
-    // Snapshot VRAM so we can see what's on the BIOS / game screen even
-    // when SDL window inspection isn't available.
-    var dumpPath: []u8 = "./vram.ppm";
-    dumpVramPpm(dumpPath, busVramPtr(bus));
 
     sdlQuit(sdl);
     freeRegFile(regs);

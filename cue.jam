@@ -29,6 +29,7 @@ pub extern fn ftell(file: *mut[] u8) i64;
 pub extern fn fgetc(file: *mut[] u8) i32;
 pub extern fn feof(file: *mut[] u8) i32;
 pub extern fn access(path: *const[] u8, mode: i32) i32;
+pub extern fn realpath(path: *const[] u8, resolved: *mut[] u8) *mut[] u8;
 pub extern fn printf(format: *const[] u8, ...) i32;
 
 // Track-mode enum (psxe cue.h subset we actually use).
@@ -393,20 +394,39 @@ pub fn cueParse(raw: *mut[] u8, path: *const[] u8) i32 {
     var afmt: []u8 = "rb";
     if (access(path, 4) != 0) { return 1; }
     c[0].cur = fgetc(c[0].file) as u32 & 0xFF;
-    // Compute root path = path up to last '/' or '\\'.
+    // Resolve any symlinks in the .cue path so the rootPath we extract is
+    // the directory of the actual file. Without this, a symlinked
+    // `./game.cue` whose target lives elsewhere produces rootPath="./",
+    // and the FILE entries in the .cue (which use basenames) fail to
+    // open relative to "./".
+    //
+    // access(path, 4) above already confirmed the file is readable, so
+    // realpath() should succeed; we still pre-fill the buffer with the
+    // original path as a fallback for the unlikely failure case (Jam
+    // can't null-check pointer returns).
+    var resolved: *mut[] u8 = malloc(4096);
+    memset(resolved, 0, 4096);
+    var pi: u32 = 0;
+    while (path[pi] != 0 && pi < 4095) {
+        resolved[pi] = path[pi];
+        pi = pi + 1;
+    }
+    realpath(path, resolved);
+    // Compute root path = resolved path up to last '/' or '\\'.
     var i: u32 = 0;
     var lastSlash: u32 = 0;
-    while (path[i] != 0) {
-        if (path[i] == 0x2F || path[i] == 0x5C) { lastSlash = i + 1; }
+    while (resolved[i] != 0) {
+        if (resolved[i] == 0x2F || resolved[i] == 0x5C) { lastSlash = i + 1; }
         i = i + 1;
     }
     var ri: u32 = 0;
     while (ri < lastSlash) {
-        c[0].rootPath[ri] = path[ri];
+        c[0].rootPath[ri] = resolved[ri];
         ri = ri + 1;
     }
     c[0].rootPath[lastSlash] = 0;
     c[0].rootLen = lastSlash;
+    free(resolved);
 
     skipWs(raw);
     var kwbuf: *mut[] u8 = malloc(16);
