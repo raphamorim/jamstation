@@ -43,8 +43,10 @@ const {
 } = import("cpu");
 
 const {
-    sdlInit, sdlQuit, sdlBlit, sdlPump, sdlDelay
+    sdlInit, sdlQuit, sdlBlit, sdlPump, sdlDelay,
+    sdlAudioOpen, sdlAudioClose, sdlAudioPush, sdlAudioQueuedBytes
 } = import("sdl");
+const { spuDrainOut, spuOutAvailable } = import("spu");
 
 extern fn malloc(size: u64) *mut[] u8;
 extern fn free(ptr: *mut[] u8);
@@ -83,6 +85,13 @@ extern fn SDL_RenderPresent(renderer: *mut[] u8);
 extern fn SDL_Delay(ms: u32);
 extern fn SDL_PollEvent(event: *mut[] u8) i32;
 extern fn SDL_GetTicks() u32;
+extern fn SDL_OpenAudioDevice(device: u64, iscapture: i32,
+                              desired: *mut[] u8, obtained: *mut[] u8,
+                              allowed_changes: i32) u32;
+extern fn SDL_CloseAudioDevice(dev: u32);
+extern fn SDL_PauseAudioDevice(dev: u32, pause_on: i32);
+extern fn SDL_QueueAudio(dev: u32, data: *const[] u8, len: u32) i32;
+extern fn SDL_GetQueuedAudioSize(dev: u32) u32;
 
 const STDOUT: i32 = 1;
 
@@ -472,6 +481,19 @@ fn main() {
         write(STDOUT, fmsg.ptr, fmsg.len);
     }
     var sdl: Sdl = sdlInit(title, sdlW, sdlH);
+    // Audio device: 1024-stereo-sample buffer (~23 ms at 44.1 kHz) is a
+    // good balance between glitch resistance and latency.
+    var audioDev: u32 = sdlAudioOpen(1024);
+    if (audioDev == 0) {
+        var afmt: []u8 = "WARN: SDL audio device failed to open\n";
+        write(STDOUT, afmt.ptr, afmt.len);
+    } else {
+        var aok: []u8 = "Audio device opened (id=%u, 44.1kHz S16 stereo)\n";
+        printf(aok.ptr, audioDev);
+    }
+    // Per-frame drain buffer. 4096 stereo samples × 4 bytes = 16 KB —
+    // matches the SPU output FIFO capacity so one drain always fits.
+    var audioBuf: *mut[] u8 = malloc(16384);
     var postMsg: []u8 = "SDL2 ready. Priming VRAM...\n";
     write(STDOUT, postMsg.ptr, postMsg.len);
     // Skip the gradient test pattern for now — the nested 1024x512 loop
@@ -532,6 +554,18 @@ fn main() {
             }
         }
         runOneFrame(c, bus, regs, cop0);
+        // Audio drain — pull whatever mixed samples the SPU produced
+        // this frame and submit to SDL. We cap at OUT_FIFO_CAP=4096 so
+        // the destination buffer is bounded. ~735 stereo samples per
+        // 60 Hz frame is the steady state; brief bursts are smoothed
+        // by SDL's internal queue.
+        const avail: u32 = spuOutAvailable(bus.spu);
+        if (avail > 0) {
+            var want: u32 = avail;
+            if (want > 4096) { want = 4096; }
+            const got: u32 = spuDrainOut(bus.spu, audioBuf, want);
+            sdlAudioPush(audioDev, audioBuf, got << 2);
+        }
         var vram: *mut[] u8 = busVramPtr(bus);
         // Read the current display origin out of the GPU state buffer
         // (g[63] disp_x, g[64] disp_y — set by GP1 0x05). The BIOS
@@ -559,6 +593,8 @@ fn main() {
     // the equivalent in psx_mcd_destroy.
     mcdRamSave(bus.mcdRam, mcdPath);
 
+    sdlAudioClose(audioDev);
+    free(audioBuf);
     sdlQuit(sdl);
     freeRegFile(regs);
     freeRegFile(cop0);

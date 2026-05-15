@@ -34,7 +34,14 @@ const CD_FIFO_BASE:   u32 = 0x1D00;
 const CD_FIFO_CAP:    u32 = 1024;        // entries (power of two)
 const CD_FIFO_MASK:   u32 = 1023;
 const CD_FIFO_BYTES:  u32 = 4096;        // 1024 × 4 bytes (i16 L + i16 R)
-const SPU_STATE_SIZE: u32 = 0x1D00 + 4096; // 0x2D00
+// Final mixed-output FIFO. Producer = spuGetSample (one stereo sample
+// per emit, 44.1 kHz). Consumer = main.jam's SDL audio drain. 4096
+// entries × 4 bytes = 16 KB, lives at 0x2D00. ~93 ms latency buffer.
+const OUT_FIFO_BASE:  u32 = 0x2D00;
+const OUT_FIFO_CAP:   u32 = 4096;
+const OUT_FIFO_MASK:  u32 = 4095;
+const OUT_FIFO_BYTES: u32 = 16384;
+const SPU_STATE_SIZE: u32 = 0x2D00 + 16384; // 0x6D00
 const SPU_RAM_SIZE:   u32 = 0x80000;
 
 // Voice-register offsets inside a 16-byte voice slot.
@@ -111,6 +118,9 @@ const G_LRSR:       u32 = 0x54;
 // writes tail. Equal head == tail → empty.
 const G_CD_HEAD:    u32 = 0x60;
 const G_CD_TAIL:    u32 = 0x64;
+// Final mixed-output FIFO head/tail. Producer = spuGetSample.
+const G_OUT_HEAD:   u32 = 0x68;
+const G_OUT_TAIL:   u32 = 0x6C;
 
 // ADSR phases.
 const ADSR_ATTACK:  u32 = 0;
@@ -664,7 +674,14 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
     }
 
     const spucnt: u32 = getU16(s, R_SPUCNT);
-    if ((spucnt & 0x4000) == 0) { return 0; }
+    if ((spucnt & 0x4000) == 0) {
+        // SPU disabled — still drain the CD FIFO so the producer doesn't
+        // back up, push silence so the SDL audio queue keeps draining
+        // at the correct rate, and bail.
+        const _drain: u32 = spuPopCdSample(s);
+        spuPushOutSample(s, 0);
+        return 0;
+    }
 
     // Mix one CD-audio sample into the voice sum. SPUCNT bit 0 = CD audio
     // enable; when clear, the FIFO is drained (so producer doesn't back
@@ -685,7 +702,51 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
     const mainr: i32 = getI16(s, R_MAINRVOL);
     const cl: i32 = (sat16(left)  * mainl) >> 15;
     const cr: i32 = (sat16(right) * mainr) >> 15;
-    return (cl as u32 & 0xFFFF) | ((cr as u32 & 0xFFFF) << 16);
+    const packed: u32 = (cl as u32 & 0xFFFF) | ((cr as u32 & 0xFFFF) << 16);
+    spuPushOutSample(s, packed);
+    return packed;
+}
+
+// Push the mixed stereo sample into the output FIFO. Drops on full so
+// audio falls behind silently rather than blocking the SPU mixer. The
+// SDL drain (main.jam) pulls samples each frame at the audio device
+// rate (44.1 kHz) so a half-full buffer is the normal steady state.
+pub fn spuPushOutSample(s: *mut[] u8, packed: u32) {
+    const head: u32 = getU32(s, GLOBAL_BASE + G_OUT_HEAD);
+    const tail: u32 = getU32(s, GLOBAL_BASE + G_OUT_TAIL);
+    if ((head - tail) >= OUT_FIFO_CAP) { return; }     // full → drop
+    const slot: u32 = OUT_FIFO_BASE + ((head & OUT_FIFO_MASK) << 2);
+    setU32(s, slot, packed);
+    setU32(s, GLOBAL_BASE + G_OUT_HEAD, head + 1);
+}
+
+// Pop up to `max` stereo samples into a host-supplied i16 buffer. dst
+// is treated as 2 × i16 per entry (interleaved L,R). Returns the count
+// actually written. Returns early if the FIFO drains.
+pub fn spuDrainOut(s: *mut[] u8, dst: *mut[] u8, max: u32) u32 {
+    var n: u32 = 0;
+    var head: u32 = getU32(s, GLOBAL_BASE + G_OUT_HEAD);
+    var tail: u32 = getU32(s, GLOBAL_BASE + G_OUT_TAIL);
+    while (n < max && head != tail) {
+        const slot: u32 = OUT_FIFO_BASE + ((tail & OUT_FIFO_MASK) << 2);
+        const lo: u32 = getU16(s, slot);
+        const hi: u32 = getU16(s, slot + 2);
+        const dOff: u32 = n << 2;
+        dst[dOff]     = (lo        & 0xFF) as u8;
+        dst[dOff + 1] = ((lo >> 8) & 0xFF) as u8;
+        dst[dOff + 2] = (hi        & 0xFF) as u8;
+        dst[dOff + 3] = ((hi >> 8) & 0xFF) as u8;
+        tail = tail + 1;
+        n = n + 1;
+    }
+    setU32(s, GLOBAL_BASE + G_OUT_TAIL, tail);
+    return n;
+}
+
+// Number of stereo samples ready to drain.
+pub fn spuOutAvailable(s: *mut[] u8) u32 {
+    return getU32(s, GLOBAL_BASE + G_OUT_HEAD)
+         - getU32(s, GLOBAL_BASE + G_OUT_TAIL);
 }
 
 // ---------- per-scanline tick ----------------------------------------
