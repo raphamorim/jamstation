@@ -394,7 +394,8 @@ pub fn cdromVersionByte(v: u32, n: u32) u32 {
 
 // Handle the command response — equivalent to psxe's
 // `cdrom_cmd_table[cmd](cdrom)` running after the TX_RESP1 delay.
-pub fn cdromExecuteCommand(d: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32) {
+pub fn cdromExecuteCommand(d: *mut[] u8, disc: *mut[] Disc,
+                           ic: *mut[] u32, cop0: *mut[] u32) {
     const cmd: u32 = d[C_PENDING_CMD] as u32;
     d[C_BUSY] = 0;
     // CdlTest is the smallest path — read the subfunction byte and
@@ -440,6 +441,17 @@ pub fn cdromExecuteCommand(d: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32) {
         }
         d[C_IFR] = 3;
         qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
+        if (cmd == CDL_SETMODE) {
+            // psxe impl.c:363 — SetMode calls cdrom_pause(), which hard
+            // resets state machine: stops any ongoing read, drops state
+            // and prev_state to IDLE, clears read_ongoing. Without this,
+            // SetMode issued during a streaming read leaves us in READ
+            // and we bounce sectors out of step with the BIOS.
+            d[C_STATE]        = CD_STATE_IDLE as u8;
+            d[C_PREV_STATE]   = CD_STATE_IDLE as u8;
+            d[C_READ_ONGOING] = 0;
+            return;
+        }
         d[C_STATE] = d[C_PREV_STATE];
         return;
     }
@@ -501,6 +513,15 @@ pub fn cdromExecuteCommand(d: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32) {
         d[C_IFR] = 3;
         qPush(d, C_RESP_BUF, C_RESP_R, C_RESP_W, cdromGetStat(d));
         cdromProcessSetloc(d);
+        // Match psxe impl.c:218-239: eagerly preload sector 0 into the
+        // data FIFO inside the command handler so the BIOS / game sees
+        // sector content in the FIFO between the INT3 ack and the
+        // first INT1. Without this, polling for STAT after CdlReadN
+        // sees stale data for ~6 ms.
+        if (d[C_HAS_DISC] != 0) {
+            const lba0: u32 = cdGetU32(d, C_LBA);
+            cdromDiscReadAt(d, disc, lba0);
+        }
         d[C_STATE]      = CD_STATE_READ as u8;
         d[C_PREV_STATE] = CD_STATE_READ as u8;
         d[C_READ_ONGOING] = 1;
@@ -828,7 +849,7 @@ pub fn cdromUpdate(d: *mut[] u8, disc: *mut[] Disc, spu: *mut[] u8,
         return;
     }
     if (d[C_STATE] == CD_STATE_TX_RESP1 as u8) {
-        cdromExecuteCommand(d, ic, cop0);
+        cdromExecuteCommand(d, disc, ic, cop0);
         // psxe cdrom.c:548-554: switching to READ after a non-read
         // command in TX_RESP1 (e.g. SetMode/SetLoc/SeekL during a
         // streaming read) incurs the "ongoing-read" delay of

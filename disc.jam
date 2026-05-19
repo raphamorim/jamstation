@@ -107,15 +107,23 @@ pub fn discOpen(d: *mut[] Disc, path: []u8) i32 {
 
 // Read one 2352-byte sector at `lba` (absolute, including lead-in) into
 // `buf`. Returns 1 on success, 0 on out-of-range or no-disc.
+// Fill a 2352-byte buffer with the PSX CD-ROM pregap sector layout:
+// byte 0 = 0x00, bytes 1..10 = 0xFF (sync pattern), byte 11 = 0x00, rest
+// zero. Matches psxe cue.c:535-536. Some games inspect the sync pattern
+// when reading pregap sectors and would otherwise see all-zero data.
+pub fn fillPregapSector(buf: *mut[] u8) {
+    memset(buf, 0, SECTOR_SIZE as u64);
+    var i: u32 = 1;
+    while (i < 11) { buf[i] = 0xFF; i = i + 1; }
+}
+
 pub fn discRead(d: *mut[] Disc, lba: u32, buf: *mut[] u8) i32 {
     if (d[0].loaded == 0) { return 0; }
     if (d[0].isCue != 0) {
         return cueRead(d[0].cuePtr, lba, buf);
     }
     if (lba < LEAD_IN_SECTORS) {
-        // Pre-gap: real CDs have 2 sec of silence here; we return zeros
-        // so the BIOS sees a "blank" sector and doesn't fault.
-        memset(buf, 0, SECTOR_SIZE as u64);
+        fillPregapSector(buf);
         return 1;
     }
     const off: i64 = ((lba - LEAD_IN_SECTORS) as i64) * (SECTOR_SIZE as i64);

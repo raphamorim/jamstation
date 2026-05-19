@@ -352,14 +352,18 @@ pub fn cueRead(raw: *mut[] u8, lba: u32, buf: *mut[] u8) i32 {
         if (c[0].trackCount > 0 && lba >= c[0].tracks[c[0].trackCount - 1].endLba) {
             return 0;
         }
-        // Pregap: psxe returns a zero sector with sync pattern.
+        // Pregap: psxe cue.c:535-536 fills zero + sync at bytes [1..10].
         memset(buf, 0, SECTOR as u64);
+        var i: u32 = 1;
+        while (i < 11) { buf[i] = 0xFF; i = i + 1; }
         return 1;
     }
     const fi: u32 = c[0].tracks[ti].fileIdx;
     const off: i64 = ((lba - c[0].files[fi].startLba) as i64) * (SECTOR as i64);
     if (off < 0) {
         memset(buf, 0, SECTOR as u64);
+        var j: u32 = 1;
+        while (j < 11) { buf[j] = 0xFF; j = j + 1; }
         return 1;
     }
     fseek(c[0].files[fi].file, off, 0);
