@@ -167,7 +167,6 @@ const C0_PRID:  u32 = 15;
 const CYCLES_PER_FRAME: u32 = 564480;
 const VRAM_WIDTH:  i32 = 1024;
 const VRAM_HEIGHT: i32 = 512;
-const VRAM_PITCH:  i32 = 2048;        // bytes per row at 16 bpp
 
 // Maximum on-screen resolution we support — 640×480 is the largest the
 // PSX can produce (interlaced 640H × 480V). The SDL window is sized to
@@ -197,9 +196,17 @@ fn dmodeWidth(dm: u32) i32 {
     return 640;
 }
 
-fn dmodeHeight(dm: u32) i32 {
-    // Vertical 480 requires interlace (bit 5).
+fn dmodeHeight(dm: u32, gpuState: *mut[] u32) i32 {
+    // Vertical 480 requires interlace (bit 5) + bit 2 set per psxe.
     if ((dm & 0x04) != 0 && (dm & 0x20) != 0) { return 480; }
+    // psxe: when bit 2 alone is set, also 480.
+    if ((dm & 0x04) != 0) { return 480; }
+    // Otherwise compute from GP1(07) vertical range. g[67]=disp_y1,
+    // g[68]=disp_y2. Mirrors psxe psx_get_dmode_height.
+    const y1: i32 = gpuState[67] as i32;
+    const y2: i32 = gpuState[68] as i32;
+    const disp: i32 = y2 - y1;
+    if (disp > 0 && disp < 239) { return disp; }
     return 240;
 }
 
@@ -616,13 +623,19 @@ fn main() {
         var gpuState: *mut[] u32 = busGpuPtr(bus);
         const dispX: i32 = gpuState[63] as i32;
         const dispY: i32 = gpuState[64] as i32;
+        // GPUSTAT bit 21 (mode bit 4) = 24bpp display.
+        // GPUSTAT bit 23 = display disabled (black screen).
+        const dm: u32 = gpuState[47];
+        const is24bpp: bool = (dm & 0x10) != 0;
+        const displayOff: bool = (gpuState[46] & 0x00800000) != 0;
         if (fullVram) {
-            sdlBlit(sdl, vram, VRAM_PITCH, 0, 0, VRAM_WIDTH, VRAM_HEIGHT);
+            sdlBlit(sdl, vram, 0, 0, VRAM_WIDTH, VRAM_HEIGHT,
+                false, displayOff);
         } else {
-            const dm: u32 = gpuState[47];
             const w: i32 = dmodeWidth(dm);
-            const h: i32 = dmodeHeight(dm);
-            sdlBlit(sdl, vram, VRAM_PITCH, dispX, dispY, w, h);
+            const h: i32 = dmodeHeight(dm, gpuState);
+            sdlBlit(sdl, vram, dispX, dispY, w, h,
+                is24bpp, displayOff);
         }
         quit = sdlPump();
         frames = frames + 1;

@@ -169,6 +169,7 @@ const CDL_READTOC:    u32 = 0x1E;
 const MODE_SECTOR_SIZE: u32 = 0x20;   // 0 = 0x800 payload, 1 = 0x924 raw
 const MODE_SPEED:       u32 = 0x80;   // 0 = 1x, 1 = 2x
 const MODE_XA_ADPCM:    u32 = 0x40;   // 1 = enable XA-ADPCM streaming
+const MODE_XA_FILTER:   u32 = 0x08;   // 1 = honour CdlSetFilter file/chan
 const CDL_SEEKL:    u32 = 0x15;
 const CDL_TEST:     u32 = 0x19;
 const CDL_GETID:    u32 = 0x1A;
@@ -905,7 +906,10 @@ pub fn cdromHandleRead(d: *mut[] u8, disc: *mut[] Disc, spu: *mut[] u8) {
     // subheader sector, and (if a CdlSetFilter is in effect) the file/
     // channel match, decode it and push samples into the SPU CD-audio
     // FIFO. The BIOS keeps sending sector reads through this path; the
-    // SPU drains one stereo sample per audio output tick.
+    // SPU drains one stereo sample per audio output tick. We mirror
+    // psxe's behavior: always raise INT1 regardless of submode (psxe
+    // relies on the game/MDEC reader to ignore audio sectors based on
+    // subheader at offset 0x12).
     if ((d[C_MODE] as u32 & MODE_XA_ADPCM) != 0) {
         cdromTryDecodeXa(d, spu);
     }
@@ -935,10 +939,15 @@ pub fn cdromTryDecodeXa(d: *mut[] u8, spu: *mut[] u8) {
         free(scratch);
         return;
     }
-    if (!xaSectorMatchesFilter(scratch,
-            d[C_XA_FILE] as u32, d[C_XA_CHANNEL] as u32)) {
-        free(scratch);
-        return;
+    // Only enforce file/channel match when MODE_XA_FILTER is enabled.
+    // Some games (e.g. ones that drive XA without CdlSetFilter) leave
+    // the bit off and expect every audio sector to be decoded.
+    if ((d[C_MODE] as u32 & MODE_XA_FILTER) != 0) {
+        if (!xaSectorMatchesFilter(scratch,
+                d[C_XA_FILE] as u32, d[C_XA_CHANNEL] as u32)) {
+            free(scratch);
+            return;
+        }
     }
     var leftBuf:  *mut[] i32 = malloc(2016 * 4) as *mut[] i32;
     var rightBuf: *mut[] i32 = malloc(2016 * 4) as *mut[] i32;

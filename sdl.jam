@@ -145,8 +145,11 @@ pub fn sdlInit(title: []u8, width: i32, height: i32) Sdl {
         SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     var ren: *mut[] u8 = SDL_CreateRenderer(win, -1,
         SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    // Use ARGB8888 (32-bit) so the blit can target both 15bpp and 24bpp
+    // PSX display modes through a single texture. The conversion happens
+    // per-pixel in sdlBlit; SDL gets a canonical 4-byte format.
     var tex: *mut[] u8 = SDL_CreateTexture(ren,
-        SDL_PIXELFORMAT_BGR555, SDL_TEXTUREACCESS_STREAMING,
+        SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
         width, height);
     var s: Sdl = Sdl {
         window: win, renderer: ren, texture: tex,
@@ -237,49 +240,87 @@ pub fn packRect(buf: *mut[] u8, x: i32, y: i32, w: i32, h: i32) {
 // window. This is how we crop the on-screen image to the BIOS's actual
 // display window — without it, the SDL texture would also show the
 // off-screen texture pages and CLUTs that live elsewhere in VRAM.
-pub fn sdlBlit(s: Sdl, pixels: *mut[] u8, pitch: i32,
-               dx: i32, dy: i32, dw: i32, dh: i32) {
-    var srcRect:  *mut[] u8 = malloc(16);
+// sdlBlit — copy a rectangle of VRAM to the SDL texture, expanding to
+// ARGB8888. `is24bpp` selects between PSX 15bpp BGR555 (1 pixel per
+// 16-bit VRAM cell) and PSX 24bpp packed (3 bytes per pixel in raw VRAM
+// byte order R,G,B,R,G,B,…). `displayOff` forces a black frame.
+//
+// VRAM row stride is fixed at 2048 bytes (1024 cells × 2 bytes) for both
+// modes; only the per-pixel size and the unpack differs.
+pub fn sdlBlit(s: Sdl, pixels: *mut[] u8,
+               dx: i32, dy: i32, dw: i32, dh: i32,
+               is24bpp: bool, displayOff: bool) {
     var fullRect: *mut[] u8 = malloc(16);
-    packRect(srcRect, dx, dy, dw, dh);
     packRect(fullRect, 0, 0, s.width, s.height);
-    // SDL_UpdateTexture's "rect" arg means *destination on the texture*.
-    // We want to put the same 320×240 patch at the texture's top-left,
-    // then render that patch scaled to fill the window.
     var dstOnTex: *mut[] u8 = malloc(16);
     packRect(dstOnTex, 0, 0, dw, dh);
-    // Offset into VRAM where the visible region starts.
-    const ny: u32 = dy as u32;
-    const nx: u32 = dx as u32;
-    const offBytes: u32 = (ny * 1024 + nx) * 2;
-    // Manually compute the byte pointer past dx/dy. `pixels` is a
-    // many-item pointer; Jam doesn't have pointer-arithmetic syntax,
-    // so we feed `pixels` as-is with pitch=2048 and pass a sub-rect
-    // src offset via a small wrapping byte loop.  Cheap shortcut: build
-    // a packed buffer that holds only the visible pixels and pass it
-    // straight in.  Avoids touching SDL ABI internals.
-    const cropBytes: u64 = (dw * dh * 2) as u64;
+
+    // Destination buffer is always ARGB8888 = 4 bytes/pixel.
+    const dwU: u32 = dw as u32;
+    const dhU: u32 = dh as u32;
+    const cropBytes: u64 = (dwU * dhU * 4) as u64;
     var cropped: *mut[] u8 = malloc(cropBytes);
-    var row: u32 = 0;
-    while ((row as i32) < dh) {
-        const srcOff: u32 = ((dy as u32 + row) * 1024 + dx as u32) * 2;
-        const dstOff: u32 = row * (dw as u32) * 2;
-        var c: u32 = 0;
-        const rowBytes: u32 = (dw as u32) * 2;
-        while (c < rowBytes) {
-            cropped[dstOff + c] = pixels[srcOff + c];
-            c = c + 1;
+
+    if (displayOff) {
+        memset(cropped, 0, cropBytes);
+    } else {
+        var row: u32 = 0;
+        while (row < dhU) {
+            const dstBase: u32 = row * dwU * 4;
+            // VRAM row stride: 2048 bytes. dx is in cell units (16-bit),
+            // so byte offset is dx*2 for 15bpp. For 24bpp the source x is
+            // still in 16-bit-cell units but each pixel is 3 bytes, so
+            // bytes-per-row read = dwU * 3 starting at dx*2.
+            const srcRowBase: u32 = (dy as u32 + row) * 2048
+                                   + (dx as u32) * 2;
+            if (is24bpp) {
+                var x: u32 = 0;
+                while (x < dwU) {
+                    const sb: u32 = srcRowBase + x * 3;
+                    const r: u8 = pixels[sb];
+                    const g: u8 = pixels[sb + 1];
+                    const b: u8 = pixels[sb + 2];
+                    const db: u32 = dstBase + x * 4;
+                    cropped[db]     = b;   // ARGB8888 little-endian: B,G,R,A
+                    cropped[db + 1] = g;
+                    cropped[db + 2] = r;
+                    cropped[db + 3] = 0xFF;
+                    x = x + 1;
+                }
+            } else {
+                var x: u32 = 0;
+                while (x < dwU) {
+                    const sb: u32 = srcRowBase + x * 2;
+                    const lo: u32 = pixels[sb]     as u32;
+                    const hi: u32 = pixels[sb + 1] as u32;
+                    const px: u32 = lo | (hi << 8);
+                    // BGR555 → 8888 (5→8 by left-shift + replicate high
+                    // bits; cheap "x<<3 | x>>2" expansion).
+                    const r5: u32 =  px        & 0x1F;
+                    const g5: u32 = (px >> 5)  & 0x1F;
+                    const b5: u32 = (px >> 10) & 0x1F;
+                    const r8: u32 = (r5 << 3) | (r5 >> 2);
+                    const g8: u32 = (g5 << 3) | (g5 >> 2);
+                    const b8: u32 = (b5 << 3) | (b5 >> 2);
+                    const db: u32 = dstBase + x * 4;
+                    cropped[db]     = b8 as u8;
+                    cropped[db + 1] = g8 as u8;
+                    cropped[db + 2] = r8 as u8;
+                    cropped[db + 3] = 0xFF;
+                    x = x + 1;
+                }
+            }
+            row = row + 1;
         }
-        row = row + 1;
     }
-    SDL_UpdateTexture(s.texture, dstOnTex, cropped, dw * 2);
+
+    SDL_UpdateTexture(s.texture, dstOnTex, cropped, dw * 4);
     SDL_RenderClear(s.renderer);
     SDL_RenderCopy(s.renderer, s.texture, dstOnTex, fullRect);
     SDL_RenderPresent(s.renderer);
     free(cropped);
     free(dstOnTex);
     free(fullRect);
-    free(srcRect);
 }
 
 // Pump SDL events. Returns non-zero when the user has requested quit

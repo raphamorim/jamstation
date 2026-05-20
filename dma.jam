@@ -340,7 +340,7 @@ pub fn dmaDoGpuLinked(d: *mut[] u32, bus: Bus) {
 // data port (0x1F801820), which buffers it as command parameters or
 // command body. When all words for the active MDEC command are
 // delivered, MDEC's internal state machine runs the decode and fills
-// its output buffer (mdec.jam:mdecWrite32).
+// its output buffer (mdec.jam:mdecWrite32). Matches psxe dma.c:179-205.
 pub fn dmaDoMdecIn(d: *mut[] u32, bus: Bus) {
     if (!chcrBusy(d, 0)) { return; }
     const size: u32 = bcrSize(d, 0) * bcrBlocks(d, 0);
@@ -359,8 +359,7 @@ pub fn dmaDoMdecIn(d: *mut[] u32, bus: Bus) {
     d[23] = size;
 }
 
-// DMA1: MDEC output port → RAM. Drains decoded RGB words from the MDEC
-// output FIFO (0x1F801820 reads when output_words_remaining > 0).
+// DMA1: MDEC output port → RAM. Match psxe exactly (dma.c:208-235).
 pub fn dmaDoMdecOut(d: *mut[] u32, bus: Bus) {
     if (!chcrBusy(d, 1)) { return; }
     const size: u32 = bcrSize(d, 1) * bcrBlocks(d, 1);
