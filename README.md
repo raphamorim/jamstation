@@ -1,4 +1,4 @@
-# PSOne Emulator written in Jam
+# JamStation: PSOne Emulator written in Jam
 
 A PlayStation 1 emulator written in [Jam Programming Language](https://github.com/raphamorim/jam). It uses SDL2 for rendering.
 
