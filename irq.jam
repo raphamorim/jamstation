@@ -36,8 +36,11 @@ const CAUSE_IP2: u32 = 0x00000400;
 const C0_CAUSE: u32 = 13;
 
 pub fn irqAlloc() *mut[] u32 {
-    var raw: *mut[] u8 = malloc(8);
-    memset(raw, 0, 8);
+    // 8 bytes for stat/mask + 11 × 4 bytes for per-source fire counters
+    // (ic[2..12]) + slack. Used by main.jam to print which interrupt
+    // sources are firing during a hang.
+    var raw: *mut[] u8 = malloc(64);
+    memset(raw, 0, 64);
     return raw as *mut[] u32;
 }
 
@@ -137,5 +140,21 @@ pub fn irqWrite8(ic: *mut[] u32, cop0: *mut[] u32, off: u32, val: u32) {
 // when a peripheral wants the CPU's attention.
 pub fn irqRaise(ic: *mut[] u32, cop0: *mut[] u32, lines: u32) {
     ic[0] = ic[0] | lines;
+    // Increment per-source fire counter for each line in the mask.
+    // ic[2+bit] is the counter for IRQ source bit. Used by main.jam to
+    // print a histogram of which IRQs are firing during a hang.
+    var b: u32 = 0;
+    while (b < 11) {
+        if ((lines & (1 << b)) != 0) {
+            ic[2 + b] = ic[2 + b] + 1;
+        }
+        b = b + 1;
+    }
     irqReevaluate(ic, cop0);
+}
+
+// Return the fire count for source bit `b` (0=VBLANK ... 10=LP_PIO).
+pub fn irqCount(ic: *mut[] u32, b: u32) u32 {
+    if (b >= 11) { return 0; }
+    return ic[2 + b];
 }

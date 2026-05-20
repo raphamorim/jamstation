@@ -171,21 +171,17 @@ pub fn dmaRead16(d: *mut[] u32, off: u32) u32 { return dmaRead32(d, off) & 0xFFF
 pub fn dmaRead8(d: *mut[] u32, off: u32) u32 { return dmaRead32(d, off) & 0xFF; }
 
 pub fn dmaWriteDicr(d: *mut[] u32, val: u32) {
+    // Mirror psxe dma_write_dicr (dma.c:108-118) exactly. Preserve only
+    // bit 31 (IRQSI master flag) from the prior state, write-1-to-clear
+    // the channel flags, and copy the rest of the new value verbatim.
+    // Do NOT pre-recompute IRQSI here — dmaUpdate's edge detector
+    // requires `prev = old IRQSI` to fire a 0->1 transition.
     const ack: u32 = val & DICR_FLAGS;
     var flags: u32 = d[22] & DICR_FLAGS;
     flags = (flags & (~ack)) & DICR_FLAGS;
     var nd: u32 = d[22] & 0x80000000;
     nd = nd | flags;
     nd = nd | (val & 0xFFFFFF);
-    // Recompute the master-flag (bit 31) inline so the BIOS doesn't see a
-    // stale `master=1, no channel flags` reading between dmaUpdate ticks.
-    // psxe gets away with deferring this because its dma_update runs more
-    // often than ours; for safety we do it on every write.
-    const irqEn:  u32 = nd & DICR_IRQEN;
-    const forceB: u32 = nd & DICR_FORCE;
-    const fl:     u32 = nd & DICR_FLAGS;
-    nd = nd & (~DICR_IRQSI);
-    if (forceB != 0 || (fl != 0 && irqEn != 0)) { nd = nd | DICR_IRQSI; }
     d[22] = nd;
 }
 

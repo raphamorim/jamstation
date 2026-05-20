@@ -50,6 +50,8 @@ const Disc = struct {
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
 pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+pub extern fn printf(format: *const[] u8, ...) i32;
+pub extern fn fflush(stream: u64) i32;
 
 // The Bus struct holds every piece of state we route through the
 // memory bus: raw buffers (RAM, BIOS, scratchpad, flat-IO fallback,
@@ -142,30 +144,30 @@ pub fn bufWrite8(buf: *mut[] u8, off: u32, val: u32) {
 //   5 = EXP1 (returns 0xFF on read — psxe psx_exp1_read* with no cart loaded)
 pub fn route(paddr: u32) BusRoute {
     if (paddr < 0x00800000) {
-        var r: BusRoute = { kind: 1, off: paddr & 0x001FFFFF };
+        var r: BusRoute = BusRoute { kind: 1, off: paddr & 0x001FFFFF };
         return r;
     }
     if (paddr >= 0x1F000000 && paddr < 0x1F080000) {
-        var r: BusRoute = { kind: 5, off: paddr - 0x1F000000 };
+        var r: BusRoute = BusRoute { kind: 5, off: paddr - 0x1F000000 };
         return r;
     }
     if (paddr >= 0x1F800000 && paddr < 0x1F800400) {
-        var r: BusRoute = { kind: 3, off: paddr - 0x1F800000 };
+        var r: BusRoute = BusRoute { kind: 3, off: paddr - 0x1F800000 };
         return r;
     }
     if (paddr >= 0x1F801000 && paddr < 0x1F803000) {
-        var r: BusRoute = { kind: 4, off: paddr - 0x1F801000 };
+        var r: BusRoute = BusRoute { kind: 4, off: paddr - 0x1F801000 };
         return r;
     }
     if (paddr >= 0x1FC00000 && paddr < 0x1FC80000) {
-        var r: BusRoute = { kind: 2, off: paddr - 0x1FC00000 };
+        var r: BusRoute = BusRoute { kind: 2, off: paddr - 0x1FC00000 };
         return r;
     }
     if (paddr >= 0xFFFE0130 && paddr < 0xFFFE0134) {
-        var r: BusRoute = { kind: 4, off: 0x1F00 + (paddr - 0xFFFE0130) };
+        var r: BusRoute = BusRoute { kind: 4, off: 0x1F00 + (paddr - 0xFFFE0130) };
         return r;
     }
-    var r: BusRoute = { kind: 0, off: 0 };
+    var r: BusRoute = BusRoute { kind: 0, off: 0 };
     return r;
 }
 
@@ -197,7 +199,7 @@ pub fn allocBus() Bus {
     bufWrite32(io, 0x1C, 0x00070777);  // EXP2_DELAY
     bufWrite32(io, 0x20, 0x00031125);  // COM_DELAY
     bufWrite32(io, 0x60, 0x00000B88);  // MC2 RAM_SIZE (2 MB mirror config)
-    var b: Bus = {
+    var b: Bus = Bus {
         ram: ram, bios: bios, spad: spad, io: io, vram: vram,
         gpu:   gpuAlloc(),
         dma:   dmaAlloc(),

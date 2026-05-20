@@ -295,9 +295,18 @@ const SCANLINES_TOTAL: u32 = 263;
 // land at quantized points up to 2k cycles after the equivalent psxe
 // fire — games that polled an IRQ flag at instruction-level granularity
 // (Musashi, Harvest Moon) saw IRQs at the wrong instruction.
+
+// psxe: hblank window is ~25% of the scanline (cycles 2560..3413 of
+// 3413 GPU cycles, ≈ 75% draw + 25% blank). We mark HBlank_Begin at
+// HDRAW (cycles_per_scanline * 3/4) and HBlank_End at the scanline
+// boundary. Without the gap, T0 sync modes 0/2 collapse to noise and
+// any BIOS code that polls `hblank==1` busy-loops forever.
+const CYCLES_HDRAW: u32 = (CYCLES_PER_SCANLINE * 3) / 4;
+
 fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     var line: u32 = 0;
     var lineCyc: u32 = 0;
+    var hblankFired: bool = false;
     while (line < SCANLINES_TOTAL) {
         biosHook(c, bus, regs);
         const before: u64 = c.cycles;
@@ -311,15 +320,37 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         sio1Update(bus.sio1, bus.irq, cop0, delta);
         spuUpdate(bus.spu, bus.spuram, bus.irq, cop0, delta);
         lineCyc = lineCyc + delta;
+        // HBlank begins ~75% into the scanline. Fire once per line.
+        if (!hblankFired && lineCyc >= CYCLES_HDRAW) {
+            timerHblankBegin(bus.timer, bus.irq, cop0);
+            hblankFired = true;
+        }
         if (lineCyc >= CYCLES_PER_SCANLINE) {
             lineCyc = lineCyc - CYCLES_PER_SCANLINE;
-            timerHblankBegin(bus.timer, bus.irq, cop0);
+            hblankFired = false;
+            // HBlank ends at the scanline boundary, before the next line.
             timerHblankEnd(bus.timer);
+            // psxe gpu.c:1908-1946: toggle GPUSTAT bit 31 (odd-line flag)
+            // per scanline. BIOS VSync uses this as a heartbeat; if it
+            // stays at 0, the BIOS busy-spins on GPUSTAT instead of
+            // returning to the VBlank handler chain that runs pad-poll.
+            if (line < SCANLINES_VDRAW) {
+                if ((line & 1) != 0) {
+                    bus.gpu[46] = bus.gpu[46] | 0x80000000;
+                } else {
+                    bus.gpu[46] = bus.gpu[46] & (~0x80000000);
+                }
+            } else {
+                bus.gpu[46] = bus.gpu[46] & (~0x80000000);
+            }
+            // psxe fires VBlank when `line` *becomes* 240, i.e. after the
+            // increment. Previously we fired before the increment, so
+            // VBlank arrived one scanline late (~2172 cycles).
+            line = line + 1;
             if (line == SCANLINES_VDRAW) {
                 timerVblankBegin(bus.timer, bus.irq, cop0);
                 irqRaise(bus.irq, cop0, IC_VBLANK());
             }
-            line = line + 1;
         }
     }
     // NOTE: do NOT commitLoad here. Each instruction's own commitLoad
@@ -595,6 +626,7 @@ fn main() {
         }
         quit = sdlPump();
         frames = frames + 1;
+
         // Bail after a long-but-finite session if no quit event comes —
         // protects users from a runaway window when there's no controller
         // input wired up yet.

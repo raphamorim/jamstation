@@ -148,7 +148,7 @@ pub fn sdlInit(title: []u8, width: i32, height: i32) Sdl {
     var tex: *mut[] u8 = SDL_CreateTexture(ren,
         SDL_PIXELFORMAT_BGR555, SDL_TEXTUREACCESS_STREAMING,
         width, height);
-    var s: Sdl = {
+    var s: Sdl = Sdl {
         window: win, renderer: ren, texture: tex,
         width: width, height: height,
     };

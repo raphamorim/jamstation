@@ -154,7 +154,7 @@ pub fn cop0Read(cop0: *mut[] u32, idx: u32) u32 { return cop0[idx]; }
 pub fn cop0Write(cop0: *mut[] u32, idx: u32, val: u32) { cop0[idx] = val; }
 
 pub fn freshCpu() Cpu {
-    var c: Cpu = {
+    var c: Cpu = Cpu {
         pc: 0xBFC00000, nextPc: 0xBFC00004,
         savedPc: 0, hi: 0, lo: 0,
         loadD: 0, loadV: 0,
@@ -1218,10 +1218,6 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     }
 
     const opc: u32 = busRead32(bus, c.pc);
-
-    // Arm at first hit of PC=0x1EB0, then dump 100 PCs before we got
-    // there (using a circular buffer in cop0 slots 25-26) plus the
-    // next 100 PCs after arming.
 
     c.pc = c.nextPc;
     c.nextPc = c.nextPc + 4;

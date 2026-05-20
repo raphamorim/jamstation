@@ -118,7 +118,7 @@ fn allocHarness() Harness {
     var cop0: *mut[] u32 = allocRegFile(16);
     var bus: Bus = allocBus();
     var cpu: Cpu = freshCpuAt(0x80000000);
-    var h: Harness = { cpu: cpu, regs: regs, cop0: cop0, bus: bus };
+    var h: Harness = Harness { cpu: cpu, regs: regs, cop0: cop0, bus: bus };
     return h;
 }
 
