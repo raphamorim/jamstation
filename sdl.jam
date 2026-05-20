@@ -13,6 +13,8 @@ extern fn malloc(size: u64) *mut[] u8;
 extern fn free(ptr: *mut[] u8);
 extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 
+const { Vec } = import("std/collections");
+
 // SDL_Init flags. We need video + events (and game-controller would
 // be nice but not required for this build).
 const SDL_INIT_VIDEO:  u32 = 0x00000020;
@@ -259,10 +261,10 @@ pub fn sdlBlit(s: Sdl, pixels: *mut[] u8,
     const dwU: u32 = dw as u32;
     const dhU: u32 = dh as u32;
     const cropBytes: u64 = (dwU * dhU * 4) as u64;
-    var cropped: *mut[] u8 = malloc(cropBytes);
+    var cropped: Vec(u8) = Vec(u8).withCapacity(cropBytes as u32);
 
     if (displayOff) {
-        memset(cropped, 0, cropBytes);
+        memset(cropped.ptr, 0, cropBytes);
     } else {
         var row: u32 = 0;
         while (row < dhU) {
@@ -314,19 +316,77 @@ pub fn sdlBlit(s: Sdl, pixels: *mut[] u8,
         }
     }
 
-    SDL_UpdateTexture(s.texture, dstOnTex, cropped, dw * 4);
+    SDL_UpdateTexture(s.texture, dstOnTex, cropped.ptr, dw * 4);
     SDL_RenderClear(s.renderer);
     SDL_RenderCopy(s.renderer, s.texture, dstOnTex, fullRect);
     SDL_RenderPresent(s.renderer);
-    free(cropped);
+    // cropped auto-drops on function-scope exit. dstOnTex / fullRect
+    // stay raw — they're C-ABI SDL_Rect structs we hand to SDL2.
     free(dstOnTex);
     free(fullRect);
 }
 
+// SDL scancodes (USB HID page 7) — see SDL2 SDL_scancode.h.
+const SC_ESC:    u32 = 41;
+const SC_UP:     u32 = 82;
+const SC_DOWN:   u32 = 81;
+const SC_LEFT:   u32 = 80;
+const SC_RIGHT:  u32 = 79;
+const SC_Z:      u32 = 29;
+const SC_X:      u32 = 27;
+const SC_A:      u32 = 4;
+const SC_S:      u32 = 22;
+const SC_Q:      u32 = 20;
+const SC_W:      u32 = 26;
+const SC_1:      u32 = 30;
+const SC_2:      u32 = 31;
+const SC_RETURN: u32 = 40;
+const SC_RSHIFT: u32 = 229;
+
+// PSX SDA digital-pad button bits (active-low: 0 = pressed). Layout
+// matches the second-byte / third-byte response of a poll(0x42) command.
+const BTN_SELECT:   u32 = 0x0001;
+const BTN_START:    u32 = 0x0008;
+const BTN_UP:       u32 = 0x0010;
+const BTN_RIGHT:    u32 = 0x0020;
+const BTN_DOWN:     u32 = 0x0040;
+const BTN_LEFT:     u32 = 0x0080;
+const BTN_L2:       u32 = 0x0100;
+const BTN_R2:       u32 = 0x0200;
+const BTN_L1:       u32 = 0x0400;
+const BTN_R1:       u32 = 0x0800;
+const BTN_TRIANGLE: u32 = 0x1000;
+const BTN_CIRCLE:   u32 = 0x2000;
+const BTN_CROSS:    u32 = 0x4000;
+const BTN_SQUARE:   u32 = 0x8000;
+
+// Translate a USB-HID scancode to a PSX SDA button mask bit. Returns 0
+// for unmapped keys. Keep close to the standard PCSX / DuckStation /
+// PSXE keybinding layout so it feels familiar.
+pub fn scancodeToBtn(scan: u32) u32 {
+    if (scan == SC_UP)     { return BTN_UP; }
+    if (scan == SC_DOWN)   { return BTN_DOWN; }
+    if (scan == SC_LEFT)   { return BTN_LEFT; }
+    if (scan == SC_RIGHT)  { return BTN_RIGHT; }
+    if (scan == SC_Z)      { return BTN_CROSS; }
+    if (scan == SC_X)      { return BTN_CIRCLE; }
+    if (scan == SC_A)      { return BTN_SQUARE; }
+    if (scan == SC_S)      { return BTN_TRIANGLE; }
+    if (scan == SC_Q)      { return BTN_L1; }
+    if (scan == SC_W)      { return BTN_R1; }
+    if (scan == SC_1)      { return BTN_L2; }
+    if (scan == SC_2)      { return BTN_R2; }
+    if (scan == SC_RETURN) { return BTN_START; }
+    if (scan == SC_RSHIFT) { return BTN_SELECT; }
+    return 0;
+}
+
 // Pump SDL events. Returns non-zero when the user has requested quit
-// (close button, Cmd-Q, ESC). Allocates the event buffer once per call
-// — fine for our 60 Hz cadence.
-pub fn sdlPump() u32 {
+// (close button, Cmd-Q, ESC). The `buttons` slot is a 1-element u32
+// array holding the active-low PSX SDA mask (0xFFFF = no buttons).
+// KEYDOWN clears the bit, KEYUP sets it; updates take effect on the
+// next controller poll.
+pub fn sdlPump(buttons: *mut[] u32) u32 {
     var ev: *mut[] u8 = malloc(SDL_EVENT_SIZE as u64);
     memset(ev, 0, SDL_EVENT_SIZE as u64);
     var quit: u32 = 0;
@@ -336,14 +396,25 @@ pub fn sdlPump() u32 {
                      | ((ev[2] as u32) << 16)
                      | ((ev[3] as u32) << 24);
         if (t == SDL_QUIT) { quit = 1; }
-        // ESC key — keyboard event lays the scancode at offset 12 (a
-        // SDL_Keysym.scancode). Scancode 41 = SDL_SCANCODE_ESCAPE.
-        if (t == SDL_KEYDOWN) {
-            const scan: u32 = (ev[12] as u32)
-                            | ((ev[13] as u32) << 8)
-                            | ((ev[14] as u32) << 16)
-                            | ((ev[15] as u32) << 24);
-            if (scan == 41) { quit = 1; }
+        if (t == SDL_KEYDOWN || t == SDL_KEYUP) {
+            // SDL_KeyboardEvent layout: type(4) + timestamp(4) +
+            // windowID(4) + state(1) + repeat(1) + padding2(1) +
+            // padding3(1) = 16 bytes before SDL_Keysym, whose first
+            // field is the i32 scancode. So scancode bytes live at
+            // offsets 16..19 of the event blob.
+            const scan: u32 = (ev[16] as u32)
+                            | ((ev[17] as u32) << 8)
+                            | ((ev[18] as u32) << 16)
+                            | ((ev[19] as u32) << 24);
+            if (scan == SC_ESC && t == SDL_KEYDOWN) { quit = 1; }
+            const bit: u32 = scancodeToBtn(scan);
+            if (bit != 0) {
+                if (t == SDL_KEYDOWN) {
+                    buttons[0] = buttons[0] & (~bit);
+                } else {
+                    buttons[0] = buttons[0] | bit;
+                }
+            }
         }
     }
     free(ev);

@@ -41,6 +41,7 @@ const {
     xaDecodeSector
 } = import("xa");
 const { spuPushCdSample } = import("spu");
+const { Vec } = import("std/collections");
 
 // Disc struct redeclaration (same shape as disc.jam) so we can hold a
 // `*mut[] Disc` pointer here without an explicit Disc import.
@@ -929,44 +930,42 @@ pub fn cdromHandleRead(d: *mut[] u8, disc: *mut[] Disc, spu: *mut[] u8) {
 // pairs per channel) live in the cdrom state at C_XA_LH / C_XA_RH so
 // block N's predictor still sees block N-1's tail.
 pub fn cdromTryDecodeXa(d: *mut[] u8, spu: *mut[] u8) {
-    var scratch: *mut[] u8 = malloc(SECTOR_BYTES as u64);
+    var scratch: Vec(u8) = Vec(u8).withCapacity(SECTOR_BYTES);
     var i: u32 = 0;
     while (i < SECTOR_BYTES) {
         scratch[i] = d[C_DATA_BUF + i];
         i = i + 1;
     }
-    if (!xaSectorIsAudio(scratch)) {
-        free(scratch);
+    if (!xaSectorIsAudio(scratch.ptr)) {
         return;
     }
     // Only enforce file/channel match when MODE_XA_FILTER is enabled.
     // Some games (e.g. ones that drive XA without CdlSetFilter) leave
     // the bit off and expect every audio sector to be decoded.
     if ((d[C_MODE] as u32 & MODE_XA_FILTER) != 0) {
-        if (!xaSectorMatchesFilter(scratch,
+        if (!xaSectorMatchesFilter(scratch.ptr,
                 d[C_XA_FILE] as u32, d[C_XA_CHANNEL] as u32)) {
-            free(scratch);
             return;
         }
     }
-    var leftBuf:  *mut[] i32 = malloc(2016 * 4) as *mut[] i32;
-    var rightBuf: *mut[] i32 = malloc(2016 * 4) as *mut[] i32;
-    var monoBuf:  *mut[] i32 = malloc(4032 * 4) as *mut[] i32;
+    var leftBuf:  Vec(i32) = Vec(i32).withCapacity(2016);
+    var rightBuf: Vec(i32) = Vec(i32).withCapacity(2016);
+    var monoBuf:  Vec(i32) = Vec(i32).withCapacity(4032);
     // Carry history out via a small scratch buffer (8 bytes per channel)
     // and write it back into the cdrom state when done. Direct slice
     // offset into `d` would be cleaner but Jam can't form the view.
-    var hist: *mut[] u8 = malloc(16);
+    var hist: Vec(u8) = Vec(u8).withCapacity(16);
     var i2: u32 = 0;
     while (i2 < 8) {
         hist[i2]     = d[C_XA_LH + i2];
         hist[i2 + 8] = d[C_XA_RH + i2];
         i2 = i2 + 1;
     }
-    var leftH:    *mut[] i32 = hist as *mut[] i32;
-    var rightH:   *mut[] i32 = (hist as *mut[] i32) + 2 as u32;
-    const stereo: bool = xaSectorIsStereo(scratch);
-    const n: u32 = xaDecodeSector(scratch, leftBuf, rightBuf, monoBuf,
-                                  leftH, rightH);
+    var leftH:    *mut[] i32 = hist.ptr as *mut[] i32;
+    var rightH:   *mut[] i32 = (hist.ptr as *mut[] i32) + 2 as u32;
+    const stereo: bool = xaSectorIsStereo(scratch.ptr);
+    const n: u32 = xaDecodeSector(scratch.ptr, leftBuf.ptr, rightBuf.ptr,
+                                  monoBuf.ptr, leftH, rightH);
     var k: u32 = 0;
     while (k < n) {
         var l: i32 = 0;
@@ -992,11 +991,8 @@ pub fn cdromTryDecodeXa(d: *mut[] u8, spu: *mut[] u8) {
         d[C_XA_RH + i3] = hist[i3 + 8];
         i3 = i3 + 1;
     }
-    free(hist);
-    free(leftBuf as *mut[] u8);
-    free(rightBuf as *mut[] u8);
-    free(monoBuf as *mut[] u8);
-    free(scratch);
+    // scratch / leftBuf / rightBuf / monoBuf / hist all auto-drop at
+    // scope exit — Vec's drop() runs free() under the hood.
 }
 
 // Read one sector at `lba` into the state's data-FIFO slot. Uses a
@@ -1004,9 +1000,8 @@ pub fn cdromTryDecodeXa(d: *mut[] u8, spu: *mut[] u8) {
 // support pointer arithmetic / offset views on `*mut[] T`), so we
 // stream through 2352 bytes once per sector. Returns 1 on success.
 pub fn cdromDiscReadAt(d: *mut[] u8, disc: *mut[] Disc, lba: u32) i32 {
-    var scratch: *mut[] u8 = malloc(SECTOR_BYTES as u64);
-    if (discRead(disc, lba, scratch) == 0) {
-        free(scratch);
+    var scratch: Vec(u8) = Vec(u8).withCapacity(SECTOR_BYTES);
+    if (discRead(disc, lba, scratch.ptr) == 0) {
         return 0;
     }
     var i: u32 = 0;
@@ -1014,7 +1009,6 @@ pub fn cdromDiscReadAt(d: *mut[] u8, disc: *mut[] Disc, lba: u32) i32 {
         d[C_DATA_BUF + i] = scratch[i];
         i = i + 1;
     }
-    free(scratch);
     return 1;
 }
 

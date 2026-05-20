@@ -88,6 +88,16 @@ pub fn padAlloc() *mut[] u8 {
 
 pub fn padFree(p: *mut[] u8) { free(p); }
 
+// Update the SDA digital-pad button mask (active-low: bit clear =
+// pressed). PSX bit layout: 0=Select, 3=Start, 4=Up, 5=Right, 6=Down,
+// 7=Left, 8=L2, 9=R2, 10=L1, 11=R1, 12=Triangle, 13=Circle, 14=Cross,
+// 15=Square. The next controller poll picks the new value up via
+// sdaRead's SDA_SWL/SDA_SWH states.
+pub fn padSetButtons(p: *mut[] u8, mask: u32) {
+    p[P_SW_LO] = (mask        & 0xFF) as u8;
+    p[P_SW_HI] = ((mask >> 8) & 0xFF) as u8;
+}
+
 pub fn padGetU16(p: *mut[] u8, off: u32) u32 {
     return (p[off] as u32) | ((p[off + 1] as u32) << 8);
 }

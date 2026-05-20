@@ -32,6 +32,8 @@ pub extern fn access(path: *const[] u8, mode: i32) i32;
 pub extern fn realpath(path: *const[] u8, resolved: *mut[] u8) *mut[] u8;
 pub extern fn printf(format: *const[] u8, ...) i32;
 
+const { Vec } = import("std/collections");
+
 // Track-mode enum (psxe cue.h subset we actually use).
 pub const TRACK_MODE_UNKNOWN: u32 = 0;
 pub const TRACK_MODE_AUDIO:    u32 = 1;
@@ -408,14 +410,14 @@ pub fn cueParse(raw: *mut[] u8, path: *const[] u8) i32 {
     // realpath() should succeed; we still pre-fill the buffer with the
     // original path as a fallback for the unlikely failure case (Jam
     // can't null-check pointer returns).
-    var resolved: *mut[] u8 = malloc(4096);
-    memset(resolved, 0, 4096);
+    var resolved: Vec(u8) = Vec(u8).withCapacity(4096);
+    memset(resolved.ptr, 0, 4096);
     var pi: u32 = 0;
     while (path[pi] != 0 && pi < 4095) {
         resolved[pi] = path[pi];
         pi = pi + 1;
     }
-    realpath(path, resolved);
+    realpath(path, resolved.ptr);
     // Compute root path = resolved path up to last '/' or '\\'.
     var i: u32 = 0;
     var lastSlash: u32 = 0;
@@ -430,15 +432,14 @@ pub fn cueParse(raw: *mut[] u8, path: *const[] u8) i32 {
     }
     c[0].rootPath[lastSlash] = 0;
     c[0].rootLen = lastSlash;
-    free(resolved);
 
     skipWs(raw);
-    var kwbuf: *mut[] u8 = malloc(16);
+    var kwbuf: Vec(u8) = Vec(u8).withCapacity(16);
 
     while (feof(c[0].file) == 0) {
-        const kn: u32 = parseKeyword(raw, kwbuf);
+        const kn: u32 = parseKeyword(raw, kwbuf.ptr);
         if (kn == 0) { break; }
-        const kw: u32 = kwId(kwbuf);
+        const kw: u32 = kwId(kwbuf.ptr);
         if (kw == 1) {                          // FILE
             cueParseFile(raw);
         } else if (kw == 2) {                   // TRACK
@@ -454,7 +455,7 @@ pub fn cueParse(raw: *mut[] u8, path: *const[] u8) i32 {
         }
         skipWs(raw);
     }
-    free(kwbuf);
+    // kwbuf / resolved auto-drop at function-scope exit.
     fclose(c[0].file);
     cueComputeRanges(raw);
     return 0;
@@ -467,7 +468,7 @@ pub fn cueParseFile(raw: *mut[] u8) {
     if (c[0].cur != 0x22) { return; }       // expect '"'
     c[0].cur = fgetc(c[0].file) as u32 & 0xFF;
 
-    var nameBuf: *mut[] u8 = malloc(512);
+    var nameBuf: Vec(u8) = Vec(u8).withCapacity(512);
     var ni: u32 = 0;
     // Prefix with the .cue's directory.
     while (ni < c[0].rootLen) {
@@ -486,10 +487,10 @@ pub fn cueParseFile(raw: *mut[] u8) {
     while (isSpace(c[0].cur)) { c[0].cur = fgetc(c[0].file) as u32 & 0xFF; }
     while (isAlpha(c[0].cur)) { c[0].cur = fgetc(c[0].file) as u32 & 0xFF; }
 
-    if (c[0].fileCount >= MAX_FILES) { free(nameBuf); return; }
+    if (c[0].fileCount >= MAX_FILES) { return; }
     var rb: []u8 = "rb";
-    var f: *mut[] u8 = fopen(nameBuf as *const[] u8, rb.ptr);
-    if (access(nameBuf as *const[] u8, 4) != 0) { free(nameBuf); return; }
+    var f: *mut[] u8 = fopen(nameBuf.ptr as *const[] u8, rb.ptr);
+    if (access(nameBuf.ptr as *const[] u8, 4) != 0) { return; }
     // Size by seeking to end.
     fseek(f, 0, 2);
     const sz: i64 = ftell(f);
@@ -498,7 +499,7 @@ pub fn cueParseFile(raw: *mut[] u8) {
     c[0].files[fi].file = f;
     c[0].files[fi].sectors = (sz as u32) / SECTOR;
     c[0].fileCount = fi + 1;
-    free(nameBuf);
+    // nameBuf auto-drops on function-scope exit.
 }
 
 // TRACK NN MODE → push a CueTrack tagged with the current file.
@@ -508,10 +509,10 @@ pub fn cueParseTrack(raw: *mut[] u8) {
     if (!isDigit(c[0].cur)) { return; }
     const num: u32 = parseNumber(raw);
     skipWs(raw);
-    var kwbuf: *mut[] u8 = malloc(16);
-    parseKeyword(raw, kwbuf);
-    const kw: u32 = kwId(kwbuf);
-    free(kwbuf);
+    var kwbuf: Vec(u8) = Vec(u8).withCapacity(16);
+    parseKeyword(raw, kwbuf.ptr);
+    const kw: u32 = kwId(kwbuf.ptr);
+    // kwbuf auto-drops on function-scope exit.
     var mode: u32 = TRACK_MODE_UNKNOWN;
     if (kw == 8)       { mode = TRACK_MODE_MODE1_2048; }
     else if (kw == 9)  { mode = TRACK_MODE_MODE1_2352; }

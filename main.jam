@@ -21,7 +21,7 @@ const { gteAlloc } = import("gte");
 const { cdromAlloc, cdromUpdate, cdromAttachDisc } = import("cdrom");
 const { discAlloc, discOpen } = import("disc");
 const { dmaAlloc, dmaTickSpu, dmaUpdate } = import("dma");
-const { padAlloc, padUpdate } = import("pad");
+const { padAlloc, padUpdate, padSetButtons } = import("pad");
 const { spuAlloc, spuRamAlloc, spuUpdate } = import("spu");
 const { sio1Update } = import("sio1");
 const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
@@ -47,6 +47,7 @@ const {
     sdlAudioOpen, sdlAudioClose, sdlAudioPush, sdlAudioQueuedBytes
 } = import("sdl");
 const { spuDrainOut, spuOutAvailable } = import("spu");
+const { Vec } = import("std/collections");
 
 extern fn malloc(size: u64) *mut[] u8;
 extern fn free(ptr: *mut[] u8);
@@ -222,29 +223,28 @@ fn readU32At(buf: *mut[] u8, off: u32) u32 {
 fn loadExe(path: []u8, bus: Bus, regs: *mut[] u32, c: mut Cpu) {
     var modeRb: []u8 = "rb";
     var f: *mut[] u8 = fopen(path.ptr, modeRb.ptr);
-    var hdr: *mut[] u8 = malloc(0x800);
-    memset(hdr, 0, 0x800);
-    const hdrBytes: u64 = fread(hdr, 1, 0x800, f);
+    var hdr: Vec(u8) = Vec(u8).withCapacity(0x800);
+    memset(hdr.ptr, 0, 0x800);
+    const hdrBytes: u64 = fread(hdr.ptr, 1, 0x800, f);
     if (hdrBytes < 0x800) {
-        free(hdr);
         fclose(f);
         var msg: []u8 = "loadExe: header read failed\n";
         write(STDOUT, msg.ptr, msg.len);
         return;
     }
 
-    const initPc:  u32 = readU32At(hdr, 0x10);
-    const initGp:  u32 = readU32At(hdr, 0x14);
-    const ramDest: u32 = readU32At(hdr, 0x18);
-    const fileSz:  u32 = readU32At(hdr, 0x1C);
-    const spBase:  u32 = readU32At(hdr, 0x30);
-    const spOff:   u32 = readU32At(hdr, 0x34);
+    const initPc:  u32 = readU32At(hdr.ptr, 0x10);
+    const initGp:  u32 = readU32At(hdr.ptr, 0x14);
+    const ramDest: u32 = readU32At(hdr.ptr, 0x18);
+    const fileSz:  u32 = readU32At(hdr.ptr, 0x1C);
+    const spBase:  u32 = readU32At(hdr.ptr, 0x30);
+    const spOff:   u32 = readU32At(hdr.ptr, 0x34);
 
     // Copy the executable body byte-by-byte into RAM. Jam doesn't have
     // pointer arithmetic on many-item pointers, so we stream through a
     // temp buffer and copy.
-    var body: *mut[] u8 = malloc(fileSz as u64);
-    fread(body, 1, fileSz as u64, f);
+    var body: Vec(u8) = Vec(u8).withCapacity(fileSz);
+    fread(body.ptr, 1, fileSz as u64, f);
     const dst: u32 = ramDest & 0x001FFFFF;
     var ram: *mut[] u8 = busRamPtr(bus);
     var i: u32 = 0;
@@ -252,9 +252,8 @@ fn loadExe(path: []u8, bus: Bus, regs: *mut[] u32, c: mut Cpu) {
         ram[dst + i] = body[i];
         i = i + 1;
     }
-    free(body);
-    free(hdr);
     fclose(f);
+    // hdr / body auto-drop at function-scope exit.
     c.pc = initPc;
     c.nextPc = c.pc + 4;
     gprWrite(regs, 28, initGp);
@@ -384,7 +383,7 @@ fn dumpVramPpm(path: []u8, vram: *mut[] u8) {
     var f: *mut[] u8 = fopen(path.ptr, modeWb.ptr);
     var hdr: []u8 = "P6\n1024 512\n255\n";
     fwrite(hdr.ptr, 1, hdr.len, f);
-    var row: *mut[] u8 = malloc(1024 * 3);
+    var row: Vec(u8) = Vec(u8).withCapacity(1024 * 3);
     var y: u32 = 0;
     while (y < 512) {
         var x: u32 = 0;
@@ -402,10 +401,10 @@ fn dumpVramPpm(path: []u8, vram: *mut[] u8) {
             row[di + 2] = b as u8;
             x = x + 1;
         }
-        fwrite(row, 1, 1024 * 3, f);
+        fwrite(row.ptr, 1, 1024 * 3, f);
         y = y + 1;
     }
-    free(row);
+    // row auto-drops on function-scope exit.
     fclose(f);
     var msg: []u8 = "Wrote VRAM dump: %s\n";
     printf(msg.ptr, path.ptr);
@@ -531,7 +530,9 @@ fn main() {
     }
     // Per-frame drain buffer. 4096 stereo samples × 4 bytes = 16 KB —
     // matches the SPU output FIFO capacity so one drain always fits.
-    var audioBuf: *mut[] u8 = malloc(16384);
+    // Allocated once outside the loop; spuDrainOut / sdlAudioPush
+    // both take raw `*mut[] u8`, so we hand them `audioBuf.ptr`.
+    var audioBuf: Vec(u8) = Vec(u8).withCapacity(16384);
     var postMsg: []u8 = "SDL2 ready. Priming VRAM...\n";
     write(STDOUT, postMsg.ptr, postMsg.len);
     // Skip the gradient test pattern for now — the nested 1024x512 loop
@@ -542,6 +543,13 @@ fn main() {
 
     var msg: []u8 = "Running — Esc or close to quit\n";
     write(STDOUT, msg.ptr, msg.len);
+
+    // Active-low button mask the SDL pump updates from keyboard events.
+    // 0xFFFF = no buttons pressed; sdlPump clears bits on KEYDOWN and
+    // sets them on KEYUP. padUpdate copies it into the SDA pad state
+    // each frame so the next controller poll sees fresh input.
+    var buttons: *mut[] u32 = malloc(4) as *mut[] u32;
+    buttons[0] = 0xFFFF;
 
     var frames: u32 = 0;
     var quit: u32 = 0;
@@ -601,8 +609,8 @@ fn main() {
         if (avail > 0) {
             var want: u32 = avail;
             if (want > 4096) { want = 4096; }
-            const got: u32 = spuDrainOut(bus.spu, audioBuf, want);
-            sdlAudioPush(audioDev, audioBuf, got << 2);
+            const got: u32 = spuDrainOut(bus.spu, audioBuf.ptr, want);
+            sdlAudioPush(audioDev, audioBuf.ptr, got << 2);
         }
         // Audio throttle disabled — left here so we can re-enable if we
         // pick this strategy over the callback / wall-clock approach.
@@ -637,7 +645,11 @@ fn main() {
             sdlBlit(sdl, vram, dispX, dispY, w, h,
                 is24bpp, displayOff);
         }
-        quit = sdlPump();
+        quit = sdlPump(buttons);
+        // Push the latest keyboard state into the SDA pad. Cheap (2-byte
+        // write); doing it once per frame is enough since controller
+        // polling runs at VBlank cadence in the BIOS.
+        padSetButtons(bus.pad, buttons[0]);
         frames = frames + 1;
 
         // Bail after a long-but-finite session if no quit event comes —
@@ -651,7 +663,8 @@ fn main() {
     mcdRamSave(bus.mcdRam, mcdPath);
 
     sdlAudioClose(audioDev);
-    free(audioBuf);
+    // audioBuf auto-drops at function-scope exit via Vec.drop().
+    free(buttons as *mut[] u8);
     sdlQuit(sdl);
     freeRegFile(regs);
     freeRegFile(cop0);
