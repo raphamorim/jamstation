@@ -34,6 +34,7 @@ const { gteAlloc, gteDataRead, gteDataWrite,
         gteCtrlRead, gteCtrlWrite, gteExec } = import("gte");
 const { cdromAlloc } = import("cdrom");
 const { Mcd } = import("mcd");
+const { Sio1 } = import("sio1");
 
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
@@ -70,7 +71,7 @@ const Bus = struct {
     mdec:    *mut[] u8,
     mdecIn:  *mut[] u8,
     mdecOut: *mut[] u8,
-    sio1:    *mut[] u8,
+    sio1:    Sio1,
     mcd:     Mcd,
     mcdRam:  *mut[] u8,
     biosLoaded: u8,

@@ -30,9 +30,7 @@ const { spuRead32, spuRead16, spuRead8,
 const { mdecRead32, mdecRead16, mdecRead8,
         mdecWrite32, mdecWrite16, mdecWrite8,
         mdecAlloc, mdecInputAlloc, mdecOutputAlloc, mdecFree } = import("mdec");
-const { sio1Read32, sio1Read16, sio1Read8,
-        sio1Write32, sio1Write16, sio1Write8,
-        sio1Alloc, sio1Free } = import("sio1");
+const { Sio1 } = import("sio1");
 const { Mcd, mcdRamAlloc, mcdRamFree } = import("mcd");
 
 // Disc shape — kept in sync with disc.jam so callers can reference the
@@ -76,7 +74,7 @@ const Bus = struct {
     mdec:    *mut[] u8,
     mdecIn:  *mut[] u8,
     mdecOut: *mut[] u8,
-    sio1:    *mut[] u8,
+    sio1:    Sio1,
     mcd:     Mcd,
     mcdRam:  *mut[] u8,
     biosLoaded: u8,
@@ -213,7 +211,7 @@ pub fn allocBus() Bus {
         mdec:    mdecAlloc(),
         mdecIn:  mdecInputAlloc(),
         mdecOut: mdecOutputAlloc(),
-        sio1:    sio1Alloc(),
+        sio1:    Sio1.init(),
         mcd:     Mcd.init(),
         mcdRam:  mcdRamAlloc(),
         biosLoaded: 0,
@@ -240,7 +238,7 @@ pub fn freeBus(b: Bus) {
     mdecFree(b.mdec);
     mdecFree(b.mdecIn);
     mdecFree(b.mdecOut);
-    sio1Free(b.sio1);
+    // b.sio1 is by-value; no free needed.
     // b.mcd is by-value; no free needed.
     mcdRamFree(b.mcdRam);
 }
@@ -250,7 +248,7 @@ pub fn freeBus(b: Bus) {
 pub fn ioRead32(bus: Bus, off: u32) u32 {
     match (off) {
         0x040..=0x04F { return padRead32(bus.pad, bus.mcd, bus.mcdRam, off - 0x040); }
-        0x050..=0x05F { return sio1Read32(bus.sio1, off - 0x050); }
+        0x050..=0x05F { return bus.sio1.read32(off - 0x050); }
         0x070..=0x07F { return irqRead32(bus.irq, off - 0x070); }
         0x080..=0x0FF { return dmaRead32(bus.dma, off - 0x080); }
         0x100..=0x12F { return bus.timer.read32(off - 0x100); }
@@ -267,7 +265,7 @@ pub fn ioRead32(bus: Bus, off: u32) u32 {
 pub fn ioRead16(bus: Bus, off: u32) u32 {
     match (off) {
         0x040..=0x04F { return padRead16(bus.pad, bus.mcd, bus.mcdRam, off - 0x040); }
-        0x050..=0x05F { return sio1Read16(bus.sio1, off - 0x050); }
+        0x050..=0x05F { return bus.sio1.read16(off - 0x050); }
         0x070..=0x07F { return irqRead16(bus.irq, off - 0x070); }
         0x080..=0x0FF { return dmaRead16(bus.dma, off - 0x080); }
         0x100..=0x12F { return bus.timer.read16(off - 0x100); }
@@ -284,7 +282,7 @@ pub fn ioRead16(bus: Bus, off: u32) u32 {
 pub fn ioRead8(bus: Bus, off: u32) u32 {
     match (off) {
         0x040..=0x04F { return padRead8(bus.pad, bus.mcd, bus.mcdRam, off - 0x040); }
-        0x050..=0x05F { return sio1Read8(bus.sio1, off - 0x050); }
+        0x050..=0x05F { return bus.sio1.read8(off - 0x050); }
         0x070..=0x07F { return irqRead8(bus.irq, off - 0x070); }
         0x080..=0x0FF { return dmaRead8(bus.dma, off - 0x080); }
         0x100..=0x12F { return bus.timer.read8(off - 0x100); }
@@ -305,7 +303,7 @@ pub fn ioRead8(bus: Bus, off: u32) u32 {
 pub fn ioWrite32(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     match (off) {
         0x040..=0x04F { padWrite32(bus.pad, bus.mcd, off - 0x040, val); return; }
-        0x050..=0x05F { sio1Write32(bus.sio1, off - 0x050, val); return; }
+        0x050..=0x05F { bus.sio1.write32(off - 0x050, val); return; }
         0x070..=0x07F { irqWrite32(bus.irq, cop0, off - 0x070, val); return; }
         0x080..=0x0FF { dmaWrite32(bus.dma, bus, cop0, off - 0x080, val); return; }
         0x100..=0x12F { bus.timer.write32(bus.irq, cop0, off - 0x100, val); return; }
@@ -322,7 +320,7 @@ pub fn ioWrite32(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
 pub fn ioWrite16(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     match (off) {
         0x040..=0x04F { padWrite16(bus.pad, bus.mcd, off - 0x040, val); return; }
-        0x050..=0x05F { sio1Write16(bus.sio1, off - 0x050, val); return; }
+        0x050..=0x05F { bus.sio1.write16(off - 0x050, val); return; }
         0x070..=0x07F { irqWrite16(bus.irq, cop0, off - 0x070, val); return; }
         0x080..=0x0FF { dmaWrite16(bus.dma, bus, cop0, off - 0x080, val); return; }
         0x100..=0x12F { bus.timer.write16(bus.irq, cop0, off - 0x100, val); return; }
@@ -339,7 +337,7 @@ pub fn ioWrite16(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
 pub fn ioWrite8(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     match (off) {
         0x040..=0x04F { padWrite8(bus.pad, bus.mcd, off - 0x040, val); return; }
-        0x050..=0x05F { sio1Write8(bus.sio1, off - 0x050, val); return; }
+        0x050..=0x05F { bus.sio1.write8(off - 0x050, val); return; }
         0x070..=0x07F { irqWrite8(bus.irq, cop0, off - 0x070, val); return; }
         0x080..=0x0FF { dmaWrite8(bus.dma, bus, cop0, off - 0x080, val); return; }
         0x100..=0x12F { bus.timer.write8(bus.irq, cop0, off - 0x100, val); return; }

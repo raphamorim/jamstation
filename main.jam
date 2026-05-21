@@ -23,7 +23,7 @@ const { discAlloc, discOpen } = import("disc");
 const { dmaAlloc, dmaTickSpu, dmaUpdate } = import("dma");
 const { padAlloc, padUpdate, padSetButtons } = import("pad");
 const { spuAlloc, spuRamAlloc, psone_audio_cb, setU64 } = import("spu");
-const { sio1Update } = import("sio1");
+const { Sio1 } = import("sio1");
 const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
 const { Mcd, mcdRamLoad, mcdRamSave } = import("mcd");
 const { Timer } = import("timer");
@@ -124,7 +124,7 @@ const Bus = struct {
     mdec:    *mut[] u8,
     mdecIn:  *mut[] u8,
     mdecOut: *mut[] u8,
-    sio1:    *mut[] u8,
+    sio1:    Sio1,
     mcd:     Mcd,
     mcdRam:  *mut[] u8,
     biosLoaded: u8,
@@ -319,7 +319,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         dmaUpdate(bus.dma, bus.irq, cop0);
         cdromUpdate(bus.cdrom, bus.disc, bus.spu, bus.irq, cop0, delta);
         padUpdate(bus.pad, bus.irq, cop0, delta);
-        sio1Update(bus.sio1, bus.irq, cop0, delta);
+        bus.sio1.update(bus.irq, cop0, delta);
         // SPU is no longer ticked here — the audio thread owns its
         // sample clock via psone_audio_cb at 44.1 kHz. This decouples
         // pitch from CPU loop speed, matching psxe (psx.c never calls

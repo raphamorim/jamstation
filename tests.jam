@@ -30,7 +30,7 @@ const { discAlloc, discOpen } = import("disc");
 const { dmaAlloc, dmaUpdate } = import("dma");
 const { padAlloc, padUpdate } = import("pad");
 const { spuAlloc, spuRamAlloc, spuUpdate } = import("spu");
-const { sio1Alloc, sio1Update } = import("sio1");
+const { Sio1 } = import("sio1");
 const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
 const { Timer } = import("timer");
 const { Mcd } = import("mcd");
@@ -75,7 +75,7 @@ const Bus = struct {
     mdec:    *mut[] u8,
     mdecIn:  *mut[] u8,
     mdecOut: *mut[] u8,
-    sio1:    *mut[] u8,
+    sio1:    Sio1,
     mcd:     Mcd,
     mcdRam:  *mut[] u8,
     biosLoaded: u8,
@@ -438,7 +438,7 @@ fn emuRunOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         dmaUpdate(bus.dma, bus.irq, cop0);
         cdromUpdate(bus.cdrom, bus.disc, bus.irq, cop0, delta);
         padUpdate(bus.pad, bus.irq, cop0, delta);
-        sio1Update(bus.sio1, bus.irq, cop0, delta);
+        bus.sio1.update(bus.irq, cop0, delta);
         spuUpdate(bus.spu, bus.spuram, bus.irq, cop0, delta);
         lineCyc = lineCyc + delta;
         if (lineCyc >= CYC_PER_SCANLINE) {
