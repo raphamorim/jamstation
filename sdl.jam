@@ -68,41 +68,20 @@ extern fn SDL_GetTicks() u32;
 
 // --- audio ---
 //
-// We use push-mode SDL audio (callback=NULL, SDL_QueueAudio for
-// submission). That sidesteps the cross-thread callback machinery and
-// lets us drain the SPU output FIFO from the main loop once per frame.
+// Callback-mode SDL audio. SDL drives the SPU clock: every ~13 ms
+// the audio thread calls back into Jam (psone_audio_cb, defined in
+// spu.jam as `pub export fn`) for `samplesPerBuffer` stereo frames.
+// Each call advances the SPU by exactly that many samples at 44.1 kHz,
+// completely decoupled from the CPU loop's wall-clock pace — same
+// architecture as psxe (psx/main.c:11-29). Voice pitch stays correct
+// even if the emulator runs at 2× or 0.5× host speed.
 //
-// TODO(callback-driven audio, needs Jam compiler work):
-//   psxe matches the PSX audio behavior naturally because SDL runs the
-//   audio callback on its own thread at exactly 44.1 kHz, and that
-//   callback calls psx_spu_get_sample 588 times per 13.3 ms — so SPU
-//   voice playback advances purely from the audio device's clock,
-//   independent of how fast the emulator core is running. Voices play
-//   at the correct pitch even when the CPU is 2× speed.
+// `cbAddr` is the address of `psone_audio_cb` (computed in main.jam
+// via Jam's fn-as-u64 coercion — the new ptrtoint cast lowering in
+// the compiler is what makes this expressible without a C shim).
+// `userdata` is the AudioCtx blob holding the bus pointers the
+// callback needs to reach SPU state.
 //
-//   To match that here we'd need to:
-//     1. Pass a Jam-defined function as SDL_AudioSpec.callback. SDL
-//        invokes it via the standard C calling convention from a
-//        dedicated audio thread.
-//        → blocker: Jam v0.1.0 doesn't export `pub fn` with the C ABI
-//          / a stable function-pointer type that can be handed to a
-//          foreign callsite. Need compiler support for either:
-//             - an `extern "C"` (or equivalent) attribute on pub fn, or
-//             - a `&fn (...)` value coercion to a C function pointer.
-//
-//     2. Make the SPU mixer safe to call from a thread that isn't the
-//        emulator core thread. Today the SPU state buffer is mutated
-//        freely from CPU writes on the main thread; concurrent reads
-//        from an audio callback would race.
-//        → either need a lock around the SPU state, a lock-free
-//          double-buffer, or accept a small race (psxe does — it's
-//          mostly invisible).
-//
-//   Until that lands, we stay in push mode and the emulator clocks
-//   audio off its own CPU-cycle accumulator. On hosts with the wrong
-//   vsync (anything other than 60 Hz), audio rate drifts from real-
-//   time — workaround is the queue-watching throttle in main.jam
-//   (currently commented out).
 // SDL_OpenAudioDevice's first arg is `const char*`. We need to pass
 // NULL to mean "use the default playback device"; Jam can't express
 // a null `*const[] u8` directly, so we declare the arg as u64 and
@@ -167,11 +146,26 @@ pub fn sdlQuit(s: Sdl) {
     SDL_Quit();
 }
 
-// Open a 44.1 kHz / S16-LE / stereo audio device in push mode. Returns
-// the device ID (0 on failure). Caller drives playback via sdlAudioPush
-// and shuts down with sdlAudioClose. SDL_AudioSpec is laid out by
-// memcpying the C-struct layout into a 32-byte buffer.
-pub fn sdlAudioOpen(samplesPerBuffer: u32) u32 {
+// Open a 44.1 kHz / S16-LE / stereo audio device in callback mode.
+// `cbAddr` = address of the SDL_AudioCallback (Jam fn coerced to u64
+// via the new fn-ref / PtrToInt path). `userdata` = address of the
+// AudioCtx blob handed back to the callback. Returns the device ID
+// (0 on failure). SDL_AudioSpec is laid out by memcpying the C-struct
+// layout into a 32-byte buffer.
+// Local little-endian 8-byte writer for SDL_AudioSpec's pointer slots.
+// Kept here so sdl.jam doesn't have to pull in spu.jam's setU64.
+pub fn setU64Le(buf: *mut[] u8, off: u32, v: u64) {
+    buf[off]     = (v         & 0xFF) as u8;
+    buf[off + 1] = ((v >>  8) & 0xFF) as u8;
+    buf[off + 2] = ((v >> 16) & 0xFF) as u8;
+    buf[off + 3] = ((v >> 24) & 0xFF) as u8;
+    buf[off + 4] = ((v >> 32) & 0xFF) as u8;
+    buf[off + 5] = ((v >> 40) & 0xFF) as u8;
+    buf[off + 6] = ((v >> 48) & 0xFF) as u8;
+    buf[off + 7] = ((v >> 56) & 0xFF) as u8;
+}
+
+pub fn sdlAudioOpen(samplesPerBuffer: u32, cbAddr: u64, userdata: u64) u32 {
     var desired: *mut[] u8 = malloc(32);
     var obtained: *mut[] u8 = malloc(32);
     memset(desired, 0, 32);
@@ -188,8 +182,10 @@ pub fn sdlAudioOpen(samplesPerBuffer: u32) u32 {
     desired[8]  = (samplesPerBuffer        & 0xFF) as u8;
     desired[9]  = ((samplesPerBuffer >> 8) & 0xFF) as u8;
     // padding, size — SDL fills
-    // callback @ 16 (8-byte pointer) — push mode = NULL (already zero)
-    // userdata @ 24 (8-byte pointer) — NULL
+    // callback @ 16 (8-byte fn pointer)
+    setU64Le(desired, 16, cbAddr);
+    // userdata @ 24 (8-byte ptr) — handed back to the callback as-is
+    setU64Le(desired, 24, userdata);
     // First arg = NULL (default playback device).
     const dev: u32 = SDL_OpenAudioDevice(0 as u64, 0,
                                          desired, obtained, 0);

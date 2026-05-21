@@ -22,7 +22,7 @@ const { cdromAlloc, cdromUpdate, cdromAttachDisc } = import("cdrom");
 const { discAlloc, discOpen } = import("disc");
 const { dmaAlloc, dmaTickSpu, dmaUpdate } = import("dma");
 const { padAlloc, padUpdate, padSetButtons } = import("pad");
-const { spuAlloc, spuRamAlloc, spuUpdate } = import("spu");
+const { spuAlloc, spuRamAlloc, psone_audio_cb, setU64 } = import("spu");
 const { sio1Update } = import("sio1");
 const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
 const { mcdRamLoad, mcdRamSave } = import("mcd");
@@ -44,9 +44,8 @@ const {
 
 const {
     sdlInit, sdlQuit, sdlBlit, sdlPump, sdlDelay,
-    sdlAudioOpen, sdlAudioClose, sdlAudioPush, sdlAudioQueuedBytes
+    sdlAudioOpen, sdlAudioClose
 } = import("sdl");
-const { spuDrainOut, spuOutAvailable } = import("spu");
 const { Vec } = import("std/collections");
 
 extern fn malloc(size: u64) *mut[] u8;
@@ -325,7 +324,10 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         cdromUpdate(bus.cdrom, bus.disc, bus.spu, bus.irq, cop0, delta);
         padUpdate(bus.pad, bus.irq, cop0, delta);
         sio1Update(bus.sio1, bus.irq, cop0, delta);
-        spuUpdate(bus.spu, bus.spuram, bus.irq, cop0, delta);
+        // SPU is no longer ticked here — the audio thread owns its
+        // sample clock via psone_audio_cb at 44.1 kHz. This decouples
+        // pitch from CPU loop speed, matching psxe (psx.c never calls
+        // psx_spu_update either).
         lineCyc = lineCyc + delta;
         // HBlank begins ~75% into the scanline. Fire once per line.
         if (!hblankFired && lineCyc >= CYCLES_HDRAW) {
@@ -519,20 +521,26 @@ fn main() {
         write(STDOUT, fmsg.ptr, fmsg.len);
     }
     var sdl: Sdl = sdlInit(title, sdlW, sdlH);
-    // Audio device: 1024-stereo-sample buffer (~23 ms at 44.1 kHz) is a
-    // good balance between glitch resistance and latency.
-    var audioDev: u32 = sdlAudioOpen(1024);
+    // Audio device — callback mode. SDL pulls 1024 stereo samples
+    // (~23 ms at 44.1 kHz) every audio-thread iteration; psone_audio_cb
+    // services that pull by running the SPU one sample per output
+    // frame. The audio thread needs handles to spu / spuram / irq /
+    // cop0 — pack them into a 32-byte AudioCtx so we can pass a
+    // single pointer through SDL_AudioSpec.userdata.
+    var audioCtx: *mut[] u8 = malloc(32);
+    setU64(audioCtx,  0, bus.spu    as u64);
+    setU64(audioCtx,  8, bus.spuram as u64);
+    setU64(audioCtx, 16, bus.irq    as u64);
+    setU64(audioCtx, 24, cop0       as u64);
+    const cbAddr: u64 = psone_audio_cb as u64;
+    var audioDev: u32 = sdlAudioOpen(1024, cbAddr, audioCtx as u64);
     if (audioDev == 0) {
         var afmt: []u8 = "WARN: SDL audio device failed to open\n";
         write(STDOUT, afmt.ptr, afmt.len);
     } else {
-        var aok: []u8 = "Audio device opened (id=%u, 44.1kHz S16 stereo)\n";
+        var aok: []u8 = "Audio device opened (id=%u, 44.1kHz S16 stereo, callback mode)\n";
         printf(aok.ptr, audioDev);
     }
-    // Per-frame drain buffer. 4096 stereo samples × 4 bytes = 16 KB,
-    // matches the SPU output FIFO capacity so one drain always fits.
-    // Stack-allocated; lives for the lifetime of main's frame loop.
-    var audioBuf: [16384]u8 = [0; 16384];
     var postMsg: []u8 = "SDL2 ready. Priming VRAM...\n";
     write(STDOUT, postMsg.ptr, postMsg.len);
     // Skip the gradient test pattern for now — the nested 1024x512 loop
@@ -600,30 +608,8 @@ fn main() {
             }
         }
         runOneFrame(c, bus, regs, cop0);
-        // Audio drain — pull whatever mixed samples the SPU produced
-        // this frame and submit to SDL. We cap at OUT_FIFO_CAP=4096 so
-        // the destination buffer is bounded. ~735 stereo samples per
-        // 60 Hz frame is the steady state; brief bursts are smoothed
-        // by SDL's internal queue.
-        const avail: u32 = spuOutAvailable(bus.spu);
-        if (avail > 0) {
-            var want: u32 = avail;
-            if (want > 4096) { want = 4096; }
-            const got: u32 = spuDrainOut(bus.spu, audioBuf.asMutPtr(), want);
-            sdlAudioPush(audioDev, audioBuf.asMutPtr(), got << 2);
-        }
-        // Audio throttle disabled — left here so we can re-enable if we
-        // pick this strategy over the callback / wall-clock approach.
-        //
-        // if (audioDev != 0) {
-        //     const high: u32 = 17640;        // ~100 ms
-        //     const low: u32  =  8820;        // ~ 50 ms
-        //     if (sdlAudioQueuedBytes(audioDev) > high) {
-        //         while (sdlAudioQueuedBytes(audioDev) > low) {
-        //             sdlDelay(1);
-        //         }
-        //     }
-        // }
+        // Audio: nothing to do on the main thread anymore. SDL's audio
+        // thread is pulling samples from psone_audio_cb at 44.1 kHz.
         var vram: *mut[] u8 = busVramPtr(bus);
         // Read the current display origin out of the GPU state buffer
         // (g[63] disp_x, g[64] disp_y — set by GP1 0x05). The BIOS
@@ -663,6 +649,7 @@ fn main() {
     mcdRamSave(bus.mcdRam, mcdPath);
 
     sdlAudioClose(audioDev);
+    free(audioCtx);
     free(buttons as *mut[] u8);
     sdlQuit(sdl);
     freeRegFile(regs);

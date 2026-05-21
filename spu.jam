@@ -441,6 +441,29 @@ pub fn setU32(s: *mut[] u8, off: u32, v: u32) {
     s[off + 2] = ((v >> 16) & 0xFF) as u8;
     s[off + 3] = ((v >> 24) & 0xFF) as u8;
 }
+// 64-bit accessors. Used to round-trip pointer addresses through
+// SDL_AudioSpec (the callback / userdata slots are pointer-sized) and
+// the AudioCtx blob the audio thread reads its bus handles from.
+pub fn getU64(s: *mut[] u8, off: u32) u64 {
+    return  (s[off]         as u64)
+         | ((s[off + 1]     as u64) <<  8)
+         | ((s[off + 2]     as u64) << 16)
+         | ((s[off + 3]     as u64) << 24)
+         | ((s[off + 4]     as u64) << 32)
+         | ((s[off + 5]     as u64) << 40)
+         | ((s[off + 6]     as u64) << 48)
+         | ((s[off + 7]     as u64) << 56);
+}
+pub fn setU64(s: *mut[] u8, off: u32, v: u64) {
+    s[off]     = (v         & 0xFF) as u8;
+    s[off + 1] = ((v >>  8) & 0xFF) as u8;
+    s[off + 2] = ((v >> 16) & 0xFF) as u8;
+    s[off + 3] = ((v >> 24) & 0xFF) as u8;
+    s[off + 4] = ((v >> 32) & 0xFF) as u8;
+    s[off + 5] = ((v >> 40) & 0xFF) as u8;
+    s[off + 6] = ((v >> 48) & 0xFF) as u8;
+    s[off + 7] = ((v >> 56) & 0xFF) as u8;
+}
 
 pub fn getI16(s: *mut[] u8, off: u32) i32 {
     const u: u32 = getU16(s, off);
@@ -894,11 +917,9 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
 
     const spucnt: u32 = getU16(s, R_SPUCNT);
     if ((spucnt & 0x4000) == 0) {
-        // SPU disabled — still drain the CD FIFO so the producer doesn't
-        // back up, push silence so the SDL audio queue keeps draining
-        // at the correct rate, and bail.
+        // SPU disabled — still drain the CD FIFO so the producer
+        // doesn't back up, and return silence to the audio callback.
         const _drain: u32 = spuPopCdSample(s);
-        spuPushOutSample(s, 0);
         return 0;
     }
 
@@ -944,7 +965,6 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
     const cl: i32 = (sat16(left)  * mainl) >> 15;
     const cr: i32 = (sat16(right) * mainr) >> 15;
     const packed: u32 = (cl as u32 & 0xFFFF) | ((cr as u32 & 0xFFFF) << 16);
-    spuPushOutSample(s, packed);
     return packed;
 }
 
@@ -1103,4 +1123,42 @@ pub fn spuGaussInit(s: *mut[] u8) {
     spuGaussRow(s, 488, 0x589E, 0x58B5, 0x58CB, 0x58E0, 0x58F4, 0x5907, 0x5919, 0x592A);
     spuGaussRow(s, 496, 0x593A, 0x5949, 0x5958, 0x5965, 0x5971, 0x597C, 0x5986, 0x598F);
     spuGaussRow(s, 504, 0x5997, 0x599E, 0x59A4, 0x59A9, 0x59AD, 0x59B0, 0x59B2, 0x59B3);
+}
+
+// ---------- SDL audio callback ----------------------------------------
+//
+// Runs on SDL's audio thread at exactly 44.1 kHz. Pulls `len` bytes
+// (4 bytes per stereo frame: i16 L + i16 R) by calling spuGetSample
+// for each output frame. Sample timing is now owned by the audio
+// device — completely decoupled from the CPU loop's wall-clock pace.
+// This mirrors psxe (main.c:11-29 / spu.c:575): SPU advances one
+// sample per callback iteration.
+//
+// `userdata` is the address of a 32-byte AudioCtx blob laid out by
+// main.jam (offsets 0/8/16/24 = spu / spuram / ic / cop0). The host
+// pointer round-trips through u64 — the new IntToPtr cast in the Jam
+// compiler is what makes that possible without a C shim.
+//
+// Thread safety: the audio thread reads SPU register state that the
+// CPU thread mutates via spuWrite16/32. Aligned 16/32-bit loads/stores
+// are atomic on AArch64, so individual fields don't tear, but voice
+// state can briefly desynchronise on KON/KOFF. psxe accepts the same
+// race — the audible effect is a one-block (~0.6 ms) glitch in the
+// worst case.
+pub export fn psone_audio_cb(userdata: u64, stream: *mut[] u8, len: i32) {
+    var ctx: *mut[] u8 = userdata as *mut[] u8;
+    var spu:    *mut[] u8  = getU64(ctx,  0) as *mut[] u8;
+    var spuram: *mut[] u8  = getU64(ctx,  8) as *mut[] u8;
+    var ic:     *mut[] u32 = getU64(ctx, 16) as *mut[] u32;
+    var cop0:   *mut[] u32 = getU64(ctx, 24) as *mut[] u32;
+
+    var i: i32 = 0;
+    while (i < len) {
+        const sample: u32 = spuGetSample(spu, spuram, ic, cop0);
+        stream[i    ] = (sample         & 0xFF) as u8;
+        stream[i + 1] = ((sample >>  8) & 0xFF) as u8;
+        stream[i + 2] = ((sample >> 16) & 0xFF) as u8;
+        stream[i + 3] = ((sample >> 24) & 0xFF) as u8;
+        i = i + 4;
+    }
 }
