@@ -728,6 +728,15 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
         g[46] = (g[46] & 0xFFFFFE00) | (page & 0x1FF);
         g[70] = (page >> 11) & 1;
         g[46] = (g[46] & 0xFFFF7FFF) | ((g[71] & g[70]) << 15);
+        // psxe gpu.c:972-974 — the polygon's tpage byte also rewrites
+        // the GLOBAL texp_x/y/d (the derived fields textured rectangles
+        // read from). Without this, FMVs that draw the decoded frame
+        // as a texture-mapped polygon then composite it with a
+        // textured rect end up sampling the wrong VRAM region for the
+        // rect — texel 0 on every pixel → black FMV.
+        g[60] = tpx;
+        g[61] = tpy;
+        g[62] = depth;
         c2 = g[6] & 0xFFFFFF;
         v2x = gpuVertX(g[7]); v2y = gpuVertY(g[7]);
         uu2 = g[8] & 0xFF;  vv2 = (g[8] >> 8) & 0xFF;
@@ -756,6 +765,16 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
         g[46] = (g[46] & 0xFFFFFE00) | (page & 0x1FF);
         g[70] = (page >> 11) & 1;
         g[46] = (g[46] & 0xFFFF7FFF) | ((g[71] & g[70]) << 15);
+        // psxe gpu.c:969-977 "Undocumented behavior? Fixes Mortal
+        // Kombat II, Bubble Bobble, Driver 1 & 2" — and Musashi FMV.
+        // Propagate the polygon's tpage into the derived globals so a
+        // following textured RECTANGLE (which carries clut but no
+        // tpage) inherits this state instead of stale values. Without
+        // it, the rect samples the wrong VRAM region → texel 0 →
+        // texel-0 skip → entire FMV frame is black.
+        g[60] = tpx;
+        g[61] = tpy;
+        g[62] = depth;
         v2x = gpuVertX(g[5]); v2y = gpuVertY(g[5]);
         uu2 = g[6] & 0xFF;  vv2 = (g[6] >> 8) & 0xFF;
         if (isQuad) {
@@ -1226,26 +1245,29 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
                     const ty: u32 = (vv0 + iy) & 0xFF;
                     const texel: u32 = gpuFetchTexel(vram, tx, ty, g[60], g[61],
                                                       clutx, cluty, g[62]);
-                    if (texel != 0) {
-                        var color: u32 = texel;
-                        if (!isRaw) {
-                            color = gpuModulate(texel, g[0] & 0xFFFFFF);
-                        }
-                        // Per psxe: when the rect's transparency flag is
-                        // set, texel bit 15 selects whether THIS pixel
-                        // blends. When the flag isn't set, no blending.
-                        var thisTransp: bool = false;
-                        if (isTransp) {
-                            thisTransp = (texel & 0x8000) != 0;
-                        }
-                        if (thisTransp) {
-                            const back: u32 = vramReadPixel(vram,
-                                (px as u32) & 0x3FF, (py as u32) & 0x1FF);
-                            color = gpuBlend(color, back, transpMode);
-                        }
-                        vramWritePixel(vram, (px as u32) & 0x3FF,
-                                       (py as u32) & 0x1FF, color);
+                    // psxe gpu_render_textured_rectangle (gpu.c:686-718)
+                    // writes every texel UNCONDITIONALLY — no texel-0
+                    // skip even though the strict spec says texel 0 is
+                    // transparent. The Musashi intro (and other FMVs that
+                    // draw decoded frames via textured rectangles) relies
+                    // on this: the FMV contains lots of true-black pixels
+                    // that, if skipped, leave stale VRAM contents showing
+                    // through — entire frame appears black.
+                    var color: u32 = texel;
+                    if (!isRaw) {
+                        color = gpuModulate(texel, g[0] & 0xFFFFFF);
                     }
+                    var thisTransp: bool = false;
+                    if (isTransp) {
+                        thisTransp = (texel & 0x8000) != 0;
+                    }
+                    if (thisTransp) {
+                        const back: u32 = vramReadPixel(vram,
+                            (px as u32) & 0x3FF, (py as u32) & 0x1FF);
+                        color = gpuBlend(color, back, transpMode);
+                    }
+                    vramWritePixel(vram, (px as u32) & 0x3FF,
+                                   (py as u32) & 0x1FF, color);
                 }
                 ix = ix + 1;
             }
