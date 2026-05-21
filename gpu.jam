@@ -431,16 +431,21 @@ pub fn gpuCpuToVram(g: *mut[] u32, vram: *mut[] u8) {
         g[19] = GP_RECV_DATA;
         return;
     }
-    // RECV_DATA — one 32-bit word delivers two VRAM pixels. Honor mask-
-    // bit semantics so GP0(0xE6) actually does something visible.
+    // RECV_DATA — one 32-bit word delivers two VRAM pixels. psxe's
+    // gpu_cmd_a0 (gpu.c:1122-1137) writes the destination directly,
+    // bypassing the GP0(0xE6) mask bits — same as all of its other
+    // draw commands. Mirror that here so Musashi's FMV (which leaves
+    // check-mask set when uploading decoded frames) doesn't silently
+    // drop writes to pixels that previously had bit 15 set. The strict
+    // spec says masks SHOULD apply, but no real game relies on it.
     const x0: u32 = (g[22] + g[28]) & 0x3FF;
     const y0: u32 = (g[23] + g[29]) & 0x1FF;
-    vramWritePixelMasked(g, vram, x0, y0, g[20] & 0xFFFF);
+    vramWritePixel(vram, x0, y0, g[20] & 0xFFFF);
     g[28] = g[28] + 1;
     if (g[28] == g[24]) { g[29] = g[29] + 1; g[28] = 0; }
     const x1: u32 = (g[22] + g[28]) & 0x3FF;
     const y1: u32 = (g[23] + g[29]) & 0x1FF;
-    vramWritePixelMasked(g, vram, x1, y1, (g[20] >> 16) & 0xFFFF);
+    vramWritePixel(vram, x1, y1, (g[20] >> 16) & 0xFFFF);
     g[28] = g[28] + 1;
     if (g[28] == g[24]) { g[29] = g[29] + 1; g[28] = 0; }
     g[26] = g[26] - 2;
