@@ -41,7 +41,6 @@ const {
     xaDecodeSector
 } = import("xa");
 const { spuPushCdSample } = import("spu");
-const { Vec } = import("std/collections");
 
 // Disc struct redeclaration (same shape as disc.jam) so we can hold a
 // `*mut[] Disc` pointer here without an explicit Disc import.
@@ -930,42 +929,51 @@ pub fn cdromHandleRead(d: *mut[] u8, disc: *mut[] Disc, spu: *mut[] u8) {
 // pairs per channel) live in the cdrom state at C_XA_LH / C_XA_RH so
 // block N's predictor still sees block N-1's tail.
 pub fn cdromTryDecodeXa(d: *mut[] u8, spu: *mut[] u8) {
-    var scratch: Vec(u8) = Vec(u8).withCapacity(SECTOR_BYTES);
+    // All buffers below are stack-allocated fixed arrays sized by
+    // the PSX hardware: 2352 = SECTOR_BYTES (raw CD sector),
+    // 2016 = max samples per channel in XA stereo mode,
+    // 4032 = max samples for mono (2x the stereo lane count),
+    // 16 = 4 i32 history pairs (left+right * 2 samples).
+    var scratch: [2352]u8 = [0; 2352];
     var i: u32 = 0;
-    while (i < SECTOR_BYTES) {
+    while (i < 2352) {
         scratch[i] = d[C_DATA_BUF + i];
         i = i + 1;
     }
-    if (!xaSectorIsAudio(scratch.ptr)) {
+    if (!xaSectorIsAudio(scratch.asPtr())) {
         return;
     }
     // Only enforce file/channel match when MODE_XA_FILTER is enabled.
     // Some games (e.g. ones that drive XA without CdlSetFilter) leave
     // the bit off and expect every audio sector to be decoded.
     if ((d[C_MODE] as u32 & MODE_XA_FILTER) != 0) {
-        if (!xaSectorMatchesFilter(scratch.ptr,
+        if (!xaSectorMatchesFilter(scratch.asPtr(),
                 d[C_XA_FILE] as u32, d[C_XA_CHANNEL] as u32)) {
             return;
         }
     }
-    var leftBuf:  Vec(i32) = Vec(i32).withCapacity(2016);
-    var rightBuf: Vec(i32) = Vec(i32).withCapacity(2016);
-    var monoBuf:  Vec(i32) = Vec(i32).withCapacity(4032);
+    var leftBuf:  [2016]i32 = [0; 2016];
+    var rightBuf: [2016]i32 = [0; 2016];
+    var monoBuf:  [4032]i32 = [0; 4032];
     // Carry history out via a small scratch buffer (8 bytes per channel)
     // and write it back into the cdrom state when done. Direct slice
     // offset into `d` would be cleaner but Jam can't form the view.
-    var hist: Vec(u8) = Vec(u8).withCapacity(16);
+    var hist: [16]u8 = [0; 16];
     var i2: u32 = 0;
     while (i2 < 8) {
         hist[i2]     = d[C_XA_LH + i2];
         hist[i2 + 8] = d[C_XA_RH + i2];
         i2 = i2 + 1;
     }
-    var leftH:    *mut[] i32 = hist.ptr as *mut[] i32;
-    var rightH:   *mut[] i32 = (hist.ptr as *mut[] i32) + 2 as u32;
-    const stereo: bool = xaSectorIsStereo(scratch.ptr);
-    const n: u32 = xaDecodeSector(scratch.ptr, leftBuf.ptr, rightBuf.ptr,
-                                  monoBuf.ptr, leftH, rightH);
+    // hist's storage reinterpreted as four i32 history values
+    // (leftLo, leftHi, rightLo, rightHi). asMutPtr() yields the
+    // *mut[] u8 base; the `as` cast retypes the element to i32.
+    var leftH:    *mut[] i32 = hist.asMutPtr() as *mut[] i32;
+    var rightH:   *mut[] i32 = (hist.asMutPtr() as *mut[] i32) + 2 as u32;
+    const stereo: bool = xaSectorIsStereo(scratch.asPtr());
+    const n: u32 = xaDecodeSector(scratch.asMutPtr(),
+                                  leftBuf.asMutPtr(), rightBuf.asMutPtr(),
+                                  monoBuf.asMutPtr(), leftH, rightH);
     var k: u32 = 0;
     while (k < n) {
         var l: i32 = 0;
@@ -991,8 +999,7 @@ pub fn cdromTryDecodeXa(d: *mut[] u8, spu: *mut[] u8) {
         d[C_XA_RH + i3] = hist[i3 + 8];
         i3 = i3 + 1;
     }
-    // scratch / leftBuf / rightBuf / monoBuf / hist all auto-drop at
-    // scope exit — Vec's drop() runs free() under the hood.
+    // All five buffers above are stack-allocated; nothing to free.
 }
 
 // Read one sector at `lba` into the state's data-FIFO slot. Uses a
@@ -1000,12 +1007,12 @@ pub fn cdromTryDecodeXa(d: *mut[] u8, spu: *mut[] u8) {
 // support pointer arithmetic / offset views on `*mut[] T`), so we
 // stream through 2352 bytes once per sector. Returns 1 on success.
 pub fn cdromDiscReadAt(d: *mut[] u8, disc: *mut[] Disc, lba: u32) i32 {
-    var scratch: Vec(u8) = Vec(u8).withCapacity(SECTOR_BYTES);
-    if (discRead(disc, lba, scratch.ptr) == 0) {
+    var scratch: [2352]u8 = [0; 2352];   // SECTOR_BYTES
+    if (discRead(disc, lba, scratch.asMutPtr()) == 0) {
         return 0;
     }
     var i: u32 = 0;
-    while (i < SECTOR_BYTES) {
+    while (i < 2352) {
         d[C_DATA_BUF + i] = scratch[i];
         i = i + 1;
     }

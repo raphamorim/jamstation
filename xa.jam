@@ -30,8 +30,6 @@ pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
 pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 
-const { Vec } = import("std/collections");
-
 // ADPCM predictor coefficient tables (5 entries; filter index 0..3 maps
 // to entries 0..3; entry 4 is psxe's table padding and rarely hit).
 pub fn xaPosCoef(idx: u32) i32 {
@@ -138,25 +136,27 @@ pub fn xaDecodeSector(secBuf: *mut[] u8,
     var rightIdx: u32 = 0;
     var monoIdx: u32 = 0;
     var i: u32 = 0;
-    var blockBuf: Vec(i32) = Vec(i32).withCapacity(28);
+    // 28 = samples per ADPCM block. Stack-allocated; rewritten by
+    // every xaDecodeBlock call below.
+    var blockBuf: [28]i32 = [0; 28];
     while (i < 18) {
         var blk: u32 = 0;
         while (blk < 4) {
             if (stereo) {
-                xaDecodeBlock(secBuf, src, blk, 0, blockBuf.ptr, leftH);
+                xaDecodeBlock(secBuf, src, blk, 0, blockBuf.asMutPtr(), leftH);
                 var k: u32 = 0;
                 while (k < 28) { leftBuf[leftIdx + k] = blockBuf[k]; k = k + 1; }
                 leftIdx = leftIdx + 28;
-                xaDecodeBlock(secBuf, src, blk, 1, blockBuf.ptr, rightH);
+                xaDecodeBlock(secBuf, src, blk, 1, blockBuf.asMutPtr(), rightH);
                 k = 0;
                 while (k < 28) { rightBuf[rightIdx + k] = blockBuf[k]; k = k + 1; }
                 rightIdx = rightIdx + 28;
             } else {
-                xaDecodeBlock(secBuf, src, blk, 0, blockBuf.ptr, leftH);
+                xaDecodeBlock(secBuf, src, blk, 0, blockBuf.asMutPtr(), leftH);
                 var k: u32 = 0;
                 while (k < 28) { monoBuf[monoIdx + k] = blockBuf[k]; k = k + 1; }
                 monoIdx = monoIdx + 28;
-                xaDecodeBlock(secBuf, src, blk, 1, blockBuf.ptr, leftH);
+                xaDecodeBlock(secBuf, src, blk, 1, blockBuf.asMutPtr(), leftH);
                 k = 0;
                 while (k < 28) { monoBuf[monoIdx + k] = blockBuf[k]; k = k + 1; }
                 monoIdx = monoIdx + 28;
@@ -166,7 +166,6 @@ pub fn xaDecodeSector(secBuf: *mut[] u8,
         src = src + 128;
         i = i + 1;
     }
-    // blockBuf auto-drops on function-scope exit.
     if (stereo) { return leftIdx; }
     return monoIdx;
 }

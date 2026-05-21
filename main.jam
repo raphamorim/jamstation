@@ -223,9 +223,10 @@ fn readU32At(buf: *mut[] u8, off: u32) u32 {
 fn loadExe(path: []u8, bus: Bus, regs: *mut[] u32, c: mut Cpu) {
     var modeRb: []u8 = "rb";
     var f: *mut[] u8 = fopen(path.ptr, modeRb.ptr);
-    var hdr: Vec(u8) = Vec(u8).withCapacity(0x800);
-    memset(hdr.ptr, 0, 0x800);
-    const hdrBytes: u64 = fread(hdr.ptr, 1, 0x800, f);
+    // 0x800 = 2 KB PSX-EXE header (fixed by the platform). Array
+    // literal [0; N] already zero-fills; no memset needed.
+    var hdr: [2048]u8 = [0; 2048];
+    const hdrBytes: u64 = fread(hdr.asMutPtr(), 1, 0x800, f);
     if (hdrBytes < 0x800) {
         fclose(f);
         var msg: []u8 = "loadExe: header read failed\n";
@@ -233,16 +234,16 @@ fn loadExe(path: []u8, bus: Bus, regs: *mut[] u32, c: mut Cpu) {
         return;
     }
 
-    const initPc:  u32 = readU32At(hdr.ptr, 0x10);
-    const initGp:  u32 = readU32At(hdr.ptr, 0x14);
-    const ramDest: u32 = readU32At(hdr.ptr, 0x18);
-    const fileSz:  u32 = readU32At(hdr.ptr, 0x1C);
-    const spBase:  u32 = readU32At(hdr.ptr, 0x30);
-    const spOff:   u32 = readU32At(hdr.ptr, 0x34);
+    const initPc:  u32 = readU32At(hdr.asMutPtr(), 0x10);
+    const initGp:  u32 = readU32At(hdr.asMutPtr(), 0x14);
+    const ramDest: u32 = readU32At(hdr.asMutPtr(), 0x18);
+    const fileSz:  u32 = readU32At(hdr.asMutPtr(), 0x1C);
+    const spBase:  u32 = readU32At(hdr.asMutPtr(), 0x30);
+    const spOff:   u32 = readU32At(hdr.asMutPtr(), 0x34);
 
-    // Copy the executable body byte-by-byte into RAM. Jam doesn't have
-    // pointer arithmetic on many-item pointers, so we stream through a
-    // temp buffer and copy.
+    // Body is runtime-sized (length from the header), so stays Vec.
+    // Copy byte-by-byte into RAM: Jam doesn't have pointer arithmetic
+    // on many-item pointers, so we stream through a temp buffer.
     var body: Vec(u8) = Vec(u8).withCapacity(fileSz);
     fread(body.ptr, 1, fileSz as u64, f);
     const dst: u32 = ramDest & 0x001FFFFF;
@@ -253,7 +254,7 @@ fn loadExe(path: []u8, bus: Bus, regs: *mut[] u32, c: mut Cpu) {
         i = i + 1;
     }
     fclose(f);
-    // hdr / body auto-drop at function-scope exit.
+    // body auto-drops at scope exit; hdr is stack-allocated.
     c.pc = initPc;
     c.nextPc = c.pc + 4;
     gprWrite(regs, 28, initGp);
@@ -383,7 +384,8 @@ fn dumpVramPpm(path: []u8, vram: *mut[] u8) {
     var f: *mut[] u8 = fopen(path.ptr, modeWb.ptr);
     var hdr: []u8 = "P6\n1024 512\n255\n";
     fwrite(hdr.ptr, 1, hdr.len, f);
-    var row: Vec(u8) = Vec(u8).withCapacity(1024 * 3);
+    // 3072 = 1024 px × 3 bytes (RGB24). VRAM width is fixed.
+    var row: [3072]u8 = [0; 3072];
     var y: u32 = 0;
     while (y < 512) {
         var x: u32 = 0;
@@ -401,10 +403,9 @@ fn dumpVramPpm(path: []u8, vram: *mut[] u8) {
             row[di + 2] = b as u8;
             x = x + 1;
         }
-        fwrite(row.ptr, 1, 1024 * 3, f);
+        fwrite(row.asPtr(), 1, 1024 * 3, f);
         y = y + 1;
     }
-    // row auto-drops on function-scope exit.
     fclose(f);
     var msg: []u8 = "Wrote VRAM dump: %s\n";
     printf(msg.ptr, path.ptr);
@@ -528,11 +529,10 @@ fn main() {
         var aok: []u8 = "Audio device opened (id=%u, 44.1kHz S16 stereo)\n";
         printf(aok.ptr, audioDev);
     }
-    // Per-frame drain buffer. 4096 stereo samples × 4 bytes = 16 KB —
+    // Per-frame drain buffer. 4096 stereo samples × 4 bytes = 16 KB,
     // matches the SPU output FIFO capacity so one drain always fits.
-    // Allocated once outside the loop; spuDrainOut / sdlAudioPush
-    // both take raw `*mut[] u8`, so we hand them `audioBuf.ptr`.
-    var audioBuf: Vec(u8) = Vec(u8).withCapacity(16384);
+    // Stack-allocated; lives for the lifetime of main's frame loop.
+    var audioBuf: [16384]u8 = [0; 16384];
     var postMsg: []u8 = "SDL2 ready. Priming VRAM...\n";
     write(STDOUT, postMsg.ptr, postMsg.len);
     // Skip the gradient test pattern for now — the nested 1024x512 loop
@@ -609,8 +609,8 @@ fn main() {
         if (avail > 0) {
             var want: u32 = avail;
             if (want > 4096) { want = 4096; }
-            const got: u32 = spuDrainOut(bus.spu, audioBuf.ptr, want);
-            sdlAudioPush(audioDev, audioBuf.ptr, got << 2);
+            const got: u32 = spuDrainOut(bus.spu, audioBuf.asMutPtr(), want);
+            sdlAudioPush(audioDev, audioBuf.asMutPtr(), got << 2);
         }
         // Audio throttle disabled — left here so we can re-enable if we
         // pick this strategy over the callback / wall-clock approach.
@@ -663,7 +663,6 @@ fn main() {
     mcdRamSave(bus.mcdRam, mcdPath);
 
     sdlAudioClose(audioDev);
-    // audioBuf auto-drops at function-scope exit via Vec.drop().
     free(buttons as *mut[] u8);
     sdlQuit(sdl);
     freeRegFile(regs);
