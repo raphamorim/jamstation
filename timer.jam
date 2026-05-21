@@ -5,360 +5,353 @@
 // different clock sources — system clock, dotclock, hblank — and can
 // raise IRQs (lines 4 / 5 / 6 = TIMER0 / TIMER1 / TIMER2) on
 // target-hit or 0xFFFF wraparound.
-//
-// State buffer layout (52 u32 entries):
-//   [0..3]   shared: hblank, prev_hblank, vblank, prev_vblank
-//   [4..19]  timer 0 fields (16 entries)
-//   [20..35] timer 1 fields
-//   [36..51] timer 2 fields
-//
-// Per-timer field order (offsets relative to the timer's base):
-//   0  counter      4  irq_target    8  irq           12 irq_fired
-//   1  target       5  irq_max       9  target_reached 13 paused
-//   2  sync_enable  6  irq_repeat   10 max_reached    14 blank_once
-//   3  sync_mode    7  irq_toggle   11 reset_target   15 clk_source
 
 const { irqRaise, IC_TIMER0, IC_TIMER1, IC_TIMER2 } = import("irq");
 
-pub extern fn malloc(size: u64) *mut[] u8;
-pub extern fn free(ptr: *mut[] u8);
-pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+// Per-timer state. Each channel has its own counter, target, and a
+// pile of mode-register bits (sync / IRQ / clock-source). The 0/1
+// flag bits stay u32 so they round-trip cleanly through the mode
+// register's pack/unpack without per-field width juggling.
+pub const TimerChannel = struct {
+    counter:       u32,
+    target:        u32,
+    syncEnable:    u32,
+    syncMode:      u32,
+    irqTarget:     u32,
+    irqMax:        u32,
+    irqRepeat:     u32,
+    irqToggle:     u32,
+    irq:           u32,
+    targetReached: u32,
+    maxReached:    u32,
+    resetTarget:   u32,
+    irqFired:      u32,
+    paused:        u32,
+    blankOnce:     u32,
+    clkSource:     u32,
 
-const TIMER_STATE_WORDS: u32 = 52;
-
-const F_COUNTER:    u32 = 0;
-const F_TARGET:     u32 = 1;
-const F_SYNC_EN:    u32 = 2;
-const F_SYNC_MODE:  u32 = 3;
-const F_IRQ_TGT:    u32 = 4;
-const F_IRQ_MAX:    u32 = 5;
-const F_IRQ_REPEAT: u32 = 6;
-const F_IRQ_TOGGLE: u32 = 7;
-const F_IRQ:        u32 = 8;
-const F_TGT_REACH:  u32 = 9;
-const F_MAX_REACH:  u32 = 10;
-const F_RESET_TGT:  u32 = 11;
-const F_IRQ_FIRED:  u32 = 12;
-const F_PAUSED:     u32 = 13;
-const F_BLANK_ONCE: u32 = 14;
-const F_CLKSRC:     u32 = 15;
-// Scratch slot for the timer-2 /8 sub-tick accumulator. Previously we
-// stored this in the high 16 bits of F_COUNTER, but timerRead32 returns
-// the full 32-bit word — so the game would see counter | (sub<<16) and
-// equality checks against the target value never matched. Keep the
-// counter clean and stash sub-cycles in F_SUBTICK instead.
-const F_SUBTICK:    u32 = 51;
-
-pub fn timerAlloc() *mut[] u32 {
-    var raw: *mut[] u8 = malloc((TIMER_STATE_WORDS as u64) * 4);
-    memset(raw, 0, (TIMER_STATE_WORDS as u64) * 4);
-    return raw as *mut[] u32;
-}
-
-pub fn timerFree(t: *mut[] u32) { free(t as *mut[] u8); }
-
-pub fn timerBase(idx: u32) u32 { return 4 + idx * 16; }
-
-pub fn timerGetField(t: *mut[] u32, idx: u32, field: u32) u32 {
-    return t[timerBase(idx) + field];
-}
-
-pub fn timerSetField(t: *mut[] u32, idx: u32, field: u32, val: u32) {
-    t[timerBase(idx) + field] = val;
-}
-
-// Compose the mode register from individual flag fields, per psxe
-// timer_get_mode(). Side effect: clears target_reached and max_reached
-// (they latch until read).
-pub fn timerGetMode(t: *mut[] u32, idx: u32) u32 {
-    const b: u32 = timerBase(idx);
-    var v: u32 = 0;
-    v = v | ((t[b + F_SYNC_EN]   & 1) << 0);
-    v = v | ((t[b + F_SYNC_MODE] & 3) << 1);
-    v = v | ((t[b + F_RESET_TGT] & 1) << 3);
-    v = v | ((t[b + F_IRQ_TGT]   & 1) << 4);
-    v = v | ((t[b + F_IRQ_MAX]   & 1) << 5);
-    v = v | ((t[b + F_IRQ_REPEAT] & 1) << 6);
-    v = v | ((t[b + F_IRQ_TOGGLE] & 1) << 7);
-    v = v | ((t[b + F_CLKSRC]    & 3) << 8);
-    v = v | ((t[b + F_IRQ]       & 1) << 10);
-    v = v | ((t[b + F_TGT_REACH] & 1) << 11);
-    v = v | ((t[b + F_MAX_REACH] & 1) << 12);
-    t[b + F_TGT_REACH] = 0;
-    t[b + F_MAX_REACH] = 0;
-    return v;
-}
-
-// Mode write — decompose the value into the per-flag fields, then
-// reset side-state (counter, irq, fired, etc.) per psxe semantics.
-// Also seeds the `paused` flag based on hblank/vblank for sync modes.
-pub fn timerSetMode(t: *mut[] u32, idx: u32, val: u32) {
-    const b: u32 = timerBase(idx);
-    t[b + F_SYNC_EN]    = (val >> 0) & 1;
-    t[b + F_SYNC_MODE]  = (val >> 1) & 3;
-    t[b + F_RESET_TGT]  = (val >> 3) & 1;
-    t[b + F_IRQ_TGT]    = (val >> 4) & 1;
-    t[b + F_IRQ_MAX]    = (val >> 5) & 1;
-    t[b + F_IRQ_REPEAT] = (val >> 6) & 1;
-    t[b + F_IRQ_TOGGLE] = (val >> 7) & 1;
-    t[b + F_CLKSRC]     = (val >> 8) & 3;
-    t[b + F_TGT_REACH]  = 0;
-    t[b + F_MAX_REACH]  = 0;
-    t[b + F_IRQ]        = 1;
-    t[b + F_IRQ_FIRED]  = 0;
-    t[b + F_COUNTER]    = 0;
-    t[b + F_BLANK_ONCE] = 0;
-    t[b + F_PAUSED]     = 0;
-
-    const syncMode: u32 = t[b + F_SYNC_MODE];
-    const syncEn: u32 = t[b + F_SYNC_EN];
-    if (idx == 0) {
-        if (syncMode != 1 && syncMode != 2 && syncEn != 0) {
-            var p: u32 = t[0];   // hblank
-            if (syncMode == 3) { p = 1; }
-            t[b + F_PAUSED] = p;
-        }
+    pub fn init() Self {
+        return Self {
+            counter: 0, target: 0, syncEnable: 0, syncMode: 0,
+            irqTarget: 0, irqMax: 0, irqRepeat: 0, irqToggle: 0,
+            irq: 0, targetReached: 0, maxReached: 0, resetTarget: 0,
+            irqFired: 0, paused: 0, blankOnce: 0, clkSource: 0,
+        };
     }
-    if (idx == 1) {
-        if (syncMode != 1 && syncMode != 2 && syncEn != 0) {
-            var p: u32 = t[2];   // vblank
-            if (syncMode == 3) { p = 1; }
-            t[b + F_PAUSED] = p;
-        }
+};
+
+// Aggregate timer state for the chip. Four shared blank-line flags
+// (`hblank` / `prevHblank` / `vblank` / `prevVblank`) drive sync-mode
+// behavior; `channels` carries the three 16-bit timers; `subtick`
+// is the sub-cycle accumulator for timer 2's /8 clock divisor.
+pub const Timer = struct {
+    hblank:     u32,
+    prevHblank: u32,
+    vblank:     u32,
+    prevVblank: u32,
+    channels:   [3]TimerChannel,
+    subtick:    u32,
+
+    pub fn init() Self {
+        return Self {
+            hblank: 0, prevHblank: 0, vblank: 0, prevVblank: 0,
+            channels: [
+                TimerChannel.init(),
+                TimerChannel.init(),
+                TimerChannel.init(),
+            ],
+            subtick: 0,
+        };
     }
-    if (idx == 2) {
-        if (syncEn != 0) {
-            if (syncMode == 0 || syncMode == 3) {
-                t[b + F_PAUSED] = 1;
+
+    // Compose the mode register from individual flag fields, per
+    // psxe `timer_get_mode()`. Side effect: clears
+    // `targetReached` and `maxReached` (they latch until read).
+    pub fn getMode(self: mut Self, idx: u32) u32 {
+        var v: u32 = 0;
+        v = v | ((self.channels[idx].syncEnable    & 1) << 0);
+        v = v | ((self.channels[idx].syncMode      & 3) << 1);
+        v = v | ((self.channels[idx].resetTarget   & 1) << 3);
+        v = v | ((self.channels[idx].irqTarget     & 1) << 4);
+        v = v | ((self.channels[idx].irqMax        & 1) << 5);
+        v = v | ((self.channels[idx].irqRepeat     & 1) << 6);
+        v = v | ((self.channels[idx].irqToggle     & 1) << 7);
+        v = v | ((self.channels[idx].clkSource     & 3) << 8);
+        v = v | ((self.channels[idx].irq           & 1) << 10);
+        v = v | ((self.channels[idx].targetReached & 1) << 11);
+        v = v | ((self.channels[idx].maxReached    & 1) << 12);
+        self.channels[idx].targetReached = 0;
+        self.channels[idx].maxReached    = 0;
+        return v;
+    }
+
+    // Mode write — decompose the value into the per-flag fields,
+    // then reset side-state (counter, irq, fired, etc.) per psxe
+    // semantics. Also seeds `paused` from hblank/vblank for sync
+    // modes.
+    pub fn setMode(self: mut Self, idx: u32, val: u32) {
+        self.channels[idx].syncEnable   = (val >> 0) & 1;
+        self.channels[idx].syncMode     = (val >> 1) & 3;
+        self.channels[idx].resetTarget  = (val >> 3) & 1;
+        self.channels[idx].irqTarget    = (val >> 4) & 1;
+        self.channels[idx].irqMax       = (val >> 5) & 1;
+        self.channels[idx].irqRepeat    = (val >> 6) & 1;
+        self.channels[idx].irqToggle    = (val >> 7) & 1;
+        self.channels[idx].clkSource    = (val >> 8) & 3;
+        self.channels[idx].targetReached = 0;
+        self.channels[idx].maxReached    = 0;
+        self.channels[idx].irq           = 1;
+        self.channels[idx].irqFired      = 0;
+        self.channels[idx].counter       = 0;
+        self.channels[idx].blankOnce     = 0;
+        self.channels[idx].paused        = 0;
+
+        const syncMode: u32 = self.channels[idx].syncMode;
+        const syncEn:   u32 = self.channels[idx].syncEnable;
+        if (idx == 0) {
+            if (syncMode != 1 && syncMode != 2 && syncEn != 0) {
+                var p: u32 = self.hblank;
+                if (syncMode == 3) { p = 1; }
+                self.channels[idx].paused = p;
+            }
+        }
+        if (idx == 1) {
+            if (syncMode != 1 && syncMode != 2 && syncEn != 0) {
+                var p: u32 = self.vblank;
+                if (syncMode == 3) { p = 1; }
+                self.channels[idx].paused = p;
+            }
+        }
+        if (idx == 2) {
+            if (syncEn != 0) {
+                if (syncMode == 0 || syncMode == 3) {
+                    self.channels[idx].paused = 1;
+                }
             }
         }
     }
-}
 
-// IRQ delivery logic — call after every counter advance and every
-// register write. Sets target_reached / max_reached as appropriate,
-// fires the matching IRQ line if its mask bit is enabled, honours
-// one-shot vs repeat semantics, and resets the counter on target-hit
-// if reset_target is set.
-pub fn timerHandleIrq(t: *mut[] u32, idx: u32,
-                      ic: *mut[] u32, cop0: *mut[] u32) {
-    const b: u32 = timerBase(idx);
-    const counter: u32 = t[b + F_COUNTER];
-    const target:  u32 = t[b + F_TARGET];
-    var fireIrq: u32 = 0;
+    // IRQ delivery logic — call after every counter advance and
+    // every register write. Sets targetReached / maxReached as
+    // appropriate, fires the matching IRQ line if its mask bit is
+    // enabled, honours one-shot vs repeat, and resets the counter
+    // on target-hit if resetTarget is set.
+    pub fn handleIrq(self: mut Self, idx: u32,
+                     ic: *mut[] u32, cop0: *mut[] u32) {
+        const counter: u32 = self.channels[idx].counter;
+        const target:  u32 = self.channels[idx].target;
+        var fireIrq: u32 = 0;
 
-    if (counter > target) {
-        t[b + F_TGT_REACH] = 1;
-        if (t[b + F_RESET_TGT] != 0) { t[b + F_COUNTER] = 0; }
-        if (t[b + F_IRQ_TGT] != 0)   { fireIrq = 1; }
-    }
-    if (counter > 0xFFFF) {
-        t[b + F_COUNTER] = 0;
-        t[b + F_MAX_REACH] = 1;
-        if (t[b + F_IRQ_MAX] != 0) { fireIrq = 1; }
-    }
-    if (fireIrq == 0) { return; }
+        if (counter > target) {
+            self.channels[idx].targetReached = 1;
+            if (self.channels[idx].resetTarget != 0) {
+                self.channels[idx].counter = 0;
+            }
+            if (self.channels[idx].irqTarget != 0) { fireIrq = 1; }
+        }
+        if (counter > 0xFFFF) {
+            self.channels[idx].counter = 0;
+            self.channels[idx].maxReached = 1;
+            if (self.channels[idx].irqMax != 0) { fireIrq = 1; }
+        }
+        if (fireIrq == 0) { return; }
 
-    if (t[b + F_IRQ_TOGGLE] == 0) {
-        t[b + F_IRQ] = 0;
-    } else {
-        t[b + F_IRQ] = t[b + F_IRQ] ^ 1;
-    }
-
-    const trigger: bool = t[b + F_IRQ] == 0;
-
-    if (t[b + F_IRQ_REPEAT] == 0) {
-        if (trigger && t[b + F_IRQ_FIRED] == 0) {
-            t[b + F_IRQ_FIRED] = 1;
+        if (self.channels[idx].irqToggle == 0) {
+            self.channels[idx].irq = 0;
         } else {
-            return;
+            self.channels[idx].irq = self.channels[idx].irq ^ 1;
+        }
+
+        const trigger: bool = self.channels[idx].irq == 0;
+
+        if (self.channels[idx].irqRepeat == 0) {
+            if (trigger && self.channels[idx].irqFired == 0) {
+                self.channels[idx].irqFired = 1;
+            } else {
+                return;
+            }
+        }
+
+        self.channels[idx].irq = 1;
+
+        if (trigger) {
+            var line: u32 = IC_TIMER0();
+            match (idx) {
+                1 { line = IC_TIMER1(); }
+                2 { line = IC_TIMER2(); }
+                _ {}
+            }
+            irqRaise(ic, cop0, line);
         }
     }
 
-    t[b + F_IRQ] = 1;
+    // Bus reads — register layout per timer is:
+    //   +0 counter (16-bit)
+    //   +4 mode    (16-bit, read also clears targetReached / maxReached)
+    //   +8 target  (16-bit)
+    pub fn read32(self: mut Self, off: u32) u32 {
+        const idx: u32 = off >> 4;
+        const reg: u32 = off & 0xF;
+        if (idx >= 3) { return 0; }
+        match (reg) {
+            0 { return self.channels[idx].counter; }
+            4 { return self.getMode(idx); }
+            8 { return self.channels[idx].target; }
+            _ { return 0; }
+        }
+    }
 
-    if (trigger) {
-        var line: u32 = IC_TIMER0();
-        match (idx) {
-            1 { line = IC_TIMER1(); }
-            2 { line = IC_TIMER2(); }
+    pub fn read16(self: mut Self, off: u32) u32 { return self.read32(off) & 0xFFFF; }
+    pub fn read8(self: mut Self, off: u32) u32  { return self.read32(off) & 0xFF; }
+
+    pub fn write32(self: mut Self, ic: *mut[] u32, cop0: *mut[] u32,
+               off: u32, val: u32) {
+        const idx: u32 = off >> 4;
+        const reg: u32 = off & 0xF;
+        if (idx >= 3) { return; }
+        match (reg) {
+            0 { self.channels[idx].counter = val & 0xFFFF; }
+            4 { self.setMode(idx, val); }
+            8 { self.channels[idx].target = val & 0xFFFF; }
             _ {}
         }
-        irqRaise(ic, cop0, line);
-    }
-}
-
-// Bus reads — register layout per timer is:
-//   +0 counter (16-bit)
-//   +4 mode    (16-bit, read also clears target_reached / max_reached)
-//   +8 target  (16-bit)
-pub fn timerRead32(t: *mut[] u32, off: u32) u32 {
-    const idx: u32 = off >> 4;
-    const reg: u32 = off & 0xF;
-    if (idx >= 3) { return 0; }
-    match (reg) {
-        0 { return timerGetField(t, idx, F_COUNTER); }
-        4 { return timerGetMode(t, idx); }
-        8 { return timerGetField(t, idx, F_TARGET);  }
-        _ { return 0; }
-    }
-}
-
-pub fn timerRead16(t: *mut[] u32, off: u32) u32 {
-    return timerRead32(t, off) & 0xFFFF;
-}
-
-pub fn timerRead8(t: *mut[] u32, off: u32) u32 {
-    return timerRead32(t, off) & 0xFF;
-}
-
-pub fn timerWrite32(t: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32,
-                    off: u32, val: u32) {
-    const idx: u32 = off >> 4;
-    const reg: u32 = off & 0xF;
-    if (idx >= 3) { return; }
-    match (reg) {
-        0 { timerSetField(t, idx, F_COUNTER, val & 0xFFFF); }
-        4 { timerSetMode(t, idx, val); }
-        8 { timerSetField(t, idx, F_TARGET, val & 0xFFFF); }
-        _ {}
-    }
-    timerHandleIrq(t, idx, ic, cop0);
-}
-
-pub fn timerWrite16(t: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32,
-                    off: u32, val: u32) {
-    timerWrite32(t, ic, cop0, off, val & 0xFFFF);
-}
-
-pub fn timerWrite8(t: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32,
-                   off: u32, val: u32) {
-    timerWrite32(t, ic, cop0, off, val & 0xFF);
-}
-
-// Per-cycle advance. The caller passes how many CPU cycles have just
-// been executed (psxe equivalent: `psx_timer_update(timer, cpu->last_cycles)`).
-// Timer 1 with clk_source=1 (hblank) is driven by `timerHblankEvent`
-// instead; timer 0 has a dotclock mode we approximate as system clock.
-pub fn timerUpdate(t: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32) {
-    timerUpdateCyc(t, ic, cop0, 2);
-}
-
-pub fn timerUpdateCyc(t: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
-    timerUpdateOne(t, 0, cyc, ic, cop0);
-    timerUpdateOne(t, 1, cyc, ic, cop0);
-    timerUpdateOne(t, 2, cyc, ic, cop0);
-}
-
-pub fn timerUpdateOne(t: *mut[] u32, idx: u32, cyc: u32,
-                      ic: *mut[] u32, cop0: *mut[] u32) {
-    const b: u32 = timerBase(idx);
-    if (t[b + F_PAUSED] != 0) { return; }
-    // Timer 1 sourced from hblank is incremented in the hblank handler.
-    if (idx == 1 && (t[b + F_CLKSRC] & 1) != 0) { return; }
-    const prevCounter: u32 = t[b + F_COUNTER];
-    // Timer 2 with clk_source >= 2 ticks at sysclk/8. psxe uses a float
-    // counter; we accumulate sub-cycles in F_SUBTICK and add whole /8
-    // increments to the clean 16-bit counter so timerRead32 returns a
-    // value the game can compare against F_TARGET without garbage bits.
-    if (idx == 2 && t[b + F_CLKSRC] >= 2) {
-        const acc: u32 = t[F_SUBTICK] + cyc;
-        const incr: u32 = acc >> 3;
-        t[F_SUBTICK] = acc & 7;
-        t[b + F_COUNTER] = (t[b + F_COUNTER] + incr) & 0xFFFF;
-    } else {
-        t[b + F_COUNTER] = (t[b + F_COUNTER] + cyc) & 0xFFFFFFFF;
-    }
-    // ps1-tests timers testTimerTargetBehaviour reads the counter in a
-    // tight loop and asserts the value `target` is observed before
-    // reset_target snaps it back to 0. Our cycle-aggregated tick can
-    // leap past the target value (e.g. counter += 2 jumps target=10
-    // from 8 straight to 12). When this happens with RESET_TGT set,
-    // land at target this update — the next call will pick up from
-    // target+1 and clear via the normal reset path.
-    const target: u32 = t[b + F_TARGET];
-    // Use prevCounter < target (strict) — once we've landed at target
-    // we want the next call to advance past and fire the normal reset
-    // path in timerHandleIrq, otherwise we'd be pinned at target.
-    if (t[b + F_RESET_TGT] != 0 &&
-        prevCounter < target &&
-        t[b + F_COUNTER] > target &&
-        t[b + F_COUNTER] <= 0xFFFF) {
-        t[b + F_COUNTER] = target;
-    }
-    timerHandleIrq(t, idx, ic, cop0);
-}
-
-// Hblank / vblank entry/exit hooks called by the GPU's frame-pacing.
-pub fn timerHblankBegin(t: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32) {
-    t[1] = t[0];      // prev = current
-    t[0] = 1;         // hblank = 1
-
-    if ((timerGetField(t, 1, F_CLKSRC) & 1) != 0 &&
-        timerGetField(t, 1, F_PAUSED) == 0) {
-        timerSetField(t, 1, F_COUNTER,
-                      (timerGetField(t, 1, F_COUNTER) + 1) & 0xFFFF);
-        timerHandleIrq(t, 1, ic, cop0);
+        self.handleIrq(idx, ic, cop0);
     }
 
-    if (timerGetField(t, 0, F_SYNC_EN) == 0) { return; }
-    match (timerGetField(t, 0, F_SYNC_MODE)) {
-        0 { timerSetField(t, 0, F_PAUSED, 1); }
-        1 { timerSetField(t, 0, F_COUNTER, 0); }
-        2 {
-            timerSetField(t, 0, F_COUNTER, 0);
-            timerSetField(t, 0, F_PAUSED, 0);
+    pub fn write16(self: mut Self, ic: *mut[] u32, cop0: *mut[] u32,
+               off: u32, val: u32) {
+        self.write32(ic, cop0, off, val & 0xFFFF);
+    }
+
+    pub fn write8(self: mut Self, ic: *mut[] u32, cop0: *mut[] u32,
+              off: u32, val: u32) {
+        self.write32(ic, cop0, off, val & 0xFF);
+    }
+
+    // Per-cycle advance. The caller passes how many CPU cycles
+    // have just been executed. Timer 1 with clk_source=1 (hblank)
+    // is driven by `hblankBegin` instead; timer 0 has a dotclock
+    // mode we approximate as system clock.
+    pub fn update(self: mut Self, ic: *mut[] u32, cop0: *mut[] u32) {
+        self.updateCyc(ic, cop0, 2);
+    }
+
+    pub fn updateCyc(self: mut Self, ic: *mut[] u32, cop0: *mut[] u32,
+                 cyc: u32) {
+        self.updateOne(0, cyc, ic, cop0);
+        self.updateOne(1, cyc, ic, cop0);
+        self.updateOne(2, cyc, ic, cop0);
+    }
+
+    pub fn updateOne(self: mut Self, idx: u32, cyc: u32,
+                 ic: *mut[] u32, cop0: *mut[] u32) {
+        if (self.channels[idx].paused != 0) { return; }
+        // Timer 1 sourced from hblank is incremented in hblankBegin.
+        if (idx == 1 && (self.channels[idx].clkSource & 1) != 0) { return; }
+        const prevCounter: u32 = self.channels[idx].counter;
+        // Timer 2 with clk_source >= 2 ticks at sysclk/8. We
+        // accumulate sub-cycles in `subtick` and add whole /8
+        // increments to the clean 16-bit counter so reads return a
+        // value the game can compare against `target` without
+        // garbage bits.
+        if (idx == 2 && self.channels[idx].clkSource >= 2) {
+            const acc: u32 = self.subtick + cyc;
+            const incr: u32 = acc >> 3;
+            self.subtick = acc & 7;
+            self.channels[idx].counter = (self.channels[idx].counter + incr) & 0xFFFF;
+        } else {
+            self.channels[idx].counter = (self.channels[idx].counter + cyc) & 0xFFFFFFFF;
         }
-        3 {
-            if (timerGetField(t, 0, F_BLANK_ONCE) == 0) {
-                timerSetField(t, 0, F_BLANK_ONCE, 1);
-                timerSetField(t, 0, F_SYNC_EN, 0);
-                timerSetField(t, 0, F_PAUSED, 0);
+        // ps1-tests timers `testTimerTargetBehaviour` reads the
+        // counter in a tight loop and asserts `target` is observed
+        // before resetTarget snaps it back. Our cycle-aggregated
+        // tick can leap past target (e.g. counter += 2 jumps
+        // target=10 from 8 straight to 12). When this happens with
+        // resetTarget set, land at target this update — the next
+        // call will pick up from target+1 and clear via the normal
+        // reset path.
+        const target: u32 = self.channels[idx].target;
+        if (self.channels[idx].resetTarget != 0 &&
+            prevCounter < target &&
+            self.channels[idx].counter > target &&
+            self.channels[idx].counter <= 0xFFFF) {
+            self.channels[idx].counter = target;
+        }
+        self.handleIrq(idx, ic, cop0);
+    }
+
+    // Hblank / vblank entry/exit hooks called by the GPU's
+    // frame-pacing.
+    pub fn hblankBegin(self: mut Self, ic: *mut[] u32, cop0: *mut[] u32) {
+        self.prevHblank = self.hblank;
+        self.hblank = 1;
+
+        if ((self.channels[1].clkSource & 1) != 0 &&
+            self.channels[1].paused == 0) {
+            self.channels[1].counter =
+                (self.channels[1].counter + 1) & 0xFFFF;
+            self.handleIrq(1, ic, cop0);
+        }
+
+        if (self.channels[0].syncEnable == 0) { return; }
+        match (self.channels[0].syncMode) {
+            0 { self.channels[0].paused = 1; }
+            1 { self.channels[0].counter = 0; }
+            2 {
+                self.channels[0].counter = 0;
+                self.channels[0].paused = 0;
             }
-        }
-        _ {}
-    }
-}
-
-pub fn timerHblankEnd(t: *mut[] u32) {
-    t[0] = 0;
-    if (timerGetField(t, 0, F_SYNC_EN) == 0) { return; }
-    match (timerGetField(t, 0, F_SYNC_MODE)) {
-        0 { timerSetField(t, 0, F_PAUSED, 0); }
-        2 { timerSetField(t, 0, F_PAUSED, 1); }
-        _ {}
-    }
-}
-
-pub fn timerVblankBegin(t: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32) {
-    t[3] = t[2];
-    t[2] = 1;
-
-    if (timerGetField(t, 1, F_SYNC_EN) == 0) { return; }
-    match (timerGetField(t, 1, F_SYNC_MODE)) {
-        0 { timerSetField(t, 1, F_PAUSED, 1); }
-        1 { timerSetField(t, 1, F_COUNTER, 0); }
-        2 {
-            timerSetField(t, 1, F_COUNTER, 0);
-            timerSetField(t, 1, F_PAUSED, 0);
-        }
-        3 {
-            if (timerGetField(t, 1, F_BLANK_ONCE) == 0) {
-                timerSetField(t, 1, F_BLANK_ONCE, 1);
-                timerSetField(t, 1, F_SYNC_EN, 0);
-                timerSetField(t, 1, F_PAUSED, 0);
+            3 {
+                if (self.channels[0].blankOnce == 0) {
+                    self.channels[0].blankOnce = 1;
+                    self.channels[0].syncEnable = 0;
+                    self.channels[0].paused = 0;
+                }
             }
+            _ {}
         }
-        _ {}
     }
-}
 
-pub fn timerVblankEnd(t: *mut[] u32) {
-    t[2] = 0;
-    if (timerGetField(t, 1, F_SYNC_EN) == 0) { return; }
-    match (timerGetField(t, 1, F_SYNC_MODE)) {
-        0 { timerSetField(t, 1, F_PAUSED, 0); }
-        2 { timerSetField(t, 1, F_PAUSED, 1); }
-        _ {}
+    pub fn hblankEnd(self: mut Self) {
+        self.hblank = 0;
+        if (self.channels[0].syncEnable == 0) { return; }
+        match (self.channels[0].syncMode) {
+            0 { self.channels[0].paused = 0; }
+            2 { self.channels[0].paused = 1; }
+            _ {}
+        }
     }
-}
+
+    pub fn vblankBegin(self: mut Self, ic: *mut[] u32, cop0: *mut[] u32) {
+        self.prevVblank = self.vblank;
+        self.vblank = 1;
+
+        if (self.channels[1].syncEnable == 0) { return; }
+        match (self.channels[1].syncMode) {
+            0 { self.channels[1].paused = 1; }
+            1 { self.channels[1].counter = 0; }
+            2 {
+                self.channels[1].counter = 0;
+                self.channels[1].paused = 0;
+            }
+            3 {
+                if (self.channels[1].blankOnce == 0) {
+                    self.channels[1].blankOnce = 1;
+                    self.channels[1].syncEnable = 0;
+                    self.channels[1].paused = 0;
+                }
+            }
+            _ {}
+        }
+    }
+
+    pub fn vblankEnd(self: mut Self) {
+        self.vblank = 0;
+        if (self.channels[1].syncEnable == 0) { return; }
+        match (self.channels[1].syncMode) {
+            0 { self.channels[1].paused = 0; }
+            2 { self.channels[1].paused = 1; }
+            _ {}
+        }
+    }
+};

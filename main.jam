@@ -26,11 +26,7 @@ const { spuAlloc, spuRamAlloc, psone_audio_cb, setU64 } = import("spu");
 const { sio1Update } = import("sio1");
 const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
 const { mcdRamLoad, mcdRamSave } = import("mcd");
-const {
-    timerAlloc, timerUpdate, timerUpdateCyc,
-    timerHblankBegin, timerHblankEnd,
-    timerVblankBegin, timerVblankEnd
-} = import("timer");
+const { Timer } = import("timer");
 
 const {
     freshCpu, freshCpuAt,
@@ -118,7 +114,7 @@ const Bus = struct {
     gpu:   *mut[] u32,
     dma:   *mut[] u32,
     irq:   *mut[] u32,
-    timer: *mut[] u32,
+    timer: Timer,
     gte:   *mut[] u32,
     cdrom: *mut[] u8,
     disc:  *mut[] Disc,
@@ -318,7 +314,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         const before: u64 = c.cycles;
         step(c, bus, regs, cop0);
         const delta: u32 = (c.cycles - before) as u32;
-        timerUpdateCyc(bus.timer, bus.irq, cop0, delta);
+        bus.timer.updateCyc(bus.irq, cop0, delta);
         dmaTickSpu(bus.dma, delta);
         dmaUpdate(bus.dma, bus.irq, cop0);
         cdromUpdate(bus.cdrom, bus.disc, bus.spu, bus.irq, cop0, delta);
@@ -331,14 +327,14 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         lineCyc = lineCyc + delta;
         // HBlank begins ~75% into the scanline. Fire once per line.
         if (!hblankFired && lineCyc >= CYCLES_HDRAW) {
-            timerHblankBegin(bus.timer, bus.irq, cop0);
+            bus.timer.hblankBegin(bus.irq, cop0);
             hblankFired = true;
         }
         if (lineCyc >= CYCLES_PER_SCANLINE) {
             lineCyc = lineCyc - CYCLES_PER_SCANLINE;
             hblankFired = false;
             // HBlank ends at the scanline boundary, before the next line.
-            timerHblankEnd(bus.timer);
+            bus.timer.hblankEnd();
             // psxe gpu.c:1908-1946: toggle GPUSTAT bit 31 (odd-line flag)
             // per scanline. BIOS VSync uses this as a heartbeat; if it
             // stays at 0, the BIOS busy-spins on GPUSTAT instead of
@@ -357,7 +353,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
             // VBlank arrived one scanline late (~2172 cycles).
             line = line + 1;
             if (line == SCANLINES_VDRAW) {
-                timerVblankBegin(bus.timer, bus.irq, cop0);
+                bus.timer.vblankBegin(bus.irq, cop0);
                 irqRaise(bus.irq, cop0, IC_VBLANK());
             }
         }
@@ -367,7 +363,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     // would eat the delay slot when a load lands on the last cycle of
     // the frame (the delay-slot instruction runs in the next frame,
     // and would see the new value instead of the old one).
-    timerVblankEnd(bus.timer);
+    bus.timer.vblankEnd();
 }
 
 // Pre-fill VRAM with a soft gradient so the user sees the SDL pipe is
@@ -638,6 +634,18 @@ fn main() {
         padSetButtons(bus.pad, buttons[0]);
         frames = frames + 1;
 
+        // FMV-debug probe: periodic GP0 family histogram. Once every
+        // 300 frames (~5s at 60Hz) dump g[72..79] so we can see if/when
+        // family 5 (CPU→VRAM, the FMV upload signature) starts firing.
+        if ((frames % 300) == 0) {
+            var gpuState: *mut[] u32 = busGpuPtr(bus);
+            var fmt: []u8 = "[%u] GP0 families: misc=%u poly=%u line=%u rect=%u blit=%u cpu2vram=%u vram2cpu=%u drawset=%u\n";
+            printf(fmt.ptr, frames,
+                gpuState[72], gpuState[73], gpuState[74], gpuState[75],
+                gpuState[76], gpuState[77], gpuState[78], gpuState[79]);
+            flushAll();
+        }
+
         // Bail after a long-but-finite session if no quit event comes —
         // protects users from a runaway window when there's no controller
         // input wired up yet.
@@ -647,6 +655,21 @@ fn main() {
     // Persist memcard slot 1 to disk before freeing the bus. psxe does
     // the equivalent in psx_mcd_destroy.
     mcdRamSave(bus.mcdRam, mcdPath);
+
+    // FMV-debug probe: dump GP0 command-family histogram. g[72..79]
+    // counts how many GP0 cmds of each family fired during the run.
+    // Family index = top 3 bits of the cmd byte:
+    //   0 = misc (nop/cache/fill)         4 = blit (vram2vram only here)
+    //   1 = polygon                       5 = CPU→VRAM (image load)
+    //   2 = line                          6 = VRAM→CPU
+    //   3 = rectangle                     7 = drawing settings (E1..E6)
+    // For an FMV intro we expect family 5 (CPU→VRAM) > 0 if MDEC
+    // output is being uploaded. If it's 0 the bug is upstream
+    // (CD-ROM streaming / MDEC pipeline never feeds the GPU).
+    var gpuState: *mut[] u32 = busGpuPtr(bus);
+    var fmt: []u8 = "GP0 families: misc=%u poly=%u line=%u rect=%u blit=%u cpu2vram=%u vram2cpu=%u drawset=%u\n";
+    printf(fmt.ptr, gpuState[72], gpuState[73], gpuState[74], gpuState[75],
+                    gpuState[76], gpuState[77], gpuState[78], gpuState[79]);
 
     sdlAudioClose(audioDev);
     free(audioCtx);

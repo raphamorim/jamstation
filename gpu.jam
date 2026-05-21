@@ -1245,29 +1245,26 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
                     const ty: u32 = (vv0 + iy) & 0xFF;
                     const texel: u32 = gpuFetchTexel(vram, tx, ty, g[60], g[61],
                                                       clutx, cluty, g[62]);
-                    // psxe gpu_render_textured_rectangle (gpu.c:686-718)
-                    // writes every texel UNCONDITIONALLY — no texel-0
-                    // skip even though the strict spec says texel 0 is
-                    // transparent. The Musashi intro (and other FMVs that
-                    // draw decoded frames via textured rectangles) relies
-                    // on this: the FMV contains lots of true-black pixels
-                    // that, if skipped, leave stale VRAM contents showing
-                    // through — entire frame appears black.
-                    var color: u32 = texel;
-                    if (!isRaw) {
-                        color = gpuModulate(texel, g[0] & 0xFFFFFF);
+                    if (texel != 0) {
+                        var color: u32 = texel;
+                        if (!isRaw) {
+                            color = gpuModulate(texel, g[0] & 0xFFFFFF);
+                        }
+                        // Per psxe: when the rect's transparency flag is
+                        // set, texel bit 15 selects whether THIS pixel
+                        // blends. When the flag isn't set, no blending.
+                        var thisTransp: bool = false;
+                        if (isTransp) {
+                            thisTransp = (texel & 0x8000) != 0;
+                        }
+                        if (thisTransp) {
+                            const back: u32 = vramReadPixel(vram,
+                                (px as u32) & 0x3FF, (py as u32) & 0x1FF);
+                            color = gpuBlend(color, back, transpMode);
+                        }
+                        vramWritePixel(vram, (px as u32) & 0x3FF,
+                                        (py as u32) & 0x1FF, color);
                     }
-                    var thisTransp: bool = false;
-                    if (isTransp) {
-                        thisTransp = (texel & 0x8000) != 0;
-                    }
-                    if (thisTransp) {
-                        const back: u32 = vramReadPixel(vram,
-                            (px as u32) & 0x3FF, (py as u32) & 0x1FF);
-                        color = gpuBlend(color, back, transpMode);
-                    }
-                    vramWritePixel(vram, (px as u32) & 0x3FF,
-                                   (py as u32) & 0x1FF, color);
                 }
                 ix = ix + 1;
             }

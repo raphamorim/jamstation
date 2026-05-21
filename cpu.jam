@@ -29,7 +29,7 @@ const { busRead32, busRead16, busRead8,
 const { gpuAlloc } = import("gpu");
 const { dmaAlloc } = import("dma");
 const { irqAlloc } = import("irq");
-const { timerAlloc } = import("timer");
+const { Timer } = import("timer");
 const { gteAlloc, gteDataRead, gteDataWrite,
         gteCtrlRead, gteCtrlWrite, gteExec } = import("gte");
 const { cdromAlloc } = import("cdrom");
@@ -59,7 +59,7 @@ const Bus = struct {
     gpu:   *mut[] u32,
     dma:   *mut[] u32,
     irq:   *mut[] u32,
-    timer: *mut[] u32,
+    timer: Timer,
     gte:   *mut[] u32,
     cdrom: *mut[] u8,
     disc:  *mut[] Disc,

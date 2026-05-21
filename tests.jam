@@ -32,11 +32,7 @@ const { padAlloc, padUpdate } = import("pad");
 const { spuAlloc, spuRamAlloc, spuUpdate } = import("spu");
 const { sio1Alloc, sio1Update } = import("sio1");
 const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
-const {
-    timerAlloc, timerUpdateCyc,
-    timerHblankBegin, timerHblankEnd,
-    timerVblankBegin, timerVblankEnd
-} = import("timer");
+const { Timer } = import("timer");
 const { busBiosPtr } = import("bus");
 
 // libc for the headless boot harness.
@@ -68,7 +64,7 @@ const Bus = struct {
     gpu:   *mut[] u32,
     dma:   *mut[] u32,
     irq:   *mut[] u32,
-    timer: *mut[] u32,
+    timer: Timer,
     gte:   *mut[] u32,
     cdrom: *mut[] u8,
     disc:  *mut[] Disc,
@@ -437,7 +433,7 @@ fn emuRunOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         const before: u64 = c.cycles;
         step(c, bus, regs, cop0);
         const delta: u32 = (c.cycles - before) as u32;
-        timerUpdateCyc(bus.timer, bus.irq, cop0, delta);
+        bus.timer.updateCyc(bus.irq, cop0, delta);
         dmaUpdate(bus.dma, bus.irq, cop0);
         cdromUpdate(bus.cdrom, bus.disc, bus.irq, cop0, delta);
         padUpdate(bus.pad, bus.irq, cop0, delta);
@@ -446,17 +442,17 @@ fn emuRunOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         lineCyc = lineCyc + delta;
         if (lineCyc >= CYC_PER_SCANLINE) {
             lineCyc = lineCyc - CYC_PER_SCANLINE;
-            timerHblankBegin(bus.timer, bus.irq, cop0);
-            timerHblankEnd(bus.timer);
+            bus.timer.hblankBegin(bus.irq, cop0);
+            bus.timer.hblankEnd();
             if (line == SCANLINES_VDRAW) {
-                timerVblankBegin(bus.timer, bus.irq, cop0);
+                bus.timer.vblankBegin(bus.irq, cop0);
                 irqRaise(bus.irq, cop0, IC_VBLANK());
             }
             line = line + 1;
         }
     }
     commitLoad(c, regs);
-    timerVblankEnd(bus.timer);
+    bus.timer.vblankEnd();
 }
 
 fn emuRunFrames(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,

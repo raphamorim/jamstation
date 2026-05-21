@@ -15,8 +15,7 @@ const { dmaRead32, dmaRead16, dmaRead8,
         dmaWrite32, dmaWrite16, dmaWrite8, dmaAlloc, dmaFree } = import("dma");
 const { irqRead32, irqRead16, irqRead8,
         irqWrite32, irqWrite16, irqWrite8, irqAlloc, irqFree } = import("irq");
-const { timerRead32, timerRead16, timerRead8,
-        timerWrite32, timerWrite16, timerWrite8, timerAlloc, timerFree } = import("timer");
+const { Timer } = import("timer");
 const { gteAlloc, gteFree } = import("gte");
 const { cdromRead32, cdromRead16, cdromRead8,
         cdromWrite32, cdromWrite16, cdromWrite8,
@@ -67,7 +66,7 @@ const Bus = struct {
     gpu:   *mut[] u32,
     dma:   *mut[] u32,
     irq:   *mut[] u32,
-    timer: *mut[] u32,
+    timer: Timer,
     gte:   *mut[] u32,
     cdrom: *mut[] u8,
     disc:  *mut[] Disc,
@@ -204,7 +203,7 @@ pub fn allocBus() Bus {
         gpu:   gpuAlloc(),
         dma:   dmaAlloc(),
         irq:   irqAlloc(),
-        timer: timerAlloc(),
+        timer: Timer.init(),
         gte:   gteAlloc(),
         cdrom: cdromAlloc(),
         disc:  discAlloc(),
@@ -231,7 +230,7 @@ pub fn freeBus(b: Bus) {
     gpuFree(b.gpu);
     dmaFree(b.dma);
     irqFree(b.irq);
-    timerFree(b.timer);
+    // b.timer is by-value; no free needed.
     gteFree(b.gte);
     cdromFree(b.cdrom);
     discFree(b.disc);
@@ -254,7 +253,7 @@ pub fn ioRead32(bus: Bus, off: u32) u32 {
         0x050..=0x05F { return sio1Read32(bus.sio1, off - 0x050); }
         0x070..=0x07F { return irqRead32(bus.irq, off - 0x070); }
         0x080..=0x0FF { return dmaRead32(bus.dma, off - 0x080); }
-        0x100..=0x12F { return timerRead32(bus.timer, off - 0x100); }
+        0x100..=0x12F { return bus.timer.read32(off - 0x100); }
         0x800..=0x803 { return cdromRead32(bus.cdrom, off - 0x800); }
         0x810..=0x817 { return gpuRead32(bus.gpu, bus.vram, off - 0x810); }
         0x820..=0x827 { return mdecRead32(bus.mdec, bus.mdecOut, off - 0x820); }
@@ -271,7 +270,7 @@ pub fn ioRead16(bus: Bus, off: u32) u32 {
         0x050..=0x05F { return sio1Read16(bus.sio1, off - 0x050); }
         0x070..=0x07F { return irqRead16(bus.irq, off - 0x070); }
         0x080..=0x0FF { return dmaRead16(bus.dma, off - 0x080); }
-        0x100..=0x12F { return timerRead16(bus.timer, off - 0x100); }
+        0x100..=0x12F { return bus.timer.read16(off - 0x100); }
         0x800..=0x803 { return cdromRead16(bus.cdrom, off - 0x800); }
         0x810..=0x817 { return gpuRead16(bus.gpu, bus.vram, off - 0x810); }
         0x820..=0x827 { return mdecRead16(bus.mdec, bus.mdecOut, off - 0x820); }
@@ -288,7 +287,7 @@ pub fn ioRead8(bus: Bus, off: u32) u32 {
         0x050..=0x05F { return sio1Read8(bus.sio1, off - 0x050); }
         0x070..=0x07F { return irqRead8(bus.irq, off - 0x070); }
         0x080..=0x0FF { return dmaRead8(bus.dma, off - 0x080); }
-        0x100..=0x12F { return timerRead8(bus.timer, off - 0x100); }
+        0x100..=0x12F { return bus.timer.read8(off - 0x100); }
         0x800..=0x803 { return cdromRead8(bus.cdrom, off - 0x800); }
         0x810..=0x817 { return gpuRead8(bus.gpu, bus.vram, off - 0x810); }
         0x820..=0x827 { return mdecRead8(bus.mdec, bus.mdecOut, off - 0x820); }
@@ -309,7 +308,7 @@ pub fn ioWrite32(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
         0x050..=0x05F { sio1Write32(bus.sio1, off - 0x050, val); return; }
         0x070..=0x07F { irqWrite32(bus.irq, cop0, off - 0x070, val); return; }
         0x080..=0x0FF { dmaWrite32(bus.dma, bus, cop0, off - 0x080, val); return; }
-        0x100..=0x12F { timerWrite32(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
+        0x100..=0x12F { bus.timer.write32(bus.irq, cop0, off - 0x100, val); return; }
         0x800..=0x803 { cdromWrite32(bus.cdrom, off - 0x800, val); return; }
         0x810..=0x817 { gpuWrite32(bus.gpu, bus.vram, off - 0x810, val); return; }
         0x820..=0x827 { mdecWrite32(bus.mdec, bus.mdecIn, bus.mdecOut, off - 0x820, val); return; }
@@ -326,7 +325,7 @@ pub fn ioWrite16(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
         0x050..=0x05F { sio1Write16(bus.sio1, off - 0x050, val); return; }
         0x070..=0x07F { irqWrite16(bus.irq, cop0, off - 0x070, val); return; }
         0x080..=0x0FF { dmaWrite16(bus.dma, bus, cop0, off - 0x080, val); return; }
-        0x100..=0x12F { timerWrite16(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
+        0x100..=0x12F { bus.timer.write16(bus.irq, cop0, off - 0x100, val); return; }
         0x800..=0x803 { cdromWrite16(bus.cdrom, off - 0x800, val); return; }
         0x810..=0x817 { gpuWrite16(bus.gpu, bus.vram, off - 0x810, val); return; }
         0x820..=0x827 { mdecWrite16(bus.mdec, bus.mdecIn, bus.mdecOut, off - 0x820, val); return; }
@@ -343,7 +342,7 @@ pub fn ioWrite8(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
         0x050..=0x05F { sio1Write8(bus.sio1, off - 0x050, val); return; }
         0x070..=0x07F { irqWrite8(bus.irq, cop0, off - 0x070, val); return; }
         0x080..=0x0FF { dmaWrite8(bus.dma, bus, cop0, off - 0x080, val); return; }
-        0x100..=0x12F { timerWrite8(bus.timer, bus.irq, cop0, off - 0x100, val); return; }
+        0x100..=0x12F { bus.timer.write8(bus.irq, cop0, off - 0x100, val); return; }
         0x800..=0x803 { cdromWrite8(bus.cdrom, off - 0x800, val); return; }
         0x810..=0x817 { gpuWrite8(bus.gpu, bus.vram, off - 0x810, val); return; }
         0x820..=0x827 { mdecWrite8(bus.mdec, bus.mdecIn, bus.mdecOut, off - 0x820, val); return; }
@@ -438,5 +437,6 @@ pub fn busVramPtr(bus: Bus) *mut[] u8 { return bus.vram; }
 pub fn busGpuPtr(bus: Bus) *mut[] u32 { return bus.gpu; }
 pub fn busDmaPtr(bus: Bus) *mut[] u32 { return bus.dma; }
 pub fn busIrqPtr(bus: Bus) *mut[] u32 { return bus.irq; }
-pub fn busTimerPtr(bus: Bus) *mut[] u32 { return bus.timer; }
+// busTimerPtr removed — `bus.timer` is by-value now. Callers use
+// the Timer methods directly via `bus.timer.method(...)`.
 pub fn busGtePtr(bus: Bus) *mut[] u32 { return bus.gte; }
