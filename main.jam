@@ -24,6 +24,7 @@ const { dmaAlloc, dmaTickSpu, dmaUpdate } = import("dma");
 const { padAlloc, padUpdate, padSetButtons } = import("pad");
 const { spuAlloc, spuRamAlloc, psone_audio_cb, setU64 } = import("spu");
 const { Sio1 } = import("sio1");
+const { Mdec } = import("mdec");
 const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
 const { Mcd, mcdRamLoad, mcdRamSave } = import("mcd");
 const { Timer } = import("timer");
@@ -121,7 +122,7 @@ const Bus = struct {
     pad:   *mut[] u8,
     spu:     *mut[] u8,
     spuram:  *mut[] u8,
-    mdec:    *mut[] u8,
+    mdec:    Mdec,
     mdecIn:  *mut[] u8,
     mdecOut: *mut[] u8,
     sio1:    Sio1,

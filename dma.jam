@@ -14,7 +14,7 @@
 const { gpuGp0, gpuRead32 } = import("gpu");
 const { irqRaise, IC_DMA } = import("irq");
 const { cdromReadData } = import("cdrom");
-const { mdecRead32, mdecWrite32 } = import("mdec");
+const { Mdec } = import("mdec");
 const { spuWrite16, spuRead16 } = import("spu");
 
 const SPU_TFIFO_OFF: u32 = 0x1A8;
@@ -51,7 +51,7 @@ const Bus = struct {
     pad:   *mut[] u8,
     spu:     *mut[] u8,
     spuram:  *mut[] u8,
-    mdec:    *mut[] u8,
+    mdec:    Mdec,
     mdecIn:  *mut[] u8,
     mdecOut: *mut[] u8,
     sio1:    *mut[] u8,
@@ -349,7 +349,7 @@ pub fn dmaDoMdecIn(d: *mut[] u32, bus: Bus) {
     var i: u32 = 0;
     while (i < size) {
         const w: u32 = ramRead32(bus, addr);
-        mdecWrite32(bus.mdec, bus.mdecIn, bus.mdecOut, 0, w);
+        bus.mdec.write32(bus.mdecIn, bus.mdecOut, 0, w);
         addr = addr + step;
         i = i + 1;
     }
@@ -367,7 +367,7 @@ pub fn dmaDoMdecOut(d: *mut[] u32, bus: Bus) {
     var addr: u32 = d[chBase(1) + F_MADR];
     var i: u32 = 0;
     while (i < size) {
-        const w: u32 = mdecRead32(bus.mdec, bus.mdecOut, 0);
+        const w: u32 = bus.mdec.read32(bus.mdecOut, 0);
         ramWrite32(bus, addr, w);
         addr = addr + step;
         i = i + 1;
