@@ -140,9 +140,13 @@ pub fn zagzigInit(s: *mut[] u8) {
 pub fn mdecAlloc() *mut[] u8 {
     var raw: *mut[] u8 = malloc(MDEC_STATE_SIZE as u64);
     memset(raw, 0, MDEC_STATE_SIZE as u64);
-    // Reset state: bit 31 set (data-out empty), depth 0, current_block 4.
-    mSetU32(raw, S_OUTPUT_EMPTY, 1);
-    mSetU32(raw, S_CUR_BLOCK, 4);
+    // Init state mirrors psxe psx_mdec_init (mdec.c:278-285): all fields
+    // zero after memset. The non-zero current_block=4 / output_empty=1
+    // values we previously set here are psxe's POST-RESET state
+    // (mdec.c:441-453), not its boot state — they're applied later when
+    // the game writes the reset bit to offset 4. Setting them at init
+    // made the status register report "FIFO empty, decoding block 4"
+    // before any reset, which divergent from psxe.
     zagzigInit(raw);
     return raw;
 }
