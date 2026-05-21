@@ -20,7 +20,7 @@
 // drive a real X-press.
 
 const { irqRaise, IC_JOY } = import("irq");
-const { mcdRead, mcdWrite, mcdReset, mcdQuery } = import("mcd");
+const { Mcd } = import("mcd");
 
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
@@ -164,7 +164,7 @@ pub fn sdaWrite(p: *mut[] u8, data: u32) {
 // pad_read_rx: returns the next byte the controller has staged in
 // response to the last TX. Mirrors psxe — when CTRL.JOUT and RXEN are
 // both clear, the line is high-Z and reads return 0xFFFFFFFF.
-pub fn padReadRx(p: *mut[] u8, mcd: *mut[] u8, mcdRam: *mut[] u8) u32 {
+pub fn padReadRx(p: *mut[] u8, mcd: mut Mcd, mcdRam: *mut[] u8) u32 {
     const ctrl: u32 = padGetU16(p, P_CTRL_LO);
     if (p[P_DEST] == 0) { return 0xFFFFFFFF; }
     if ((ctrl & CTRL_JOUT) == 0 && (ctrl & CTRL_RXEN) == 0) {
@@ -176,8 +176,8 @@ pub fn padReadRx(p: *mut[] u8, mcd: *mut[] u8, mcdRam: *mut[] u8) u32 {
         return data;
     }
     if (p[P_DEST] == DEST_MCD as u8) {
-        const data: u32 = mcdRead(mcd, mcdRam);
-        if (!mcdQuery(mcd)) { p[P_DEST] = 0; }
+        const data: u32 = mcd.read(mcdRam);
+        if (!mcd.query()) { p[P_DEST] = 0; }
         return data;
     }
     return 0xFFFFFFFF;
@@ -188,7 +188,7 @@ pub fn padReadRx(p: *mut[] u8, mcd: *mut[] u8, mcdRam: *mut[] u8) u32 {
 // Subsequent bytes are routed to whatever destination was selected. If
 // ACIE is enabled in CTRL, we schedule an IRQ7 ack JOY_IRQ_DELAY cycles
 // out.
-pub fn padWriteTx(p: *mut[] u8, mcd: *mut[] u8, data: u32) {
+pub fn padWriteTx(p: *mut[] u8, mcd: mut Mcd, data: u32) {
     const ctrl: u32 = padGetU16(p, P_CTRL_LO);
     if ((ctrl & CTRL_TXEN) == 0) { return; }
     if (p[P_DEST] == 0) {
@@ -205,7 +205,7 @@ pub fn padWriteTx(p: *mut[] u8, mcd: *mut[] u8, data: u32) {
                 p[P_SDA_TXR] = 1;
             }
             if (b == DEST_MCD) {
-                mcdReset(mcd);
+                mcd.reset();
             }
             if ((ctrl & CTRL_ACIE) != 0) {
                 padSetU32(p, P_CYC_LO, JOY_IRQ_DELAY);
@@ -219,7 +219,7 @@ pub fn padWriteTx(p: *mut[] u8, mcd: *mut[] u8, data: u32) {
         // drop the slot so the next first byte re-selects.
         if (p[P_SDA_TXR] == 0) { p[P_DEST] = 0; }
     } else if (p[P_DEST] == DEST_MCD as u8) {
-        mcdWrite(mcd, data);
+        mcd.write(data);
         // psxe pad.c:103-108: MCD always sets irq_bit and uses a 1024-
         // cycle delay (vs JOY's 512). The longer ACK reflects the MCD's
         // slower response time.
@@ -228,7 +228,7 @@ pub fn padWriteTx(p: *mut[] u8, mcd: *mut[] u8, data: u32) {
             padSetU32(p, P_CYC_LO, 1024);
             return;
         }
-        if (!mcdQuery(mcd)) { p[P_DEST] = 0; }
+        if (!mcd.query()) { p[P_DEST] = 0; }
     } else {
         p[P_DEST] = 0;
         return;
@@ -242,7 +242,7 @@ pub fn padWriteTx(p: *mut[] u8, mcd: *mut[] u8, data: u32) {
 // pad_handle_ctrl_write: write to JOY_CTRL. Per psxe: when JOUT is
 // cleared, also clear the slot bit; bit 4 (ACKN) is a one-shot that
 // clears STAT bits 3, 4, 5, 9 and self-clears.
-pub fn padHandleCtrlWrite(p: *mut[] u8, mcd: *mut[] u8, value: u32) {
+pub fn padHandleCtrlWrite(p: *mut[] u8, mcd: mut Mcd, value: u32) {
     padSetU16(p, P_CTRL_LO, value & 0xFFFF);
     if ((value & CTRL_JOUT) == 0) {
         var ctrl: u32 = padGetU16(p, P_CTRL_LO);
@@ -251,7 +251,7 @@ pub fn padHandleCtrlWrite(p: *mut[] u8, mcd: *mut[] u8, value: u32) {
         // psxe pad.c:134-135: !JOUT also resets the slot's MCD state so
         // the next 0x81 select starts a fresh transaction. Without this
         // the memcard stays in mid-protocol after a chip-deselect.
-        mcdReset(mcd);
+        mcd.reset();
     }
     if ((value & CTRL_ACKN) != 0) {
         var stat: u32 = padGetU16(p, P_STAT_LO);
@@ -271,7 +271,7 @@ pub fn padReadStat(p: *mut[] u8) u32 {
 
 // ---------- public IO surface ------------------------------------------
 
-pub fn padRead32(p: *mut[] u8, mcd: *mut[] u8, mcdRam: *mut[] u8, off: u32) u32 {
+pub fn padRead32(p: *mut[] u8, mcd: mut Mcd, mcdRam: *mut[] u8, off: u32) u32 {
     match (off) {
         0  { return padReadRx(p, mcd, mcdRam); }
         4  { return padReadStat(p); }
@@ -282,15 +282,15 @@ pub fn padRead32(p: *mut[] u8, mcd: *mut[] u8, mcdRam: *mut[] u8, off: u32) u32 
     }
 }
 
-pub fn padRead16(p: *mut[] u8, mcd: *mut[] u8, mcdRam: *mut[] u8, off: u32) u32 {
+pub fn padRead16(p: *mut[] u8, mcd: mut Mcd, mcdRam: *mut[] u8, off: u32) u32 {
     return padRead32(p, mcd, mcdRam, off) & 0xFFFF;
 }
 
-pub fn padRead8(p: *mut[] u8, mcd: *mut[] u8, mcdRam: *mut[] u8, off: u32) u32 {
+pub fn padRead8(p: *mut[] u8, mcd: mut Mcd, mcdRam: *mut[] u8, off: u32) u32 {
     return padRead32(p, mcd, mcdRam, off) & 0xFF;
 }
 
-pub fn padWrite32(p: *mut[] u8, mcd: *mut[] u8, off: u32, val: u32) {
+pub fn padWrite32(p: *mut[] u8, mcd: mut Mcd, off: u32, val: u32) {
     match (off) {
         0  { padWriteTx(p, mcd, val); }
         8  { padSetU16(p, P_MODE_LO, val & 0xFFFF); }
@@ -300,11 +300,11 @@ pub fn padWrite32(p: *mut[] u8, mcd: *mut[] u8, off: u32, val: u32) {
     }
 }
 
-pub fn padWrite16(p: *mut[] u8, mcd: *mut[] u8, off: u32, val: u32) {
+pub fn padWrite16(p: *mut[] u8, mcd: mut Mcd, off: u32, val: u32) {
     padWrite32(p, mcd, off, val & 0xFFFF);
 }
 
-pub fn padWrite8(p: *mut[] u8, mcd: *mut[] u8, off: u32, val: u32) {
+pub fn padWrite8(p: *mut[] u8, mcd: mut Mcd, off: u32, val: u32) {
     padWrite32(p, mcd, off, val & 0xFF);
 }
 

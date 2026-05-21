@@ -33,6 +33,7 @@ const { spuAlloc, spuRamAlloc, spuUpdate } = import("spu");
 const { sio1Alloc, sio1Update } = import("sio1");
 const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
 const { Timer } = import("timer");
+const { Mcd } = import("mcd");
 const { busBiosPtr } = import("bus");
 
 // libc for the headless boot harness.
@@ -75,7 +76,7 @@ const Bus = struct {
     mdecIn:  *mut[] u8,
     mdecOut: *mut[] u8,
     sio1:    *mut[] u8,
-    mcd:     *mut[] u8,
+    mcd:     Mcd,
     mcdRam:  *mut[] u8,
     biosLoaded: u8,
 };

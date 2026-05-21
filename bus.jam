@@ -33,7 +33,7 @@ const { mdecRead32, mdecRead16, mdecRead8,
 const { sio1Read32, sio1Read16, sio1Read8,
         sio1Write32, sio1Write16, sio1Write8,
         sio1Alloc, sio1Free } = import("sio1");
-const { mcdAlloc, mcdRamAlloc, mcdFree, mcdRamFree } = import("mcd");
+const { Mcd, mcdRamAlloc, mcdRamFree } = import("mcd");
 
 // Disc shape — kept in sync with disc.jam so callers can reference the
 // stored pointer via `bus.disc[0]`.
@@ -77,7 +77,7 @@ const Bus = struct {
     mdecIn:  *mut[] u8,
     mdecOut: *mut[] u8,
     sio1:    *mut[] u8,
-    mcd:     *mut[] u8,
+    mcd:     Mcd,
     mcdRam:  *mut[] u8,
     biosLoaded: u8,
 };
@@ -214,7 +214,7 @@ pub fn allocBus() Bus {
         mdecIn:  mdecInputAlloc(),
         mdecOut: mdecOutputAlloc(),
         sio1:    sio1Alloc(),
-        mcd:     mcdAlloc(),
+        mcd:     Mcd.init(),
         mcdRam:  mcdRamAlloc(),
         biosLoaded: 0,
     };
@@ -241,7 +241,7 @@ pub fn freeBus(b: Bus) {
     mdecFree(b.mdecIn);
     mdecFree(b.mdecOut);
     sio1Free(b.sio1);
-    mcdFree(b.mcd);
+    // b.mcd is by-value; no free needed.
     mcdRamFree(b.mcdRam);
 }
 
