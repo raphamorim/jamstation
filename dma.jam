@@ -11,9 +11,9 @@
 // structurally and we reach into bus.ram / bus.gpu directly, calling
 // gpuGp0 / vram helpers from gpu.jam where necessary.
 
-const { gpuGp0, gpuRead32 } = import("gpu");
+const { Gpu } = import("gpu");
 const { irqRaise, IC_DMA } = import("irq");
-const { cdromReadData } = import("cdrom");
+const { Cdrom } = import("cdrom");
 const { Mdec } = import("mdec");
 const { spuWrite16, spuRead16 } = import("spu");
 
@@ -41,12 +41,12 @@ const Bus = struct {
     spad: *mut[] u8,
     io:   *mut[] u8,
     vram: *mut[] u8,
-    gpu:   *mut[] u32,
+    gpu:   Gpu,
     dma:   *mut[] u32,
     irq:   *mut[] u32,
     timer: *mut[] u32,
     gte:   *mut[] u32,
-    cdrom: *mut[] u8,
+    cdrom: Cdrom,
     disc:  *mut[] Disc,
     pad:   *mut[] u8,
     spu:     *mut[] u8,
@@ -293,7 +293,7 @@ pub fn dmaDoGpuRequest(d: *mut[] u32, bus: Bus) {
         var i: u32 = 0;
         while (i < size) {
             const data: u32 = ramRead32(bus, addr);
-            gpuGp0(bus.gpu, bus.vram, data);
+            bus.gpu.gp0(bus.vram, data);
             addr = addr + step;
             i = i + 1;
         }
@@ -306,7 +306,7 @@ pub fn dmaDoGpuRequest(d: *mut[] u32, bus: Bus) {
         // composites, etc.).
         var i: u32 = 0;
         while (i < size) {
-            const data: u32 = gpuRead32(bus.gpu, bus.vram, 0);
+            const data: u32 = bus.gpu.read32(bus.vram, 0);
             ramWrite32(bus, addr, data);
             addr = addr + step;
             i = i + 1;
@@ -326,7 +326,7 @@ pub fn dmaDoGpuLinked(d: *mut[] u32, bus: Bus) {
         while (size > 0) {
             addr = (addr + step) & 0x001FFFFC;
             const cmd: u32 = ramRead32(bus, addr);
-            gpuGp0(bus.gpu, bus.vram, cmd);
+            bus.gpu.gp0(bus.vram, cmd);
             size = size - 1;
         }
         addr = hdr & 0xFFFFFF;
@@ -391,10 +391,10 @@ pub fn dmaDoCdrom(d: *mut[] u32, bus: Bus) {
     const step: u32 = chcrStep(d, 3);
     var i: u32 = 0;
     while (i < size) {
-        const b0: u32 = cdromReadData(bus.cdrom);
-        const b1: u32 = cdromReadData(bus.cdrom);
-        const b2: u32 = cdromReadData(bus.cdrom);
-        const b3: u32 = cdromReadData(bus.cdrom);
+        const b0: u32 = bus.cdrom.readData();
+        const b1: u32 = bus.cdrom.readData();
+        const b2: u32 = bus.cdrom.readData();
+        const b3: u32 = bus.cdrom.readData();
         const w: u32 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
         ramWrite32(bus, addr, w);
         addr = addr + step;

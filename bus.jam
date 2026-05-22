@@ -9,17 +9,14 @@
 // modules don't import bus.jam in turn — they take whichever raw
 // pointers they need as arguments — so the import graph stays acyclic.
 
-const { gpuRead32, gpuRead16, gpuRead8,
-        gpuWrite32, gpuWrite16, gpuWrite8, gpuAlloc, gpuFree } = import("gpu");
+const { Gpu } = import("gpu");
 const { dmaRead32, dmaRead16, dmaRead8,
         dmaWrite32, dmaWrite16, dmaWrite8, dmaAlloc, dmaFree } = import("dma");
 const { irqRead32, irqRead16, irqRead8,
         irqWrite32, irqWrite16, irqWrite8, irqAlloc, irqFree } = import("irq");
 const { Timer } = import("timer");
 const { gteAlloc, gteFree } = import("gte");
-const { cdromRead32, cdromRead16, cdromRead8,
-        cdromWrite32, cdromWrite16, cdromWrite8,
-        cdromAlloc, cdromFree } = import("cdrom");
+const { Cdrom } = import("cdrom");
 const { discAlloc, discFree } = import("disc");
 const { padRead32, padRead16, padRead8,
         padWrite32, padWrite16, padWrite8,
@@ -59,12 +56,12 @@ const Bus = struct {
     spad: *mut[] u8,
     io:   *mut[] u8,
     vram: *mut[] u8,
-    gpu:   *mut[] u32,
+    gpu:   Gpu,
     dma:   *mut[] u32,
     irq:   *mut[] u32,
     timer: Timer,
     gte:   *mut[] u32,
-    cdrom: *mut[] u8,
+    cdrom: Cdrom,
     disc:  *mut[] Disc,
     pad:   *mut[] u8,
     spu:     *mut[] u8,
@@ -196,12 +193,12 @@ pub fn allocBus() Bus {
     bufWrite32(io, 0x60, 0x00000B88);  // MC2 RAM_SIZE (2 MB mirror config)
     var b: Bus = Bus {
         ram: ram, bios: bios, spad: spad, io: io, vram: vram,
-        gpu:   gpuAlloc(),
+        gpu:   Gpu.init(),
         dma:   dmaAlloc(),
         irq:   irqAlloc(),
         timer: Timer.init(),
         gte:   gteAlloc(),
-        cdrom: cdromAlloc(),
+        cdrom: Cdrom.init(),
         disc:  discAlloc(),
         pad:   padAlloc(),
         spu:    spuAlloc(),
@@ -223,12 +220,12 @@ pub fn freeBus(b: Bus) {
     free(b.spad);
     free(b.io);
     free(b.vram);
-    gpuFree(b.gpu);
+    // b.gpu is by-value; no free needed.
     dmaFree(b.dma);
     irqFree(b.irq);
     // b.timer is by-value; no free needed.
     gteFree(b.gte);
-    cdromFree(b.cdrom);
+    // b.cdrom is by-value; no free needed.
     discFree(b.disc);
     padFree(b.pad);
     spuFree(b.spu);
@@ -250,8 +247,8 @@ pub fn ioRead32(bus: Bus, off: u32) u32 {
         0x070..=0x07F { return irqRead32(bus.irq, off - 0x070); }
         0x080..=0x0FF { return dmaRead32(bus.dma, off - 0x080); }
         0x100..=0x12F { return bus.timer.read32(off - 0x100); }
-        0x800..=0x803 { return cdromRead32(bus.cdrom, off - 0x800); }
-        0x810..=0x817 { return gpuRead32(bus.gpu, bus.vram, off - 0x810); }
+        0x800..=0x803 { return bus.cdrom.read32(off - 0x800); }
+        0x810..=0x817 { return bus.gpu.read32(bus.vram, off - 0x810); }
         0x820..=0x827 { return bus.mdec.read32(bus.mdecOut, off - 0x820); }
         0xC00..=0xFFF { return spuRead32(bus.spu, bus.spuram, off - 0xC00); }
         _ {}
@@ -267,8 +264,8 @@ pub fn ioRead16(bus: Bus, off: u32) u32 {
         0x070..=0x07F { return irqRead16(bus.irq, off - 0x070); }
         0x080..=0x0FF { return dmaRead16(bus.dma, off - 0x080); }
         0x100..=0x12F { return bus.timer.read16(off - 0x100); }
-        0x800..=0x803 { return cdromRead16(bus.cdrom, off - 0x800); }
-        0x810..=0x817 { return gpuRead16(bus.gpu, bus.vram, off - 0x810); }
+        0x800..=0x803 { return bus.cdrom.read16(off - 0x800); }
+        0x810..=0x817 { return bus.gpu.read16(bus.vram, off - 0x810); }
         0x820..=0x827 { return bus.mdec.read16(bus.mdecOut, off - 0x820); }
         0xC00..=0xFFF { return spuRead16(bus.spu, bus.spuram, off - 0xC00); }
         _ {}
@@ -284,8 +281,8 @@ pub fn ioRead8(bus: Bus, off: u32) u32 {
         0x070..=0x07F { return irqRead8(bus.irq, off - 0x070); }
         0x080..=0x0FF { return dmaRead8(bus.dma, off - 0x080); }
         0x100..=0x12F { return bus.timer.read8(off - 0x100); }
-        0x800..=0x803 { return cdromRead8(bus.cdrom, off - 0x800); }
-        0x810..=0x817 { return gpuRead8(bus.gpu, bus.vram, off - 0x810); }
+        0x800..=0x803 { return bus.cdrom.read8(off - 0x800); }
+        0x810..=0x817 { return bus.gpu.read8(bus.vram, off - 0x810); }
         0x820..=0x827 { return bus.mdec.read8(bus.mdecOut, off - 0x820); }
         0xC00..=0xFFF { return spuRead8(bus.spu, bus.spuram, off - 0xC00); }
         _ {}
@@ -305,8 +302,8 @@ pub fn ioWrite32(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
         0x070..=0x07F { irqWrite32(bus.irq, cop0, off - 0x070, val); return; }
         0x080..=0x0FF { dmaWrite32(bus.dma, bus, cop0, off - 0x080, val); return; }
         0x100..=0x12F { bus.timer.write32(bus.irq, cop0, off - 0x100, val); return; }
-        0x800..=0x803 { cdromWrite32(bus.cdrom, off - 0x800, val); return; }
-        0x810..=0x817 { gpuWrite32(bus.gpu, bus.vram, off - 0x810, val); return; }
+        0x800..=0x803 { bus.cdrom.write32(off - 0x800, val); return; }
+        0x810..=0x817 { bus.gpu.write32(bus.vram, off - 0x810, val); return; }
         0x820..=0x827 { bus.mdec.write32(bus.mdecIn, bus.mdecOut, off - 0x820, val); return; }
         0xC00..=0xFFF { spuWrite32(bus.spu, bus.spuram, off - 0xC00, val); return; }
         _ {}
@@ -322,8 +319,8 @@ pub fn ioWrite16(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
         0x070..=0x07F { irqWrite16(bus.irq, cop0, off - 0x070, val); return; }
         0x080..=0x0FF { dmaWrite16(bus.dma, bus, cop0, off - 0x080, val); return; }
         0x100..=0x12F { bus.timer.write16(bus.irq, cop0, off - 0x100, val); return; }
-        0x800..=0x803 { cdromWrite16(bus.cdrom, off - 0x800, val); return; }
-        0x810..=0x817 { gpuWrite16(bus.gpu, bus.vram, off - 0x810, val); return; }
+        0x800..=0x803 { bus.cdrom.write16(off - 0x800, val); return; }
+        0x810..=0x817 { bus.gpu.write16(bus.vram, off - 0x810, val); return; }
         0x820..=0x827 { bus.mdec.write16(bus.mdecIn, bus.mdecOut, off - 0x820, val); return; }
         0xC00..=0xFFF { spuWrite16(bus.spu, bus.spuram, off - 0xC00, val); return; }
         _ {}
@@ -339,8 +336,8 @@ pub fn ioWrite8(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
         0x070..=0x07F { irqWrite8(bus.irq, cop0, off - 0x070, val); return; }
         0x080..=0x0FF { dmaWrite8(bus.dma, bus, cop0, off - 0x080, val); return; }
         0x100..=0x12F { bus.timer.write8(bus.irq, cop0, off - 0x100, val); return; }
-        0x800..=0x803 { cdromWrite8(bus.cdrom, off - 0x800, val); return; }
-        0x810..=0x817 { gpuWrite8(bus.gpu, bus.vram, off - 0x810, val); return; }
+        0x800..=0x803 { bus.cdrom.write8(off - 0x800, val); return; }
+        0x810..=0x817 { bus.gpu.write8(bus.vram, off - 0x810, val); return; }
         0x820..=0x827 { bus.mdec.write8(bus.mdecIn, bus.mdecOut, off - 0x820, val); return; }
         0xC00..=0xFFF { spuWrite8(bus.spu, bus.spuram, off - 0xC00, val); return; }
         _ {}
@@ -430,7 +427,8 @@ pub fn busWrite8(bus: Bus, cop0: *mut[] u32, addr: u32, val: u32) {
 pub fn busRamPtr(bus: Bus)  *mut[] u8 { return bus.ram;  }
 pub fn busBiosPtr(bus: Bus) *mut[] u8 { return bus.bios; }
 pub fn busVramPtr(bus: Bus) *mut[] u8 { return bus.vram; }
-pub fn busGpuPtr(bus: Bus) *mut[] u32 { return bus.gpu; }
+// busGpuPtr removed — use `bus.gpu.bufPtr()` directly for raw slot
+// access. The `bus.gpu` field is now a `Gpu` struct value.
 pub fn busDmaPtr(bus: Bus) *mut[] u32 { return bus.dma; }
 pub fn busIrqPtr(bus: Bus) *mut[] u32 { return bus.irq; }
 // busTimerPtr removed — `bus.timer` is by-value now. Callers use

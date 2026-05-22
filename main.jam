@@ -16,9 +16,9 @@ const {
 } = import("bus");
 
 // Force device modules into main.jam's codegen context.
-const { gpuAlloc, gpuFamilyCount } = import("gpu");
+const { Gpu } = import("gpu");
 const { gteAlloc } = import("gte");
-const { cdromAlloc, cdromUpdate, cdromAttachDisc } = import("cdrom");
+const { Cdrom } = import("cdrom");
 const { discAlloc, discOpen } = import("disc");
 const { dmaAlloc, dmaTickSpu, dmaUpdate } = import("dma");
 const { padAlloc, padUpdate, padSetButtons } = import("pad");
@@ -112,12 +112,12 @@ const Bus = struct {
     spad: *mut[] u8,
     io:   *mut[] u8,
     vram: *mut[] u8,
-    gpu:   *mut[] u32,
+    gpu:   Gpu,
     dma:   *mut[] u32,
     irq:   *mut[] u32,
     timer: Timer,
     gte:   *mut[] u32,
-    cdrom: *mut[] u8,
+    cdrom: Cdrom,
     disc:  *mut[] Disc,
     pad:   *mut[] u8,
     spu:     *mut[] u8,
@@ -318,7 +318,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         bus.timer.updateCyc(bus.irq, cop0, delta);
         dmaTickSpu(bus.dma, delta);
         dmaUpdate(bus.dma, bus.irq, cop0);
-        cdromUpdate(bus.cdrom, bus.disc, bus.spu, bus.irq, cop0, delta);
+        bus.cdrom.update(bus.disc, bus.spu, bus.irq, cop0, delta);
         padUpdate(bus.pad, bus.irq, cop0, delta);
         bus.sio1.update(bus.irq, cop0, delta);
         // SPU is no longer ticked here — the audio thread owns its
@@ -340,14 +340,15 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
             // per scanline. BIOS VSync uses this as a heartbeat; if it
             // stays at 0, the BIOS busy-spins on GPUSTAT instead of
             // returning to the VBlank handler chain that runs pad-poll.
+            var gpuBuf: *mut[] u32 = bus.gpu.bufPtr();
             if (line < SCANLINES_VDRAW) {
                 if ((line & 1) != 0) {
-                    bus.gpu[46] = bus.gpu[46] | 0x80000000;
+                    gpuBuf[46] = gpuBuf[46] | 0x80000000;
                 } else {
-                    bus.gpu[46] = bus.gpu[46] & (~0x80000000);
+                    gpuBuf[46] = gpuBuf[46] & (~0x80000000);
                 }
             } else {
-                bus.gpu[46] = bus.gpu[46] & (~0x80000000);
+                gpuBuf[46] = gpuBuf[46] & (~0x80000000);
             }
             // psxe fires VBlank when `line` *becomes* 240, i.e. after the
             // increment. Previously we fired before the increment, so
@@ -469,11 +470,11 @@ fn main() {
     // a raw ./game.bin (single-track Mode2/2352).
     if (fileExists(cuePath)) {
         if (discOpen(bus.disc, cuePath) != 0) {
-            cdromAttachDisc(bus.cdrom, bus.disc);
+            bus.cdrom.attachDisc(bus.disc);
         }
     } else if (fileExists(binPath)) {
         if (discOpen(bus.disc, binPath) != 0) {
-            cdromAttachDisc(bus.cdrom, bus.disc);
+            bus.cdrom.attachDisc(bus.disc);
         }
     }
     if (fileExists(demoPath)) {
@@ -588,7 +589,7 @@ fn main() {
             flushAll();
         }
         if (pendingGameExe) {
-            const curPoly: u32 = gpuFamilyCount(bus.gpu, 1);
+            const curPoly: u32 = bus.gpu.familyCount(1);
             if (curPoly == lastPoly && curPoly >= MIN_POLY_DRAWN) {
                 idleFrames = idleFrames + 1;
                 if (idleFrames >= IDLE_TRIGGER) {
@@ -611,7 +612,7 @@ fn main() {
         // Read the current display origin out of the GPU state buffer
         // (g[63] disp_x, g[64] disp_y — set by GP1 0x05). The BIOS
         // moves these around during double-buffered animation.
-        var gpuState: *mut[] u32 = busGpuPtr(bus);
+        var gpuState: *mut[] u32 = bus.gpu.bufPtr();
         const dispX: i32 = gpuState[63] as i32;
         const dispY: i32 = gpuState[64] as i32;
         // GPUSTAT bit 21 (mode bit 4) = 24bpp display.
@@ -639,7 +640,7 @@ fn main() {
         // 300 frames (~5s at 60Hz) dump g[72..79] so we can see if/when
         // family 5 (CPU→VRAM, the FMV upload signature) starts firing.
         if ((frames % 300) == 0) {
-            var gpuState: *mut[] u32 = busGpuPtr(bus);
+            var gpuState: *mut[] u32 = bus.gpu.bufPtr();
             var fmt: []u8 = "[%u] GP0 families: misc=%u poly=%u line=%u rect=%u blit=%u cpu2vram=%u vram2cpu=%u drawset=%u\n";
             printf(fmt.ptr, frames,
                 gpuState[72], gpuState[73], gpuState[74], gpuState[75],
@@ -667,7 +668,7 @@ fn main() {
     // For an FMV intro we expect family 5 (CPU→VRAM) > 0 if MDEC
     // output is being uploaded. If it's 0 the bug is upstream
     // (CD-ROM streaming / MDEC pipeline never feeds the GPU).
-    var gpuState: *mut[] u32 = busGpuPtr(bus);
+    var gpuState: *mut[] u32 = bus.gpu.bufPtr();
     var fmt: []u8 = "GP0 families: misc=%u poly=%u line=%u rect=%u blit=%u cpu2vram=%u vram2cpu=%u drawset=%u\n";
     printf(fmt.ptr, gpuState[72], gpuState[73], gpuState[74], gpuState[75],
                     gpuState[76], gpuState[77], gpuState[78], gpuState[79]);

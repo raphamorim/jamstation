@@ -23,9 +23,9 @@ const {
 
 // Force device modules into this module's codegen context so bus.jam's
 // allocBus body (which calls gpuAlloc / dmaAlloc / etc.) resolves.
-const { gpuAlloc } = import("gpu");
+const { Gpu } = import("gpu");
 const { gteAlloc } = import("gte");
-const { cdromAlloc, cdromUpdate } = import("cdrom");
+const { Cdrom } = import("cdrom");
 const { discAlloc, discOpen } = import("disc");
 const { dmaAlloc, dmaUpdate } = import("dma");
 const { padAlloc, padUpdate } = import("pad");
@@ -63,12 +63,12 @@ const Bus = struct {
     spad: *mut[] u8,
     io:   *mut[] u8,
     vram: *mut[] u8,
-    gpu:   *mut[] u32,
+    gpu:   Gpu,
     dma:   *mut[] u32,
     irq:   *mut[] u32,
     timer: Timer,
     gte:   *mut[] u32,
-    cdrom: *mut[] u8,
+    cdrom: Cdrom,
     disc:  *mut[] Disc,
     pad:   *mut[] u8,
     spu:     *mut[] u8,
@@ -437,7 +437,7 @@ fn emuRunOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         const delta: u32 = (c.cycles - before) as u32;
         bus.timer.updateCyc(bus.irq, cop0, delta);
         dmaUpdate(bus.dma, bus.irq, cop0);
-        cdromUpdate(bus.cdrom, bus.disc, bus.irq, cop0, delta);
+        bus.cdrom.update(bus.disc, bus.irq, cop0, delta);
         padUpdate(bus.pad, bus.irq, cop0, delta);
         bus.sio1.update(bus.irq, cop0, delta);
         spuUpdate(bus.spu, bus.spuram, bus.irq, cop0, delta);

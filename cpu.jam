@@ -26,13 +26,13 @@ const { busRead32, busRead16, busRead8,
 // import set. Forcing an import here brings each device module's pub
 // fns into the codegen context so bus.jam's allocBus/dispatch helpers
 // resolve cleanly when cpu.jam is the root module.
-const { gpuAlloc } = import("gpu");
+const { Gpu } = import("gpu");
 const { dmaAlloc } = import("dma");
 const { irqAlloc } = import("irq");
 const { Timer } = import("timer");
 const { gteAlloc, gteDataRead, gteDataWrite,
         gteCtrlRead, gteCtrlWrite, gteExec } = import("gte");
-const { cdromAlloc } = import("cdrom");
+const { Cdrom } = import("cdrom");
 const { Mcd } = import("mcd");
 const { Sio1 } = import("sio1");
 const { Mdec } = import("mdec");
@@ -59,12 +59,12 @@ const Bus = struct {
     spad: *mut[] u8,
     io:   *mut[] u8,
     vram: *mut[] u8,
-    gpu:   *mut[] u32,
+    gpu:   Gpu,
     dma:   *mut[] u32,
     irq:   *mut[] u32,
     timer: Timer,
     gte:   *mut[] u32,
-    cdrom: *mut[] u8,
+    cdrom: Cdrom,
     disc:  *mut[] Disc,
     pad:   *mut[] u8,
     spu:     *mut[] u8,

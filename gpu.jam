@@ -1376,3 +1376,70 @@ const GPU_CYC_HDRAW_NTSC: u32 = 2560;
 const GPU_CYC_SCANL_NTSC: u32 = 3413;
 const GPU_LINES_VDRAW:    u32 = 240;
 const GPU_LINES_TOTAL:    u32 = 263;
+
+// ---------- struct wrapper -------------------------------------------
+//
+// `Gpu` owns the 80-u32 state buffer inline (vs the old heap alloc)
+// and exposes the public surface as methods. The internal command-
+// state machine plus the rectangle/CPU↔VRAM blit paths are too
+// indexed-access-heavy to refactor field-by-field without high
+// regression risk — same trade-off as the CDROM wrap. Callers get
+// `bus.gpu.method(...)` ergonomics.
+pub const Gpu = struct {
+    // 80 u32 entries = 320 bytes. Spelled as a literal because Jam's
+    // array type currently requires an integer literal in size
+    // position (no const-folding for `[GPU_STATE_WORDS]u32` yet).
+    buf: [80]u32,
+
+    pub fn init() Self {
+        var s: Self = Self { buf: [0; 80] };
+        s.buf[19] = GP_RECV_CMD;
+        // psxe init (gpu.c:59): only sets bit 23 (display disabled).
+        // Reads OR 0x1C000000 on the fly.
+        s.buf[46] = 0x00800000;
+        s.buf[47] = 1;            // default display_mode
+        return s;
+    }
+
+    pub fn familyCount(self: mut Self, family: u32) u32 {
+        return gpuFamilyCount(self.buf.asMutPtr(), family);
+    }
+
+    pub fn read8(self: mut Self, vram: *mut[] u8, off: u32) u32 {
+        return gpuRead8(self.buf.asMutPtr(), vram, off);
+    }
+
+    pub fn read16(self: mut Self, vram: *mut[] u8, off: u32) u32 {
+        return gpuRead16(self.buf.asMutPtr(), vram, off);
+    }
+
+    pub fn read32(self: mut Self, vram: *mut[] u8, off: u32) u32 {
+        return gpuRead32(self.buf.asMutPtr(), vram, off);
+    }
+
+    pub fn write8(self: mut Self, vram: *mut[] u8, off: u32, val: u32) {
+        gpuWrite8(self.buf.asMutPtr(), vram, off, val);
+    }
+
+    pub fn write16(self: mut Self, vram: *mut[] u8, off: u32, val: u32) {
+        gpuWrite16(self.buf.asMutPtr(), vram, off, val);
+    }
+
+    pub fn write32(self: mut Self, vram: *mut[] u8, off: u32, val: u32) {
+        gpuWrite32(self.buf.asMutPtr(), vram, off, val);
+    }
+
+    // DMA channel 2 GPU path (linked-list + request modes) calls
+    // these per word from dma.jam.
+    pub fn gp0(self: mut Self, vram: *mut[] u8, val: u32) {
+        gpuGp0(self.buf.asMutPtr(), vram, val);
+    }
+
+    // Internal slot access — used by main.jam's frame loop to peek
+    // display-mode / disp_x / etc. fields directly. Bypasses the
+    // method API for the small set of read-only readouts the host
+    // pump needs each frame.
+    pub fn bufPtr(self: mut Self) *mut[] u32 {
+        return self.buf.asMutPtr();
+    }
+};
