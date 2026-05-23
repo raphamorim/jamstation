@@ -43,7 +43,7 @@ const {
     sdlInit, sdlQuit, sdlBlit, sdlPump, sdlDelay,
     sdlAudioOpen, sdlAudioClose
 } = import("sdl");
-const { Vec } = import("std/collections");
+const { Vec } = import("std").collections;
 
 extern fn malloc(size: u64) *mut[] u8;
 extern fn free(ptr: *mut[] u8);
