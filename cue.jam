@@ -30,7 +30,6 @@ pub extern fn fgetc(file: *mut[] u8) i32;
 pub extern fn feof(file: *mut[] u8) i32;
 pub extern fn access(path: *const[] u8, mode: i32) i32;
 pub extern fn realpath(path: *const[] u8, resolved: *mut[] u8) *mut[] u8;
-pub extern fn printf(format: *const[] u8, ...) i32;
 
 // Track-mode enum (psxe cue.h subset we actually use).
 pub const TRACK_MODE_UNKNOWN: u32 = 0;

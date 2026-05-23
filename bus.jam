@@ -42,7 +42,6 @@ const Disc = struct {
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
 pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
-pub extern fn printf(format: *const[] u8, ...) i32;
 pub extern fn fflush(stream: u64) i32;
 
 // The Bus struct holds every piece of state we route through the
