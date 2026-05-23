@@ -4,6 +4,8 @@ A PlayStation 1 emulator written in [Jam Programming Language](https://github.co
 
 Passes [JaCzekanski/ps1-tests](https://github.com/JaCzekanski/ps1-tests).
 
+Kindly reminder that Jam lang is experimental yet.
+
 ```bash
 # LIBRARY_PATH should be where SDL2 is located
 LIBRARY_PATH=/opt/homebrew/lib jam -lSDL2 -C opt-level=3 -o jamstation main.jam
