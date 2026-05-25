@@ -256,7 +256,7 @@ pub fn gteExec(g: *mut[] u32, opc: u32) {
     const lm: u32 = (opc >> 10) & 1;
     if (op == 0x01) { gteRtps(g, 0, sf, lm); }    // RTPS
     if (op == 0x06) { gteNclip(g); }              // NCLIP
-    if (op == 0x0C) { gteOp(g); }                 // OP
+    if (op == 0x0C) { gteOp(g, sf, lm); }         // OP
     if (op == 0x12) { gteMvmva(g, opc); }         // MVMVA
     if (op == 0x13) { gteNcds(g, 0, sf, lm); }    // NCDS
     if (op == 0x16) {                              // NCDT — 3 successive NCDS
@@ -264,7 +264,7 @@ pub fn gteExec(g: *mut[] u32, opc: u32) {
         gteNcds(g, 1, sf, lm);
         gteNcds(g, 2, sf, lm);
     }
-    if (op == 0x28) { gteSqr(g); }                // SQR
+    if (op == 0x28) { gteSqr(g, sf, lm); }        // SQR
     if (op == 0x2D) { gteAvsz(g, 3); }            // AVSZ3
     if (op == 0x2E) { gteAvsz(g, 4); }            // AVSZ4
     if (op == 0x30) {                              // RTPT — 3 successive RTPS
@@ -300,9 +300,9 @@ pub fn gtePushRgb(g: *mut[] u32, m1: i64, m2: i64, m3: i64) {
     g[20] = g[21];
     g[21] = g[22];
     const code: u32 = (g[6] >> 24) & 0xFF;
-    const r2: u32 = clampU8(m1 >> 4);
-    const g2: u32 = clampU8(m2 >> 4);
-    const b2: u32 = clampU8(m3 >> 4);
+    const r2: u32 = gteClampRgb(g, 1, m1 >> 4);
+    const g2: u32 = gteClampRgb(g, 2, m2 >> 4);
+    const b2: u32 = gteClampRgb(g, 3, m3 >> 4);
     g[22] = r2 | (g2 << 8) | (b2 << 16) | (code << 24);
 }
 
@@ -328,13 +328,11 @@ pub fn gteApplyLight(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     var m1: i64 = ll11 * vx + ll12 * vy + ll13 * vz;
     var m2: i64 = ll21 * vx + ll22 * vy + ll23 * vz;
     var m3: i64 = ll31 * vx + ll32 * vy + ll33 * vz;
-    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    m1 = gteClampMac(g, 1, m1, sf); m2 = gteClampMac(g, 2, m2, sf); m3 = gteClampMac(g, 3, m3, sf);
     g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
-    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
-    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
-    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+    gteIrTriple(g, m1, m2, m3, lm);
 }
 
 // (BK<<12) + LC*IR stage — applied by CC, CDP, NCDS, NCCS, NCS after
@@ -359,13 +357,11 @@ pub fn gteApplyLightColor(g: *mut[] u32, sf: u32, lm: u32) {
     var m1: i64 = (rbk << 12) + lr1 * ir1 + lr2 * ir2 + lr3 * ir3;
     var m2: i64 = (gbk << 12) + lg1 * ir1 + lg2 * ir2 + lg3 * ir3;
     var m3: i64 = (bbk << 12) + lb1 * ir1 + lb2 * ir2 + lb3 * ir3;
-    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    m1 = gteClampMac(g, 1, m1, sf); m2 = gteClampMac(g, 2, m2, sf); m3 = gteClampMac(g, 3, m3, sf);
     g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
-    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
-    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
-    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+    gteIrTriple(g, m1, m2, m3, lm);
 }
 
 // Far-colour interpolation stage shared by CDP, NCDS, DCPL, DPCS:
@@ -387,21 +383,19 @@ pub fn gteFarColorInterp(g: *mut[] u32, sf: u32, lm: u32) {
     var fp1: i64 = (rfc << 12) - (rc << 4) * ir1;
     var fp2: i64 = (gfc << 12) - (gc << 4) * ir2;
     var fp3: i64 = (bfc << 12) - (bc << 4) * ir3;
-    if (sf == 12) { fp1 = fp1 >> 12; fp2 = fp2 >> 12; fp3 = fp3 >> 12; }
-    const ir1f: i64 = satIrLm(fp1, 0);
-    const ir2f: i64 = satIrLm(fp2, 0);
-    const ir3f: i64 = satIrLm(fp3, 0);
+    fp1 = gteClampMac(g, 1, fp1, sf); fp2 = gteClampMac(g, 2, fp2, sf); fp3 = gteClampMac(g, 3, fp3, sf);
+    const ir1f: i64 = gteClampIr(g, 1, fp1, 0);
+    const ir2f: i64 = gteClampIr(g, 2, fp2, 0);
+    const ir3f: i64 = gteClampIr(g, 3, fp3, 0);
     const ir0: i64 = s16ToI64(g[8]);
     var m1: i64 = (rc << 4) * ir1 + ir0 * ir1f;
     var m2: i64 = (gc << 4) * ir2 + ir0 * ir2f;
     var m3: i64 = (bc << 4) * ir3 + ir0 * ir3f;
-    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    m1 = gteClampMac(g, 1, m1, sf); m2 = gteClampMac(g, 2, m2, sf); m3 = gteClampMac(g, 3, m3, sf);
     g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
-    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
-    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
-    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+    gteIrTriple(g, m1, m2, m3, lm);
 }
 
 // NCS — normal-color single. L*V then BK+LC*IR. No final colour stage.
@@ -415,9 +409,7 @@ pub fn gteNcs(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     gtePushRgb(g, m1, m2, m3);
     // psxe NCS macro reclamps IR after the FIFO push using the *new*
     // MAC values — the existing MAC1..MAC3 register state.
-    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
-    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
-    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+    gteIrTriple(g, m1, m2, m3, lm);
 }
 
 // NCCS — normal-color-color single. NCS pipeline + (C * IR) << 4 final
@@ -435,14 +427,12 @@ pub fn gteNccs(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     var m1: i64 = (rc * ir1) << 4;
     var m2: i64 = (gc * ir2) << 4;
     var m3: i64 = (bc * ir3) << 4;
-    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    m1 = gteClampMac(g, 1, m1, sf); m2 = gteClampMac(g, 2, m2, sf); m3 = gteClampMac(g, 3, m3, sf);
     g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
     gtePushRgb(g, m1, m2, m3);
-    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
-    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
-    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+    gteIrTriple(g, m1, m2, m3, lm);
 }
 
 // CC — color color. Skips L*V (uses existing IR), then BK+LC*IR, then
@@ -459,14 +449,12 @@ pub fn gteCc(g: *mut[] u32, sf: u32, lm: u32) {
     var m1: i64 = (rc * ir1) << 4;
     var m2: i64 = (gc * ir2) << 4;
     var m3: i64 = (bc * ir3) << 4;
-    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    m1 = gteClampMac(g, 1, m1, sf); m2 = gteClampMac(g, 2, m2, sf); m3 = gteClampMac(g, 3, m3, sf);
     g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
     gtePushRgb(g, m1, m2, m3);
-    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
-    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
-    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+    gteIrTriple(g, m1, m2, m3, lm);
 }
 
 // CDP — color depth-cued. Skips L*V (uses existing IR), then BK+LC*IR,
@@ -494,21 +482,19 @@ pub fn gteDpcs(g: *mut[] u32, sf: u32, lm: u32) {
     var fp1: i64 = (rfc << 12) - (rc << 16);
     var fp2: i64 = (gfc << 12) - (gc << 16);
     var fp3: i64 = (bfc << 12) - (bc << 16);
-    if (sf == 12) { fp1 = fp1 >> 12; fp2 = fp2 >> 12; fp3 = fp3 >> 12; }
-    const ir1f: i64 = satIrLm(fp1, 0);
-    const ir2f: i64 = satIrLm(fp2, 0);
-    const ir3f: i64 = satIrLm(fp3, 0);
+    fp1 = gteClampMac(g, 1, fp1, sf); fp2 = gteClampMac(g, 2, fp2, sf); fp3 = gteClampMac(g, 3, fp3, sf);
+    const ir1f: i64 = gteClampIr(g, 1, fp1, 0);
+    const ir2f: i64 = gteClampIr(g, 2, fp2, 0);
+    const ir3f: i64 = gteClampIr(g, 3, fp3, 0);
     const ir0: i64 = s16ToI64(g[8]);
     var m1: i64 = (rc << 16) + ir0 * ir1f;
     var m2: i64 = (gc << 16) + ir0 * ir2f;
     var m3: i64 = (bc << 16) + ir0 * ir3f;
-    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    m1 = gteClampMac(g, 1, m1, sf); m2 = gteClampMac(g, 2, m2, sf); m3 = gteClampMac(g, 3, m3, sf);
     g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
-    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
-    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
-    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+    gteIrTriple(g, m1, m2, m3, lm);
     gtePushRgb(g, m1, m2, m3);
 }
 
@@ -528,21 +514,19 @@ pub fn gteDpct(g: *mut[] u32, sf: u32, lm: u32) {
         var fp1: i64 = (rfc << 12) - (rc << 16);
         var fp2: i64 = (gfc << 12) - (gc << 16);
         var fp3: i64 = (bfc << 12) - (bc << 16);
-        if (sf == 12) { fp1 = fp1 >> 12; fp2 = fp2 >> 12; fp3 = fp3 >> 12; }
-        const ir1f: i64 = satIrLm(fp1, 0);
-        const ir2f: i64 = satIrLm(fp2, 0);
-        const ir3f: i64 = satIrLm(fp3, 0);
+        fp1 = gteClampMac(g, 1, fp1, sf); fp2 = gteClampMac(g, 2, fp2, sf); fp3 = gteClampMac(g, 3, fp3, sf);
+        const ir1f: i64 = gteClampIr(g, 1, fp1, 0);
+        const ir2f: i64 = gteClampIr(g, 2, fp2, 0);
+        const ir3f: i64 = gteClampIr(g, 3, fp3, 0);
         const ir0: i64 = s16ToI64(g[8]);
         var m1: i64 = (rc << 16) + ir0 * ir1f;
         var m2: i64 = (gc << 16) + ir0 * ir2f;
         var m3: i64 = (bc << 16) + ir0 * ir3f;
-        if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+        m1 = gteClampMac(g, 1, m1, sf); m2 = gteClampMac(g, 2, m2, sf); m3 = gteClampMac(g, 3, m3, sf);
         g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
         g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
         g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
-        g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
-        g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
-        g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+        gteIrTriple(g, m1, m2, m3, lm);
         gtePushRgb(g, m1, m2, m3);
         iter = iter + 1;
     }
@@ -560,21 +544,19 @@ pub fn gteIntpl(g: *mut[] u32, sf: u32, lm: u32) {
     var fp1: i64 = (rfc << 12) - (ir1 << 12);
     var fp2: i64 = (gfc << 12) - (ir2 << 12);
     var fp3: i64 = (bfc << 12) - (ir3 << 12);
-    if (sf == 12) { fp1 = fp1 >> 12; fp2 = fp2 >> 12; fp3 = fp3 >> 12; }
-    const ir1f: i64 = satIrLm(fp1, 0);
-    const ir2f: i64 = satIrLm(fp2, 0);
-    const ir3f: i64 = satIrLm(fp3, 0);
+    fp1 = gteClampMac(g, 1, fp1, sf); fp2 = gteClampMac(g, 2, fp2, sf); fp3 = gteClampMac(g, 3, fp3, sf);
+    const ir1f: i64 = gteClampIr(g, 1, fp1, 0);
+    const ir2f: i64 = gteClampIr(g, 2, fp2, 0);
+    const ir3f: i64 = gteClampIr(g, 3, fp3, 0);
     const ir0: i64 = s16ToI64(g[8]);
     var m1: i64 = (ir1 << 12) + ir0 * ir1f;
     var m2: i64 = (ir2 << 12) + ir0 * ir2f;
     var m3: i64 = (ir3 << 12) + ir0 * ir3f;
-    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    m1 = gteClampMac(g, 1, m1, sf); m2 = gteClampMac(g, 2, m2, sf); m3 = gteClampMac(g, 3, m3, sf);
     g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
-    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
-    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
-    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+    gteIrTriple(g, m1, m2, m3, lm);
     gtePushRgb(g, m1, m2, m3);
 }
 
@@ -591,7 +573,7 @@ pub fn gteDcpl(g: *mut[] u32, sf: u32, lm: u32) {
     var s1: i64 = (rc * ir1Pre) << 4;
     var s2: i64 = (gc * ir2Pre) << 4;
     var s3: i64 = (bc * ir3Pre) << 4;
-    if (sf == 12) { s1 = s1 >> 12; s2 = s2 >> 12; s3 = s3 >> 12; }
+    s1 = gteClampMac(g, 1, s1, sf); s2 = gteClampMac(g, 2, s2, sf); s3 = gteClampMac(g, 3, s3, sf);
     g[D_MAC1] = (s1 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC2] = (s2 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC3] = (s3 as u64 & 0xFFFFFFFF) as u32;
@@ -612,13 +594,11 @@ pub fn gteGpf(g: *mut[] u32, sf: u32, lm: u32) {
     var m1: i64 = ir0 * ir1;
     var m2: i64 = ir0 * ir2;
     var m3: i64 = ir0 * ir3;
-    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    m1 = gteClampMac(g, 1, m1, sf); m2 = gteClampMac(g, 2, m2, sf); m3 = gteClampMac(g, 3, m3, sf);
     g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
-    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
-    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
-    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+    gteIrTriple(g, m1, m2, m3, lm);
     gtePushRgb(g, m1, m2, m3);
 }
 
@@ -635,13 +615,11 @@ pub fn gteGpl(g: *mut[] u32, sf: u32, lm: u32) {
     var m1: i64 = mac1 + ir0 * ir1;
     var m2: i64 = mac2 + ir0 * ir2;
     var m3: i64 = mac3 + ir0 * ir3;
-    if (sf == 12) { m1 = m1 >> 12; m2 = m2 >> 12; m3 = m3 >> 12; }
+    m1 = gteClampMac(g, 1, m1, sf); m2 = gteClampMac(g, 2, m2, sf); m3 = gteClampMac(g, 3, m3, sf);
     g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
-    g[9]  = (satIrLm(m1, lm) as u64 & 0xFFFF) as u32;
-    g[10] = (satIrLm(m2, lm) as u64 & 0xFFFF) as u32;
-    g[11] = (satIrLm(m3, lm) as u64 & 0xFFFF) as u32;
+    gteIrTriple(g, m1, m2, m3, lm);
     gtePushRgb(g, m1, m2, m3);
 }
 
@@ -680,6 +658,90 @@ pub fn satIrLm(v: i64, lm: u32) i64 {
     if (v < lo) { return lo; }
     if (v > 32767) { return 32767; }
     return v;
+}
+
+// ---- FLAG-aware clamps (psxe gte_clamp_* / gte_check_mac, cpu.c:1486-1607)
+// Each ORs the matching FLAG bit into g[32+C_FLAG] on saturation/overflow
+// and otherwise returns exactly what the plain sat* helpers return, so
+// MAC/IR/SXY/RGB *values* are unchanged — only FLAG gets populated. `i`
+// is the component (1/2/3) selecting the per-channel bit. gteExec clears
+// FLAG at the top of each op; gteCtrlRead synthesizes the bit-31 summary.
+
+// IR1..IR3 saturation → bit 24/23/22.
+pub fn gteClampIr(g: *mut[] u32, i: u32, v: i64, lm: u32) i64 {
+    var lo: i64 = -32768;
+    if (lm != 0) { lo = 0; }
+    if (v < lo) { g[32 + C_FLAG] = g[32 + C_FLAG] | (0x1000000 >> (i - 1)); return lo; }
+    if (v > 32767) { g[32 + C_FLAG] = g[32 + C_FLAG] | (0x1000000 >> (i - 1)); return 32767; }
+    return v;
+}
+
+// Clamp three MAC values into IR1..IR3 (with FLAG bits 24/23/22) and
+// store them — the tail shared by nearly every colour op. Replaces the
+// old `g[9..11] = satIrLm(...)` triple.
+pub fn gteIrTriple(g: *mut[] u32, m1: i64, m2: i64, m3: i64, lm: u32) {
+    g[9]  = (gteClampIr(g, 1, m1, lm) as u64 & 0xFFFF) as u32;
+    g[10] = (gteClampIr(g, 2, m2, lm) as u64 & 0xFFFF) as u32;
+    g[11] = (gteClampIr(g, 3, m3, lm) as u64 & 0xFFFF) as u32;
+}
+
+// IR0 clamp 0..0x1000 → bit 12 (gte_clamp_ir0).
+pub fn gteClampIr0(g: *mut[] u32, v: i64) i64 {
+    if (v < 0) { g[32 + C_FLAG] = g[32 + C_FLAG] | 0x1000; return 0; }
+    if (v > 0x1000) { g[32 + C_FLAG] = g[32 + C_FLAG] | 0x1000; return 0x1000; }
+    return v;
+}
+
+// SZ3 saturation 0..0xFFFF → bit 18 (gte_clamp_sz3).
+pub fn gteClampSz3(g: *mut[] u32, v: i64) u32 {
+    if (v < 0) { g[32 + C_FLAG] = g[32 + C_FLAG] | 0x40000; return 0; }
+    if (v > 0xFFFF) { g[32 + C_FLAG] = g[32 + C_FLAG] | 0x40000; return 0xFFFF; }
+    return (v as u64 & 0xFFFF) as u32;
+}
+
+// SX/SY saturation -0x400..0x3FF → bit 14/13 (gte_clamp_sxy).
+pub fn gteClampSxy(g: *mut[] u32, i: u32, v: i64) u32 {
+    if (v < -1024) { g[32 + C_FLAG] = g[32 + C_FLAG] | (0x4000 >> (i - 1)); return 0xFFFFFC00; }
+    if (v > 1023)  { g[32 + C_FLAG] = g[32 + C_FLAG] | (0x4000 >> (i - 1)); return 0x3FF; }
+    return ((v + 0x100000000) as u64 & 0xFFFF) as u32;
+}
+
+// RGB channel clamp 0..0xFF → bit 21/20/19 (gte_clamp_rgb).
+pub fn gteClampRgb(g: *mut[] u32, i: u32, v: i64) u32 {
+    if (v < 0) { g[32 + C_FLAG] = g[32 + C_FLAG] | (0x200000 >> (i - 1)); return 0; }
+    if (v > 255) { g[32 + C_FLAG] = g[32 + C_FLAG] | (0x200000 >> (i - 1)); return 255; }
+    return (v as u64 & 0xFF) as u32;
+}
+
+// MAC0 overflow → bit 15 (neg) / 16 (pos); value is NOT clamped, only
+// flagged (gte_clamp_mac0).
+pub fn gteClampMac0(g: *mut[] u32, v: i64) i64 {
+    const lim: i64 = (1 as i64) << 31;
+    if (v < (0 - lim)) { g[32 + C_FLAG] = g[32 + C_FLAG] | 0x8000; }
+    if (v > (lim - 1)) { g[32 + C_FLAG] = g[32 + C_FLAG] | 0x10000; }
+    return v;
+}
+
+// MAC1..MAC3: flag 44-bit overflow (bit 30/29/28 pos, 27/26/25 neg),
+// truncate to 44 bits (sign-extend from bit 43), then >> sf. This is
+// psxe's gte_clamp_mac — the truncation only changes the result when the
+// sum exceeds 44 bits, so normal geometry is unaffected.
+pub fn gteClampMac(g: *mut[] u32, i: u32, v: i64, sf: u32) i64 {
+    const lim: i64 = (1 as i64) << 43;
+    if (v < (0 - lim)) { g[32 + C_FLAG] = g[32 + C_FLAG] | (0x8000000 >> (i - 1)); }
+    if (v > (lim - 1)) { g[32 + C_FLAG] = g[32 + C_FLAG] | (0x40000000 >> (i - 1)); }
+    const t: i64 = (v << 20) >> 20;
+    return t >> sf;
+}
+
+// Running-accumulation 44-bit check (gte_check_mac): flag overflow and
+// truncate to 44 bits, WITHOUT the >> sf (used between the additive terms
+// of a 3-term MAC sum so intermediate overflow wraps like psxe).
+pub fn gteCheckMac(g: *mut[] u32, i: u32, v: i64) i64 {
+    const lim: i64 = (1 as i64) << 43;
+    if (v < (0 - lim)) { g[32 + C_FLAG] = g[32 + C_FLAG] | (0x8000000 >> (i - 1)); }
+    if (v > (lim - 1)) { g[32 + C_FLAG] = g[32 + C_FLAG] | (0x40000000 >> (i - 1)); }
+    return (v << 20) >> 20;
 }
 
 // Saturate to u16 (used for SZ3).
@@ -779,17 +841,17 @@ pub fn gteRtps(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     var sm1: i64 = mac1;
     var sm2: i64 = mac2;
     var sm3: i64 = mac3;
-    if (sf == 12) { sm1 = mac1 >> 12; sm2 = mac2 >> 12; sm3 = mac3 >> 12; }
-    const ir1: i64 = satIrLm(sm1, lm);
-    const ir2: i64 = satIrLm(sm2, lm);
-    const ir3: i64 = satIrLm(sm3, lm);
+    sm1 = gteClampMac(g, 1, mac1, sf); sm2 = gteClampMac(g, 2, mac2, sf); sm3 = gteClampMac(g, 3, mac3, sf);
+    const ir1: i64 = gteClampIr(g, 1, sm1, lm);
+    const ir2: i64 = gteClampIr(g, 2, sm2, lm);
+    const ir3: i64 = gteClampIr(g, 3, sm3, lm);
 
     // SZ FIFO: SZ0←SZ1, SZ1←SZ2, SZ2←SZ3, SZ3← new. SZ3 always uses
     // the >>12 form regardless of `sf` (per psxe gte_clamp_ir_z).
     g[16] = g[17];
     g[17] = g[18];
     g[18] = g[19];
-    g[19] = satSz3(mac3 >> 12);
+    g[19] = gteClampSz3(g, mac3 >> 12);
 
     // Perspective division.
     const h: u32 = g[32 + 26] & 0xFFFF;
@@ -799,13 +861,15 @@ pub fn gteRtps(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     // SXY = (OFX + IR * div) >> 16. OFX/OFY are 32-bit signed.
     const ofx: i64 = s32ToI64(g[32 + 24]);
     const ofy: i64 = s32ToI64(g[32 + 25]);
-    const sx: i64 = (ofx + ir1 * (div as i64)) >> 16;
-    const sy: i64 = (ofy + ir2 * (div as i64)) >> 16;
+    // psxe wraps OFX+IR*div in gte_clamp_mac0 (MAC0 overflow flag) before
+    // the >>16, then gte_clamp_sxy (bit 14/13).
+    const sx: i64 = gteClampMac0(g, ofx + ir1 * (div as i64)) >> 16;
+    const sy: i64 = gteClampMac0(g, ofy + ir2 * (div as i64)) >> 16;
 
     // SXY FIFO push.
     g[D_SXY0] = g[D_SXY1];
     g[D_SXY1] = g[D_SXY2];
-    g[D_SXY2] = (satSxy(sx) & 0xFFFF) | ((satSxy(sy) & 0xFFFF) << 16);
+    g[D_SXY2] = (gteClampSxy(g, 1, sx) & 0xFFFF) | ((gteClampSxy(g, 2, sy) & 0xFFFF) << 16);
 
     // Write IR back and MAC for further pipeline stages. psxe's
     // gte_clamp_mac stores the *shifted* (>> sf) value into MAC1..MAC3
@@ -823,12 +887,10 @@ pub fn gteRtps(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     // since the BIOS reads IR0/MAC0 after the final RTP call.
     const dqa: i64 = s32ToI64(g[32 + 27]);
     const dqb: i64 = s32ToI64(g[32 + 28]);
-    const mac0: i64 = dqb + dqa * (div as i64);
+    const mac0: i64 = gteClampMac0(g, dqb + dqa * (div as i64));
     g[D_MAC0] = (mac0 as u64 & 0xFFFFFFFF) as u32;
-    // IR0 clamps to 0..0x1000 in psxe (gte_clamp_ir0).
-    var ir0: i64 = mac0 >> 12;
-    if (ir0 < 0) { ir0 = 0; }
-    if (ir0 > 0x1000) { ir0 = 0x1000; }
+    // IR0 clamps to 0..0x1000 with FLAG bit 12 (gte_clamp_ir0).
+    const ir0: i64 = gteClampIr0(g, mac0 >> 12);
     g[8] = (ir0 as u64 & 0xFFFF) as u32;
 }
 
@@ -844,9 +906,9 @@ pub fn gteAvsz(g: *mut[] u32, count: u32) {
         sum = sum + (g[16] as i64);
         zsf = s16ToI64(g[32 + 30]);                 // ZSF4
     }
-    const mac0: i64 = zsf * sum;
+    const mac0: i64 = gteClampMac0(g, zsf * sum);
     g[D_MAC0] = (mac0 as u64 & 0xFFFFFFFF) as u32;
-    g[7] = satSz3(mac0 >> 12);                       // OTZ (clamped 0..0xFFFF)
+    g[7] = gteClampSz3(g, mac0 >> 12);               // OTZ (bit 18)
 }
 
 // NCLIP — back-face cull test. MAC0 = signed cross product of the three
@@ -860,7 +922,7 @@ pub fn gteNclip(g: *mut[] u32) {
     const sy1: i64 = s16ToI64((g[D_SXY1] >> 16) & 0xFFFF);
     const sx2: i64 = s16ToI64(g[D_SXY2] & 0xFFFF);
     const sy2: i64 = s16ToI64((g[D_SXY2] >> 16) & 0xFFFF);
-    const v: i64 = sx0 * (sy1 - sy2) + sx1 * (sy2 - sy0) + sx2 * (sy0 - sy1);
+    const v: i64 = gteClampMac0(g, sx0 * (sy1 - sy2) + sx1 * (sy2 - sy0) + sx2 * (sy0 - sy1));
     g[D_MAC0] = (v as u64 & 0xFFFFFFFF) as u32;
 }
 
@@ -870,22 +932,21 @@ pub fn gteNclip(g: *mut[] u32) {
 //   MAC3 = RT11*IR2 - RT22*IR1
 // Uses the rotation matrix diagonal as the input vector. Used by some
 // lighting normal computations.
-pub fn gteOp(g: *mut[] u32) {
+pub fn gteOp(g: *mut[] u32, sf: u32, lm: u32) {
     const rt11: i64 = s16ToI64(g[32 + 0] & 0xFFFF);
     const rt22: i64 = s16ToI64(g[32 + 2] & 0xFFFF);
     const rt33: i64 = s16ToI64(g[32 + 4] & 0xFFFF);
     const ir1: i64 = s16ToI64(g[9]);
     const ir2: i64 = s16ToI64(g[10]);
     const ir3: i64 = s16ToI64(g[11]);
-    const mac1: i64 = rt22 * ir3 - rt33 * ir2;
-    const mac2: i64 = rt33 * ir1 - rt11 * ir3;
-    const mac3: i64 = rt11 * ir2 - rt22 * ir1;
+    // psxe runs each through gte_clamp_mac (>>sf + flag) then gte_clamp_ir.
+    const mac1: i64 = gteClampMac(g, 1, rt22 * ir3 - rt33 * ir2, sf);
+    const mac2: i64 = gteClampMac(g, 2, rt33 * ir1 - rt11 * ir3, sf);
+    const mac3: i64 = gteClampMac(g, 3, rt11 * ir2 - rt22 * ir1, sf);
     g[D_MAC1] = (mac1 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC2] = (mac2 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC3] = (mac3 as u64 & 0xFFFFFFFF) as u32;
-    g[9]  = (satIr16(mac1) as u64 & 0xFFFF) as u32;
-    g[10] = (satIr16(mac2) as u64 & 0xFFFF) as u32;
-    g[11] = (satIr16(mac3) as u64 & 0xFFFF) as u32;
+    gteIrTriple(g, mac1, mac2, mac3, lm);
 }
 
 // NCDS — Normal Color Depth Single. Computes per-vertex lit color with
@@ -940,10 +1001,10 @@ pub fn gteNcds(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     var m1a: i64 = ll11 * vx + ll12 * vy + ll13 * vz;
     var m2a: i64 = ll21 * vx + ll22 * vy + ll23 * vz;
     var m3a: i64 = ll31 * vx + ll32 * vy + ll33 * vz;
-    if (sf == 12) { m1a = m1a >> 12; m2a = m2a >> 12; m3a = m3a >> 12; }
-    const ir1a: i64 = satIrLm(m1a, lm);
-    const ir2a: i64 = satIrLm(m2a, lm);
-    const ir3a: i64 = satIrLm(m3a, lm);
+    m1a = gteClampMac(g, 1, m1a, sf); m2a = gteClampMac(g, 2, m2a, sf); m3a = gteClampMac(g, 3, m3a, sf);
+    const ir1a: i64 = gteClampIr(g, 1, m1a, lm);
+    const ir2a: i64 = gteClampIr(g, 2, m2a, lm);
+    const ir3a: i64 = gteClampIr(g, 3, m3a, lm);
 
     // Stage 2: background-colour + light-colour matrix * (IR from stage 1).
     const lr1: i64 = s16ToI64(g[32 + 16] & 0xFFFF);
@@ -962,10 +1023,10 @@ pub fn gteNcds(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     var m1b: i64 = (rbk << 12) + lr1 * ir1a + lr2 * ir2a + lr3 * ir3a;
     var m2b: i64 = (gbk << 12) + lg1 * ir1a + lg2 * ir2a + lg3 * ir3a;
     var m3b: i64 = (bbk << 12) + lb1 * ir1a + lb2 * ir2a + lb3 * ir3a;
-    if (sf == 12) { m1b = m1b >> 12; m2b = m2b >> 12; m3b = m3b >> 12; }
-    const ir1b: i64 = satIrLm(m1b, lm);
-    const ir2b: i64 = satIrLm(m2b, lm);
-    const ir3b: i64 = satIrLm(m3b, lm);
+    m1b = gteClampMac(g, 1, m1b, sf); m2b = gteClampMac(g, 2, m2b, sf); m3b = gteClampMac(g, 3, m3b, sf);
+    const ir1b: i64 = gteClampIr(g, 1, m1b, lm);
+    const ir2b: i64 = gteClampIr(g, 2, m2b, lm);
+    const ir3b: i64 = gteClampIr(g, 3, m3b, lm);
 
     // Stage 3: vertex colour from RGBC register (DR[6]).
     const rgbc: u32 = g[6];
@@ -982,24 +1043,22 @@ pub fn gteNcds(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     var fp1: i64 = (rfc << 12) - (rc << 4) * ir1b;
     var fp2: i64 = (gfc << 12) - (gc << 4) * ir2b;
     var fp3: i64 = (bfc << 12) - (bc << 4) * ir3b;
-    if (sf == 12) { fp1 = fp1 >> 12; fp2 = fp2 >> 12; fp3 = fp3 >> 12; }
-    const ir1f: i64 = satIrLm(fp1, 0);
-    const ir2f: i64 = satIrLm(fp2, 0);
-    const ir3f: i64 = satIrLm(fp3, 0);
+    fp1 = gteClampMac(g, 1, fp1, sf); fp2 = gteClampMac(g, 2, fp2, sf); fp3 = gteClampMac(g, 3, fp3, sf);
+    const ir1f: i64 = gteClampIr(g, 1, fp1, 0);
+    const ir2f: i64 = gteClampIr(g, 2, fp2, 0);
+    const ir3f: i64 = gteClampIr(g, 3, fp3, 0);
 
     // Stage 5: final colour = (C<<4)*IR + IR0 * ir'.
     const ir0: i64 = s16ToI64(g[8]);
     var m1c: i64 = (rc << 4) * ir1b + ir0 * ir1f;
     var m2c: i64 = (gc << 4) * ir2b + ir0 * ir2f;
     var m3c: i64 = (bc << 4) * ir3b + ir0 * ir3f;
-    if (sf == 12) { m1c = m1c >> 12; m2c = m2c >> 12; m3c = m3c >> 12; }
+    m1c = gteClampMac(g, 1, m1c, sf); m2c = gteClampMac(g, 2, m2c, sf); m3c = gteClampMac(g, 3, m3c, sf);
 
     g[D_MAC1] = (m1c as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC2] = (m2c as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC3] = (m3c as u64 & 0xFFFFFFFF) as u32;
-    g[9]  = (satIrLm(m1c, lm) as u64 & 0xFFFF) as u32;
-    g[10] = (satIrLm(m2c, lm) as u64 & 0xFFFF) as u32;
-    g[11] = (satIrLm(m3c, lm) as u64 & 0xFFFF) as u32;
+    gteIrTriple(g, m1c, m2c, m3c, lm);
 
     // Stage 6: RGB FIFO push and RGB2 = clamp_rgb(MAC >> 4).
     g[20] = g[21];                       // RGB0 ← RGB1
@@ -1019,19 +1078,17 @@ pub fn clampU8(v: i64) u32 {
 
 // SQR — square each IR component. Used for vector-length computations.
 // psxe: MAC{1,2,3} = IR{1,2,3}^2; IR{1,2,3} = clamp(MAC).
-pub fn gteSqr(g: *mut[] u32) {
+pub fn gteSqr(g: *mut[] u32, sf: u32, lm: u32) {
     const ir1: i64 = s16ToI64(g[9]);
     const ir2: i64 = s16ToI64(g[10]);
     const ir3: i64 = s16ToI64(g[11]);
-    const mac1: i64 = ir1 * ir1;
-    const mac2: i64 = ir2 * ir2;
-    const mac3: i64 = ir3 * ir3;
+    const mac1: i64 = gteClampMac(g, 1, ir1 * ir1, sf);
+    const mac2: i64 = gteClampMac(g, 2, ir2 * ir2, sf);
+    const mac3: i64 = gteClampMac(g, 3, ir3 * ir3, sf);
     g[D_MAC1] = (mac1 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC2] = (mac2 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC3] = (mac3 as u64 & 0xFFFFFFFF) as u32;
-    g[9]  = (satIr16(mac1) as u64 & 0xFFFF) as u32;
-    g[10] = (satIr16(mac2) as u64 & 0xFFFF) as u32;
-    g[11] = (satIr16(mac3) as u64 & 0xFFFF) as u32;
+    gteIrTriple(g, mac1, mac2, mac3, lm);
 }
 
 // MVMVA — Multiply-Vector-by-Matrix and add-Vector. Opcode bits select
@@ -1135,12 +1192,10 @@ pub fn gteMvmva(g: *mut[] u32, opc: u32) {
     var sm1: i64 = mac1;
     var sm2: i64 = mac2;
     var sm3: i64 = mac3;
-    if (sf == 12) { sm1 = mac1 >> 12; sm2 = mac2 >> 12; sm3 = mac3 >> 12; }
+    sm1 = gteClampMac(g, 1, mac1, sf); sm2 = gteClampMac(g, 2, mac2, sf); sm3 = gteClampMac(g, 3, mac3, sf);
 
     g[D_MAC1] = (sm1 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC2] = (sm2 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC3] = (sm3 as u64 & 0xFFFFFFFF) as u32;
-    g[9]  = (satIrLm(sm1, lm) as u64 & 0xFFFF) as u32;
-    g[10] = (satIrLm(sm2, lm) as u64 & 0xFFFF) as u32;
-    g[11] = (satIrLm(sm3, lm) as u64 & 0xFFFF) as u32;
+    gteIrTriple(g, sm1, sm2, sm3, lm);
 }

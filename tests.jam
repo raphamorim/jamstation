@@ -25,7 +25,7 @@ const {
 // allocBus body (which calls gpuAlloc / dmaAlloc / etc.) resolves.
 const { Gpu } = import("gpu");
 const { gteAlloc, gteFree, gteExec, gteDivide,
-        gteDataRead, gteDataWrite, gteCtrlWrite } = import("gte");
+        gteDataRead, gteDataWrite, gteCtrlWrite, gteCtrlRead } = import("gte");
 const { Cdrom } = import("cdrom");
 const { discAlloc, discOpen } = import("disc");
 const { dmaAlloc, dmaUpdate } = import("dma");
@@ -455,6 +455,39 @@ fn tGteDivideOvf() u32 {
     gteFree(g);
     return q;
 }
+
+// FLAG (reg 63) verification. CFC2 r63 reads g[32+31] masked to
+// 0x7FFFF000 with bit 31 synthesized from the 0x7F87E000 error summary.
+
+fn tGteSqrFlag() u32 {
+    var g: *mut[] u32 = gteAlloc();
+    gteDataWrite(g, 9, 0x7FFF);            // IR1 = 32767
+    gteExec(g, 0x4A080028);                // SQR, sf=12 → MAC1=262143, IR1 saturates
+    const f: u32 = gteCtrlRead(g, 31);     // bit 24 (IR1 sat) + bit 31 summary
+    gteFree(g);
+    return f;
+}
+
+fn tGteDivideFlag() u32 {
+    var g: *mut[] u32 = gteAlloc();
+    const q: u32 = gteDivide(g, 0x2000, 0x1000);  // n>=2d → bit 17 (divide ovf)
+    const f: u32 = gteCtrlRead(g, 31);            // bit 17 + bit 31 summary
+    gteFree(g);
+    return f;
+}
+
+fn tGteNoFlag() u32 {
+    var g: *mut[] u32 = gteAlloc();
+    gteDataWrite(g, 9, 100);               // IR1 = 100
+    gteExec(g, 0x4A080028);                // SQR sf=12 → MAC1=2, no saturation
+    const f: u32 = gteCtrlRead(g, 31);     // FLAG must be clean
+    gteFree(g);
+    return f;
+}
+
+tfn psxGteSqrFlag()    { assert(tGteSqrFlag(), 0x81000000); }
+tfn psxGteDivideFlag() { assert(tGteDivideFlag(), 0x80020000); }
+tfn psxGteNoFlag()     { assert(tGteNoFlag(), 0); }
 
 tfn psxGteRtpsMac()   { assert(tGteRtpsMac(), 100); }
 tfn psxGteRtpsIr()    { assert(tGteRtpsIr(), 300); }
