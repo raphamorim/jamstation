@@ -10,11 +10,17 @@ Kindly reminder that Jam lang is experimental yet.
 # LIBRARY_PATH should be where SDL2 is located
 LIBRARY_PATH=/opt/homebrew/lib jam -lSDL2 -C opt-level=3 -o jamstation main.jam
 
-# Run the emulator
-./jamstation BIOS_PATH GAME_PATH
+# Run: jamstation <BIOS_PATH> [GAME_PATH]
+./jamstation /path/to/SCPH1001.BIN "/path/to/Brave Fencer Musashi (USA).cue"
+
+# BIOS only — boots to the PlayStation shell:
+./jamstation /path/to/SCPH1001.BIN
 ```
 
-Note: You need to use the `.cue` path instead of the game root folder like `/Users/rapha/Desktop/BraveFencerMusashi/game.cue`.
+- **`BIOS_PATH`** — the PSX BIOS image.
+- **`GAME_PATH`** — optional, dispatched by extension:
+  - `.cue` / `.bin` — disc image; the BIOS bootstraps it off the disc. Pass the **`.cue`**, not the game folder — its `.bin` tracks are resolved relative to the cue (multi-track and spaces in the name are fine, so quote paths with spaces).
+  - `.exe` — a PS-X executable, sideloaded after the BIOS boots.
 
 ## Controls
 
