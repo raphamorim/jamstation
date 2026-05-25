@@ -44,6 +44,8 @@ const {
     sdlAudioOpen, sdlAudioClose
 } = import("sdl");
 const { Vec } = import("std").collections;
+const { File } = import("std/fs");
+const { Args, args, next } = import("std").process;
 
 extern fn malloc(size: u64) *mut[] u8;
 extern fn free(ptr: *mut[] u8);
@@ -51,10 +53,7 @@ extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 extern fn printf(format: *const[] u8, ...) i32;
 extern fn write(fd: i32, buf: *const[] u8, count: u64) i64;
 extern fn putchar(c: i32) i32;
-extern fn fopen(path: *const[] u8, mode: *const[] u8) *mut[] u8;
-extern fn fclose(file: *mut[] u8) i32;
-extern fn fread(buf: *mut[] u8, size: u64, n: u64, file: *mut[] u8) u64;
-extern fn fseek(file: *mut[] u8, off: i64, whence: i32) i32;
+// fopen / fclose / fread / fseek now come from std/fs (imported above).
 extern fn access(path: *const[] u8, mode: i32) i32;
 extern fn fflush(stream: u64) i32;
 extern fn fwrite(buf: *const[] u8, size: u64, n: u64, file: *mut[] u8) u64;
@@ -265,13 +264,24 @@ fn loadExe(path: []u8, bus: Bus, regs: *mut[] u32, c: mut Cpu) {
            fileSz, ramDest);
 }
 
+// Load the 512 KB BIOS image into bus BIOS memory via std.fs. The
+// destination is a []u8 view over the bus's BIOS buffer (range-slicing a
+// many-item pointer), so the read is bounds-carrying rather than a raw
+// fread into a bare pointer.
 fn loadBios(path: []u8, bus: Bus) u64 {
-    var modeRb: []u8 = "rb";
-    var f: *mut[] u8 = fopen(path.ptr, modeRb.ptr);
-    var biosBuf: *mut[] u8 = busBiosPtr(bus);
-    const got: u64 = fread(biosBuf, 1, 0x80000, f);
-    fclose(f);
-    return got;
+    match (File.open(path)) {
+        Some(f) {
+            var biosPtr: *mut[] u8 = busBiosPtr(bus);
+            var bios: []u8 = biosPtr[0..0x80000];
+            const got: u64 = f.read(bios);
+            f.close();
+            return got;
+        }
+        None {
+            return 0;
+        }
+    }
+    return 0;
 }
 
 // Run one full NTSC frame.
@@ -440,14 +450,22 @@ fn main() {
     cop0Write(cop0, C0_SR,   0x10900000);
     cop0Write(cop0, C0_PRID, 0x00000002);
 
+    // BIOS path comes from argv[1] if given, else ./SCPH1001.BIN:
+    //   jamstation [BIOS_PATH]
     var biosPath: []u8 = "./SCPH1001.BIN";
+    var argsIt: Args = args();
+    next(argsIt);                       // skip argv[0] (the program path)
+    match (next(argsIt)) {
+        Some(arg) { biosPath = arg; }
+        None { }
+    }
     if (fileExists(biosPath)) {
         const got: u64 = loadBios(biosPath, bus);
-        var fmt: []u8 = "Loaded BIOS: %llu bytes from SCPH1001.BIN\n";
-        printf(fmt.ptr, got);
+        var fmt: []u8 = "Loaded BIOS: %llu bytes from %.*s\n";
+        printf(fmt.ptr, got, biosPath.len as i32, biosPath.ptr);
         flushAll();
     } else {
-        var msg: []u8 = "No SCPH1001.BIN — booting from EXE only\n";
+        var msg: []u8 = "No BIOS at the given path — booting from EXE only\n";
         write(STDOUT, msg.ptr, msg.len);
     }
 
