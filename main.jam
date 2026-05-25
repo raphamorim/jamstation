@@ -439,6 +439,26 @@ fn flushAll() {
     fflush(0);
 }
 
+// True if NUL-terminated `p` ends with ".exe" / ".EXE". Mirrors
+// disc.jam's pathEndsWithCue so an EXE passed as argv[2] is routed to
+// the sideload path instead of discOpen.
+fn pathEndsWithExe(p: []u8) bool {
+    var n: u32 = 0;
+    while (p.ptr[n] != 0) { n = n + 1; }
+    if (n < 4) { return false; }
+    const a: u32 = p.ptr[n - 4] as u32;
+    const b: u32 = p.ptr[n - 3] as u32;
+    const cC: u32 = p.ptr[n - 2] as u32;
+    const e: u32 = p.ptr[n - 1] as u32;
+    // ".exe" or ".EXE"
+    if (a == 0x2E && (b == 0x65 || b == 0x45)
+                  && (cC == 0x78 || cC == 0x58)
+                  && (e == 0x65 || e == 0x45)) {
+        return true;
+    }
+    return false;
+}
+
 fn main() {
     var regs: *mut[] u32 = allocRegFile(32);
     var cop0: *mut[] u32 = allocRegFile(16);
@@ -460,13 +480,22 @@ fn main() {
     cop0Write(cop0, C0_SR,   0x10900000);
     cop0Write(cop0, C0_PRID, 0x00000002);
 
-    // BIOS path comes from argv[1] if given, else ./SCPH1001.BIN:
-    //   jamstation [BIOS_PATH]
+    // CLI:  jamstation [BIOS_PATH] [GAME_PATH]
+    //   argv[1] = BIOS image (else ./SCPH1001.BIN)
+    //   argv[2] = optional game image: a .cue/.bin disc or a .exe
+    //             (dispatched below). When omitted, the fixed ./game.*
+    //             / ./demo.exe names in the cwd are used as a fallback.
     var biosPath: []u8 = "./SCPH1001.BIN";
     var argsIt: Args = args();
     next(argsIt);                       // skip argv[0] (the program path)
     match (next(argsIt)) {
         Some(arg) { biosPath = arg; }
+        None { }
+    }
+    var gameArg: []u8 = "";
+    var hasGameArg: bool = false;
+    match (next(argsIt)) {              // argv[2]: optional game image
+        Some(arg) { gameArg = arg; hasGameArg = true; }
         None { }
     }
     if (fileExists(biosPath)) {
@@ -491,30 +520,45 @@ fn main() {
     var cuePath:  []u8 = "./game.cue";
     var binPath:  []u8 = "./game.bin";
     var pendingGameExe: bool = false;
-    // Attach a CD-ROM image so the BIOS shell can read sectors via
-    // CdlReadN — this is the path that lets the BIOS bootstrap a real
-    // PS-X EXE off the disc instead of needing game.exe to be
-    // extracted manually. Prefer ./game.cue (multi-track aware) over
-    // a raw ./game.bin (single-track Mode2/2352).
-    if (fileExists(cuePath)) {
-        if (discOpen(bus.disc, cuePath) != 0) {
+    // Game image. An explicit argv[2] wins; otherwise fall back to the
+    // fixed ./game.cue / ./game.bin / ./demo.exe / ./game.exe names in
+    // the cwd. A .exe is sideloaded (BIOS boots first, then we hand off
+    // at PC=0x80030000); a .cue/.bin is attached as a CD-ROM so the BIOS
+    // bootstraps the game off the disc — discOpen auto-detects .cue
+    // (multi-track aware) vs a raw .bin (single-track Mode2/2352).
+    if (hasGameArg) {
+        if (pathEndsWithExe(gameArg)) {
+            gamePath = gameArg;
+            pendingGameExe = true;
+            var msg: []u8 = "EXE arg — booting BIOS first, will side-load at PC=80030000\n";
+            write(STDOUT, msg.ptr, msg.len);
+        } else if (discOpen(bus.disc, gameArg) != 0) {
             bus.cdrom.attachDisc(bus.disc);
+        } else {
+            var msg: []u8 = "Could not open game image from arg — running BIOS only\n";
+            write(STDOUT, msg.ptr, msg.len);
         }
-    } else if (fileExists(binPath)) {
-        if (discOpen(bus.disc, binPath) != 0) {
-            bus.cdrom.attachDisc(bus.disc);
-        }
-    }
-    if (fileExists(demoPath)) {
-        loadExe(demoPath, bus, regs, c);
-        flushAll();
-    } else if (fileExists(gamePath)) {
-        pendingGameExe = true;
-        var msg: []u8 = "game.exe found — booting BIOS first, will side-load at PC=80030000\n";
-        write(STDOUT, msg.ptr, msg.len);
     } else {
-        var msg: []u8 = "No demo.exe — running from BIOS reset vector only\n";
-        write(STDOUT, msg.ptr, msg.len);
+        if (fileExists(cuePath)) {
+            if (discOpen(bus.disc, cuePath) != 0) {
+                bus.cdrom.attachDisc(bus.disc);
+            }
+        } else if (fileExists(binPath)) {
+            if (discOpen(bus.disc, binPath) != 0) {
+                bus.cdrom.attachDisc(bus.disc);
+            }
+        }
+        if (fileExists(demoPath)) {
+            loadExe(demoPath, bus, regs, c);
+            flushAll();
+        } else if (fileExists(gamePath)) {
+            pendingGameExe = true;
+            var msg: []u8 = "game.exe found — booting BIOS first, will side-load at PC=80030000\n";
+            write(STDOUT, msg.ptr, msg.len);
+        } else {
+            var msg: []u8 = "No game arg / demo.exe — running from BIOS reset vector only\n";
+            write(STDOUT, msg.ptr, msg.len);
+        }
     }
 
     // SDL window + texture. We render the full 1024×512 VRAM as a BGR555

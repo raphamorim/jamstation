@@ -11,8 +11,10 @@ Kindly reminder that Jam lang is experimental yet.
 LIBRARY_PATH=/opt/homebrew/lib jam -lSDL2 -C opt-level=3 -o jamstation main.jam
 
 # Run the emulator
-./jamstation
+./jamstation BIOS_PATH GAME_PATH
 ```
+
+Note: You need to use the `.cue` path instead of the game root folder like `/Users/rapha/Desktop/BraveFencerMusashi/game.cue`.
 
 ## Controls
 
