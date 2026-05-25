@@ -24,7 +24,8 @@ const {
 // Force device modules into this module's codegen context so bus.jam's
 // allocBus body (which calls gpuAlloc / dmaAlloc / etc.) resolves.
 const { Gpu } = import("gpu");
-const { gteAlloc } = import("gte");
+const { gteAlloc, gteFree, gteExec, gteDivide,
+        gteDataRead, gteDataWrite, gteCtrlWrite } = import("gte");
 const { Cdrom } = import("cdrom");
 const { discAlloc, discOpen } = import("disc");
 const { dmaAlloc, dmaUpdate } = import("dma");
@@ -393,6 +394,73 @@ tfn psxCop0Roundtrip()  { assert(tCop0Roundtrip(), 0xDEAD0000); }
 tfn psxSyscallVector()  { assert(tSyscallVector(), 0xBFC00180); }
 tfn psxLoadDelay()      { assert(tLoadDelay(), 0x0000002A); }
 tfn psxLwlLwr()         { assert(tLwlLwr(), 0xBBCCDD11); }
+
+// ---------- GTE (COP2) unit tests ----------------------------------------
+//
+// gteAlloc gives a standalone register buffer, so the math ops can be
+// exercised without a full Bus. These lock in the psxe-match fixes:
+// RTPS stores MAC >> sf (not the raw 44-bit sum), MFC2 sign-extends the
+// 16-bit registers, and the perspective divide uses the UNR LUT.
+
+// Identity rotation matrix (4096 = 1.0 in s1.3.12), zero translation.
+fn gteSetIdentity(g: *mut[] u32) {
+    gteCtrlWrite(g, 0, 0x00001000);   // RT11=4096, RT12=0
+    gteCtrlWrite(g, 1, 0x00000000);   // RT13=0,   RT21=0
+    gteCtrlWrite(g, 2, 0x00001000);   // RT22=4096, RT23=0
+    gteCtrlWrite(g, 3, 0x00000000);   // RT31=0,   RT32=0
+    gteCtrlWrite(g, 4, 0x00001000);   // RT33=4096
+}
+
+fn tGteRtpsMac() u32 {
+    var g: *mut[] u32 = gteAlloc();
+    gteSetIdentity(g);
+    gteDataWrite(g, 0, (200 << 16) | 100);    // V0 = (100, 200, z)
+    gteDataWrite(g, 1, 300);                   // V0.z = 300
+    gteExec(g, 0x4A080001);                    // RTPS, sf=12
+    // MAC1 = ((TR<<12) + 4096*100) >> 12 = 100 (pre-fix it was 409600).
+    const mac1: u32 = gteDataRead(g, 25);
+    gteFree(g);
+    return mac1;
+}
+
+fn tGteRtpsIr() u32 {
+    var g: *mut[] u32 = gteAlloc();
+    gteSetIdentity(g);
+    gteDataWrite(g, 0, (200 << 16) | 100);
+    gteDataWrite(g, 1, 300);
+    gteExec(g, 0x4A080001);
+    const ir3: u32 = gteDataRead(g, 11);       // clamp(MAC3=300) = 300
+    gteFree(g);
+    return ir3;
+}
+
+fn tGteIrSext() u32 {
+    var g: *mut[] u32 = gteAlloc();
+    gteDataWrite(g, 9, 0x0000FFFF);            // IR1 = -1 (16-bit)
+    const v: u32 = gteDataRead(g, 9);          // MFC2 sign-extends → -1
+    gteFree(g);
+    return v;
+}
+
+fn tGteDivide() u32 {
+    var g: *mut[] u32 = gteAlloc();
+    const q: u32 = gteDivide(g, 0x800, 0x1000); // 2048/4096 → 0x8000
+    gteFree(g);
+    return q;
+}
+
+fn tGteDivideOvf() u32 {
+    var g: *mut[] u32 = gteAlloc();
+    const q: u32 = gteDivide(g, 0x2000, 0x1000); // n >= 2d → saturates
+    gteFree(g);
+    return q;
+}
+
+tfn psxGteRtpsMac()   { assert(tGteRtpsMac(), 100); }
+tfn psxGteRtpsIr()    { assert(tGteRtpsIr(), 300); }
+tfn psxGteIrSext()    { assert(tGteIrSext(), 0xFFFFFFFF); }
+tfn psxGteDivide()    { assert(tGteDivide(), 0x8000); }
+tfn psxGteDivideOvf() { assert(tGteDivideOvf(), 0x1FFFF); }
 
 // ---------- headless emulator boot tests ---------------------------------
 //
