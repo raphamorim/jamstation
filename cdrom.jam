@@ -167,10 +167,14 @@ pub const Cdrom = struct {
             readOngoing: 0,
             hasDisc: 0,
             cmdPending: 0, xaFile: 0, xaChannel: 0,
-            seekPrec: 0, prevSpeed: 0,
+            seekPrec: 1, prevSpeed: 0,
             paramR: 0, paramW: 0,
             respR: 0, respW: 0,
-            delay: 0, lba: 0, pendingLba: 0,
+            // Start at LBA 150 (00:02:00, first data sector) like psxe
+            // (psx_cdrom_init). jam's LBA is pregap-inclusive — cueRead
+            // maps off=(lba-startLba)*SECTOR with track1 startLba=150 —
+            // so 0 would read a negative offset (zero pregap), not sector 0.
+            delay: 0, lba: 150, pendingLba: 150,
             dataRidx: 0, dataWidx: 0,
             xaLh: [0, 0],
             xaRh: [0, 0],

@@ -663,9 +663,12 @@ pub fn spuKon(s: *mut[] u8, ram: *mut[] u8, value: u32) {
             setU32(s, rt + D_CURADDR, getU16(s, vr + VR_ADSADDR) << 3);
             setU32(s, rt + D_REPADDR, getU16(s, vr + VR_ADRADDR) << 3);
             // Store volumes as signed i32 (psxe uses float; the multiplier
-            // matters more than the type).
-            setI32(s, rt + D_LVOL, getI16(s, vr + VR_VOLUMEL));
-            setI32(s, rt + D_RVOL, getI16(s, vr + VR_VOLUMER));
+            // matters more than the type). psxe scales by x2:
+            // lvol = (volumel / 32767) * 2 (spu.c:342-343). Bake the x2
+            // in here so the >>15 sample path matches reference amplitude
+            // (without it every voice plays ~6 dB too quiet).
+            setI32(s, rt + D_LVOL, getI16(s, vr + VR_VOLUMEL) * 2);
+            setI32(s, rt + D_RVOL, getI16(s, vr + VR_VOLUMER) * 2);
             setI32(s, rt + D_ASUSLVL,
                    (((getU16(s, vr + VR_ENVCTL1) & 0xF) + 1) * 0x800) as i32);
             const envctl: u32 = (getU16(s, vr + VR_ENVCTL2) << 16)

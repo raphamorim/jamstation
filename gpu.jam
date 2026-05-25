@@ -871,7 +871,10 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
     const ymin: u32 = gpuMin3(ay, by, cy);
     const xmax: u32 = gpuMax3(ax, bx, cx);
     const ymax: u32 = gpuMax3(ay, by, cy);
-    if (sext32(xmax - xmin) > 1024 || sext32(ymax - ymin) > 512) { return; }
+    // Reject only triangles wider/taller than the GPU's real limits
+    // (psxe gpu.c:265 uses 2048 / 1024). The earlier 1024/512 dropped
+    // valid large polygons.
+    if (sext32(xmax - xmin) > 2048 || sext32(ymax - ymin) > 1024) { return; }
 
     const absArea: i64 = gpuAbsI64(gpuEdge(ax, ay, bx, by, cx, cy));
     const dx1: u32 = g[48];

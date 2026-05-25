@@ -847,7 +847,11 @@ pub fn iSltu(c: mut Cpu, opc: u32, regs: *mut[] u32) {
 
 pub fn iMfc0(c: mut Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) {
     const v: u32 = cop0Read(cop0, opRd(opc));
-    if (c.loadD != opRt(opc)) { commitLoad(c, regs); }
+    // psxe's mfc0 does DO_PENDING_LOAD unconditionally (cpu.c:1209) —
+    // a prior load to this same rt commits (briefly visible) before the
+    // new delayed load is queued. The loads' `if loadD != rt` guard is
+    // a different hazard; mfc* must not share it.
+    commitLoad(c, regs);
     c.loadD = opRt(opc);
     c.loadV = v;
 }
@@ -895,15 +899,15 @@ pub fn iCop2Unimpl(c: mut Cpu, opc: u32, bus: Bus,
                    regs: *mut[] u32, cop0: *mut[] u32) {
     const rs: u32 = opRs(opc);
     if (rs == 0x00) {
-        // MFC2
-        if (c.loadD != opRt(opc)) { commitLoad(c, regs); }
+        // MFC2 — unconditional pending-load commit, like psxe (cpu.c:1449).
+        commitLoad(c, regs);
         c.loadD = opRt(opc);
         c.loadV = gteDataRead(bus.gte, opRd(opc));
         return;
     }
     if (rs == 0x02) {
-        // CFC2
-        if (c.loadD != opRt(opc)) { commitLoad(c, regs); }
+        // CFC2 — unconditional pending-load commit, like psxe (cpu.c:1458).
+        commitLoad(c, regs);
         c.loadD = opRt(opc);
         c.loadV = gteCtrlRead(bus.gte, opRd(opc));
         return;
@@ -1213,6 +1217,16 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     // handler runs 1 instruction ahead of psxe (divergence verified
     // via REG_TRACE diff against Harvest Moon at L=19258536).
     if (cpuIrqPending(cop0)) {
+        // psxe quirk: a COP2 (GTE) math op "wins" over a pending IRQ —
+        // it executes before the interrupt is taken, and because EPC
+        // points back at it, it re-runs after the handler returns
+        // (cpu.c:323-358). Match by executing the op here when the
+        // instruction about to run (at c.pc == savedPc) is a GTE math
+        // op: primary 0x12 with the COP2 command bit set (0x4A......).
+        const irqOpc: u32 = busRead32(bus, c.pc);
+        if ((irqOpc & 0xFE000000) == 0x4A000000) {
+            gteExec(bus.gte, irqOpc);
+        }
         c.pc = c.nextPc;
         c.nextPc = c.nextPc + 4;
         raiseException(c, cop0, CAUSE_INT);
