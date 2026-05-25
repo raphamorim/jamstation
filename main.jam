@@ -45,7 +45,7 @@ const {
 } = import("sdl");
 const { Vec } = import("std").collections;
 const { File, exists } = import("std/fs");
-const { Args, args, next } = import("std").process;
+const { Args, args, next, exit } = import("std").process;
 
 extern fn malloc(size: u64) *mut[] u8;
 extern fn free(ptr: *mut[] u8);
@@ -480,16 +480,17 @@ fn main() {
     cop0Write(cop0, C0_SR,   0x10900000);
     cop0Write(cop0, C0_PRID, 0x00000002);
 
-    // CLI:  jamstation [BIOS_PATH] [GAME_PATH]
-    //   argv[1] = BIOS image (else ./SCPH1001.BIN)
+    // CLI:  jamstation <BIOS_PATH> [GAME_PATH]
+    //   argv[1] = BIOS image — REQUIRED, no default.
     //   argv[2] = optional game image: a .cue/.bin disc or a .exe
     //             (dispatched below). When omitted, the fixed ./game.*
     //             / ./demo.exe names in the cwd are used as a fallback.
-    var biosPath: []u8 = "./SCPH1001.BIN";
+    var biosPath: []u8 = "";
+    var hasBios: bool = false;
     var argsIt: Args = args();
     next(argsIt);                       // skip argv[0] (the program path)
     match (next(argsIt)) {
-        Some(arg) { biosPath = arg; }
+        Some(arg) { biosPath = arg; hasBios = true; }
         None { }
     }
     var gameArg: []u8 = "";
@@ -498,15 +499,24 @@ fn main() {
         Some(arg) { gameArg = arg; hasGameArg = true; }
         None { }
     }
-    if (fileExists(biosPath)) {
-        const got: u64 = loadBios(biosPath, bus);
-        var fmt: []u8 = "Loaded BIOS: %llu bytes from %.*s\n";
-        printf(fmt.ptr, got, biosPath.len as i32, biosPath.ptr);
-        flushAll();
-    } else {
-        var msg: []u8 = "No BIOS at the given path — booting from EXE only\n";
+    // A BIOS image is required — there is no default. Bail with a usage
+    // message instead of silently booting to a black screen.
+    if (!hasBios) {
+        var msg: []u8 = "error: no BIOS image given\nusage: jamstation <BIOS_PATH> [GAME_PATH]\n";
         write(STDOUT, msg.ptr, msg.len);
+        flushAll();
+        exit(1);
     }
+    if (!fileExists(biosPath)) {
+        var fmt: []u8 = "error: BIOS file not found: %.*s\n";
+        printf(fmt.ptr, biosPath.len as i32, biosPath.ptr);
+        flushAll();
+        exit(1);
+    }
+    const got: u64 = loadBios(biosPath, bus);
+    var biosFmt: []u8 = "Loaded BIOS: %llu bytes from %.*s\n";
+    printf(biosFmt.ptr, got, biosPath.len as i32, biosPath.ptr);
+    flushAll();
 
     // EXE side-load. If `./demo.exe` exists we drop it into RAM and jump
     // straight to its entry point (skipping the BIOS boot animation —

@@ -20,7 +20,6 @@
 
 const { cueAlloc, cueFree, cueParse, cueRead, cueQuery,
         cueGetTrackCount } = import("cue");
-const { print } = import("std").fmt;
 
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
@@ -89,11 +88,8 @@ pub fn discOpen(d: *mut[] Disc, path: []u8) i32 {
         d[0].cuePtr = c;
         d[0].isCue = 1;
         d[0].loaded = 1;
-        var fmt: []u8 = "Opened CUE: %s (%u tracks)\n";
-        const fmtAddress = fmt.ptr as u64;
-        const pathAddress = path.ptr as u64;
-        const trackCount = cueGetTrackCount(c);
-        print("{fmtAddress} {pathAddress} {trackCount}\n");
+        var fmt: []u8 = "Opened CUE: %.*s (%u tracks)\n";
+        printf(fmt.ptr, path.len as i32, path.ptr, cueGetTrackCount(c));
         return 1;
     }
     match (File.open(path)) {
