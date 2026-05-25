@@ -251,14 +251,16 @@ pub const Timer = struct {
         const prevCounter: u32 = self.channels[idx].counter;
         // Timer 2 with clk_source >= 2 ticks at sysclk/8. We
         // accumulate sub-cycles in `subtick` and add whole /8
-        // increments to the clean 16-bit counter so reads return a
-        // value the game can compare against `target` without
-        // garbage bits.
+        // increments to the counter. Keep the full 32-bit width (not
+        // & 0xFFFF) so handleIrq can see counter > 0xFFFF and raise the
+        // FFFF-overflow (maxReached / irqMax) — psxe leaves the counter
+        // unmasked here (timer.c:332). handleIrq snaps it back to 0 on
+        // overflow, so reads still observe a clean 16-bit value.
         if (idx == 2 && self.channels[idx].clkSource >= 2) {
             const acc: u32 = self.subtick + cyc;
             const incr: u32 = acc >> 3;
             self.subtick = acc & 7;
-            self.channels[idx].counter = (self.channels[idx].counter + incr) & 0xFFFF;
+            self.channels[idx].counter = (self.channels[idx].counter + incr) & 0xFFFFFFFF;
         } else {
             self.channels[idx].counter = (self.channels[idx].counter + cyc) & 0xFFFFFFFF;
         }
@@ -288,8 +290,10 @@ pub const Timer = struct {
 
         if ((self.channels[1].clkSource & 1) != 0 &&
             self.channels[1].paused == 0) {
+            // Full-width add (not & 0xFFFF) so the 0xFFFF→0x10000 wrap
+            // is visible to handleIrq's overflow check; it resets to 0.
             self.channels[1].counter =
-                (self.channels[1].counter + 1) & 0xFFFF;
+                (self.channels[1].counter + 1) & 0xFFFFFFFF;
             self.handleIrq(1, ic, cop0);
         }
 
