@@ -44,7 +44,7 @@ const {
     sdlAudioOpen, sdlAudioClose
 } = import("sdl");
 const { Vec } = import("std").collections;
-const { File } = import("std/fs");
+const { File, exists } = import("std/fs");
 const { Args, args, next } = import("std").process;
 
 extern fn malloc(size: u64) *mut[] u8;
@@ -53,10 +53,10 @@ extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 extern fn printf(format: *const[] u8, ...) i32;
 extern fn write(fd: i32, buf: *const[] u8, count: u64) i64;
 extern fn putchar(c: i32) i32;
-// fopen / fclose / fread / fseek now come from std/fs (imported above).
-extern fn access(path: *const[] u8, mode: i32) i32;
+// File I/O (fopen/fread/fwrite/fclose/fseek/access) comes from std/fs
+// (imported above) — loadExe/dumpVramPpm/fileExists resolve those there.
+// fflush stays: it flushes stdout buffers, not a file.
 extern fn fflush(stream: u64) i32;
-extern fn fwrite(buf: *const[] u8, size: u64, n: u64, file: *mut[] u8) u64;
 
 // SDL2 externs need to be re-declared here so the codegen for sdl.jam's
 // pub wrappers (which lives in this module's compilation context) can
@@ -92,12 +92,12 @@ extern fn SDL_GetQueuedAudioSize(dev: u32) u32;
 const STDOUT: i32 = 1;
 
 fn fileExists(path: []u8) bool {
-    return access(path.ptr, 0) == 0;
+    return exists(path);
 }
 
 // Locally-redeclared shapes matching bus.jam / cpu.jam / sdl.jam.
 const Disc = struct {
-    file: *mut[] u8,
+    file: File,
     loaded: u8,
     isCue: u8,
     pad1: u8,
@@ -216,52 +216,58 @@ fn readU32At(buf: *mut[] u8, off: u32) u32 {
 }
 
 fn loadExe(path: []u8, bus: Bus, regs: *mut[] u32, c: mut Cpu) {
-    var modeRb: []u8 = "rb";
-    var f: *mut[] u8 = fopen(path.ptr, modeRb.ptr);
-    // 0x800 = 2 KB PSX-EXE header (fixed by the platform). Array
-    // literal [0; N] already zero-fills; no memset needed.
-    var hdr: [2048]u8 = [0; 2048];
-    const hdrBytes: u64 = fread(hdr.asMutPtr(), 1, 0x800, f);
-    if (hdrBytes < 0x800) {
-        fclose(f);
-        var msg: []u8 = "loadExe: header read failed\n";
-        write(STDOUT, msg.ptr, msg.len);
-        return;
-    }
+    match (File.open(path)) {
+        Some(f) {
+            // 0x800 = 2 KB PSX-EXE header (fixed by the platform). The
+            // [0; N] array literal already zero-fills; no memset needed.
+            var hdr: [2048]u8 = [0; 2048];
+            var hp: *mut[] u8 = hdr.asMutPtr();
+            const hdrBytes: u64 = f.read(hp[0..0x800]);
+            if (hdrBytes < 0x800) {
+                f.close();
+                var msg: []u8 = "loadExe: header read failed\n";
+                write(STDOUT, msg.ptr, msg.len);
+                return;
+            }
 
-    const initPc:  u32 = readU32At(hdr.asMutPtr(), 0x10);
-    const initGp:  u32 = readU32At(hdr.asMutPtr(), 0x14);
-    const ramDest: u32 = readU32At(hdr.asMutPtr(), 0x18);
-    const fileSz:  u32 = readU32At(hdr.asMutPtr(), 0x1C);
-    const spBase:  u32 = readU32At(hdr.asMutPtr(), 0x30);
-    const spOff:   u32 = readU32At(hdr.asMutPtr(), 0x34);
+            const initPc:  u32 = readU32At(hdr.asMutPtr(), 0x10);
+            const initGp:  u32 = readU32At(hdr.asMutPtr(), 0x14);
+            const ramDest: u32 = readU32At(hdr.asMutPtr(), 0x18);
+            const fileSz:  u32 = readU32At(hdr.asMutPtr(), 0x1C);
+            const spBase:  u32 = readU32At(hdr.asMutPtr(), 0x30);
+            const spOff:   u32 = readU32At(hdr.asMutPtr(), 0x34);
 
-    // Body is runtime-sized (length from the header), so stays Vec.
-    // Copy byte-by-byte into RAM: Jam doesn't have pointer arithmetic
-    // on many-item pointers, so we stream through a temp buffer.
-    var body: Vec(u8) = Vec(u8).withCapacity(fileSz);
-    fread(body.ptr, 1, fileSz as u64, f);
-    const dst: u32 = ramDest & 0x001FFFFF;
-    var ram: *mut[] u8 = busRamPtr(bus);
-    var i: u32 = 0;
-    while (i < fileSz) {
-        ram[dst + i] = body[i];
-        i = i + 1;
-    }
-    fclose(f);
-    // body auto-drops at scope exit; hdr is stack-allocated.
-    c.pc = initPc;
-    c.nextPc = c.pc + 4;
-    gprWrite(regs, 28, initGp);
-    if (spBase != 0) {
-        const sp: u32 = spBase + spOff;
-        gprWrite(regs, 29, sp);
-        gprWrite(regs, 30, sp);
-    }
+            // Body is runtime-sized (length from the header). Read into a
+            // Vec(u8), then stream byte-by-byte into RAM.
+            var body: Vec(u8) = Vec(u8).withCapacity(fileSz);
+            var bp: *mut[] u8 = body.ptr;
+            f.read(bp[0..fileSz]);
+            const dst: u32 = ramDest & 0x001FFFFF;
+            var ram: *mut[] u8 = busRamPtr(bus);
+            var i: u32 = 0;
+            while (i < fileSz) {
+                ram[dst + i] = body[i];
+                i = i + 1;
+            }
+            f.close();
+            c.pc = initPc;
+            c.nextPc = c.pc + 4;
+            gprWrite(regs, 28, initGp);
+            if (spBase != 0) {
+                const sp: u32 = spBase + spOff;
+                gprWrite(regs, 29, sp);
+                gprWrite(regs, 30, sp);
+            }
 
-    var fmt: []u8 = "Loaded EXE: PC=%08X SP=%08X GP=%08X size=%u dest=%08X\n";
-    printf(fmt.ptr, c.pc, gprRead(regs, 29), gprRead(regs, 28),
-           fileSz, ramDest);
+            var fmt: []u8 = "Loaded EXE: PC=%08X SP=%08X GP=%08X size=%u dest=%08X\n";
+            printf(fmt.ptr, c.pc, gprRead(regs, 29), gprRead(regs, 28),
+                   fileSz, ramDest);
+        }
+        None {
+            var msg: []u8 = "loadExe: cannot open file\n";
+            write(STDOUT, msg.ptr, msg.len);
+        }
+    }
 }
 
 // Load the 512 KB BIOS image into bus BIOS memory via std.fs. The
@@ -390,35 +396,39 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
 // we can confirm what the BIOS/game actually rendered without staring
 // at the SDL window.
 fn dumpVramPpm(path: []u8, vram: *mut[] u8) {
-    var modeWb: []u8 = "wb";
-    var f: *mut[] u8 = fopen(path.ptr, modeWb.ptr);
-    var hdr: []u8 = "P6\n1024 512\n255\n";
-    fwrite(hdr.ptr, 1, hdr.len, f);
-    // 3072 = 1024 px × 3 bytes (RGB24). VRAM width is fixed.
-    var row: [3072]u8 = [0; 3072];
-    var y: u32 = 0;
-    while (y < 512) {
-        var x: u32 = 0;
-        while (x < 1024) {
-            const off: u32 = (y * 1024 + x) * 2;
-            const lo: u32 = vram[off] as u32;
-            const hi: u32 = vram[off + 1] as u32;
-            const px: u32 = lo | (hi << 8);
-            const r: u32 = ((px      ) & 0x1F) << 3;
-            const g: u32 = ((px >> 5 ) & 0x1F) << 3;
-            const b: u32 = ((px >> 10) & 0x1F) << 3;
-            const di: u32 = x * 3;
-            row[di]     = r as u8;
-            row[di + 1] = g as u8;
-            row[di + 2] = b as u8;
-            x = x + 1;
+    match (File.create(path)) {
+        Some(f) {
+            var hdr: []u8 = "P6\n1024 512\n255\n";
+            f.write(hdr);
+            // 3072 = 1024 px × 3 bytes (RGB24). VRAM width is fixed.
+            var row: [3072]u8 = [0; 3072];
+            var y: u32 = 0;
+            while (y < 512) {
+                var x: u32 = 0;
+                while (x < 1024) {
+                    const off: u32 = (y * 1024 + x) * 2;
+                    const lo: u32 = vram[off] as u32;
+                    const hi: u32 = vram[off + 1] as u32;
+                    const px: u32 = lo | (hi << 8);
+                    const r: u32 = ((px      ) & 0x1F) << 3;
+                    const g: u32 = ((px >> 5 ) & 0x1F) << 3;
+                    const b: u32 = ((px >> 10) & 0x1F) << 3;
+                    const di: u32 = x * 3;
+                    row[di]     = r as u8;
+                    row[di + 1] = g as u8;
+                    row[di + 2] = b as u8;
+                    x = x + 1;
+                }
+                var rp: *const[] u8 = row.asPtr();
+                f.write(rp[0..3072]);
+                y = y + 1;
+            }
+            f.close();
+            var msg: []u8 = "Wrote VRAM dump: %.*s\n";
+            printf(msg.ptr, path.len as i32, path.ptr);
         }
-        fwrite(row.asPtr(), 1, 1024 * 3, f);
-        y = y + 1;
+        None { }
     }
-    fclose(f);
-    var msg: []u8 = "Wrote VRAM dump: %s\n";
-    printf(msg.ptr, path.ptr);
 }
 
 // ---------- main --------------------------------------------------------
@@ -440,7 +450,7 @@ fn main() {
     // back to the same file so saves survive across runs. Mirrors
     // psxe's psx_mcd_init / psx_mcd_destroy lifecycle.
     var mcdPath: []u8 = "./slot1.mcd";
-    if (mcdRamLoad(bus.mcdRam, mcdPath) != 0) {
+    if (mcdRamLoad(bus.mcdRam, mcdPath)) {
         var loadMsg: []u8 = "Loaded memcard: ./slot1.mcd\n";
         write(STDOUT, loadMsg.ptr, loadMsg.len);
     }

@@ -25,18 +25,15 @@ const { print } = import("std").fmt;
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
 pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
-pub extern fn fopen(path: *const[] u8, mode: *const[] u8) *mut[] u8;
-pub extern fn fclose(file: *mut[] u8) i32;
-pub extern fn fread(buf: *mut[] u8, size: u64, n: u64, file: *mut[] u8) u64;
-pub extern fn fseek(file: *mut[] u8, off: i64, whence: i32) i32;
 pub extern fn printf(format: *const[] u8, ...) i32;
-pub extern fn access(path: *const[] u8, mode: i32) i32;
+// File I/O exclusively via std.fs — no raw libc file ABI in this module.
+const { File, exists } = import("std/fs");
 
 const SECTOR_SIZE: u32 = 2352;
 const LEAD_IN_SECTORS: u32 = 150;
 
 const Disc = struct {
-    file: *mut[] u8,   // libc FILE* (opaque) — set when raw .bin loaded
+    file: File,        // std.fs.File — valid when a raw .bin is loaded
     loaded: u8,        // 1 once discOpen succeeds
     isCue: u8,         // 1 if cue-loaded (cuePtr is valid)
     pad1: u8,
@@ -56,7 +53,7 @@ pub fn discFree(d: *mut[] Disc) {
     if (d[0].isCue != 0) {
         cueFree(d[0].cuePtr);
     } else if (d[0].loaded != 0) {
-        fclose(d[0].file);
+        d[0].file.close();
     }
     free(d as *mut[] u8);
 }
@@ -83,10 +80,9 @@ pub fn pathEndsWithCue(p: []u8) bool {
 // opens its own .bin files); everything else is treated as a raw
 // single-track Mode2/2352 .bin.
 pub fn discOpen(d: *mut[] Disc, path: []u8) i32 {
-    if (access(path.ptr, 4) != 0) { return 0; }
     if (pathEndsWithCue(path)) {
         var c: *mut[] u8 = cueAlloc();
-        if (cueParse(c, path.ptr) != 0) {
+        if (cueParse(c, path) != 0) {
             cueFree(c);
             return 0;
         }
@@ -100,13 +96,17 @@ pub fn discOpen(d: *mut[] Disc, path: []u8) i32 {
         print("{fmtAddress} {pathAddress} {trackCount}\n");
         return 1;
     }
-    var mode: []u8 = "rb";
-    var f: *mut[] u8 = fopen(path.ptr, mode.ptr);
-    d[0].file = f;
-    d[0].loaded = 1;
-    var fmt: []u8 = "Opened disc image: %s\n";
-    printf(fmt.ptr, path.ptr);
-    return 1;
+    match (File.open(path)) {
+        Some(f) {
+            d[0].file = f;
+            d[0].loaded = 1;
+            var fmt: []u8 = "Opened disc image: %.*s\n";
+            printf(fmt.ptr, path.len as i32, path.ptr);
+            return 1;
+        }
+        None { return 0; }
+    }
+    return 0;
 }
 
 // Read one 2352-byte sector at `lba` (absolute, including lead-in) into
@@ -131,8 +131,9 @@ pub fn discRead(d: *mut[] Disc, lba: u32, buf: *mut[] u8) i32 {
         return 1;
     }
     const off: i64 = ((lba - LEAD_IN_SECTORS) as i64) * (SECTOR_SIZE as i64);
-    fseek(d[0].file, off, 0);
-    const got: u64 = fread(buf, 1, SECTOR_SIZE as u64, d[0].file);
+    var f: File = d[0].file;
+    f.seek(off, 0);
+    const got: u64 = f.read(buf[0..SECTOR_SIZE]);
     if (got != SECTOR_SIZE as u64) { return 0; }
     return 1;
 }

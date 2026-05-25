@@ -21,15 +21,8 @@
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
 pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
-pub extern fn fopen(path: *const[] u8, mode: *const[] u8) *mut[] u8;
-pub extern fn fclose(file: *mut[] u8) i32;
-pub extern fn fread(buf: *mut[] u8, size: u64, n: u64, file: *mut[] u8) u64;
-pub extern fn fseek(file: *mut[] u8, off: i64, whence: i32) i32;
-pub extern fn ftell(file: *mut[] u8) i64;
-pub extern fn fgetc(file: *mut[] u8) i32;
-pub extern fn feof(file: *mut[] u8) i32;
-pub extern fn access(path: *const[] u8, mode: i32) i32;
-pub extern fn realpath(path: *const[] u8, resolved: *mut[] u8) *mut[] u8;
+// All file I/O goes through std.fs — no raw libc file ABI in this module.
+const { File, exists, canonicalize } = import("std/fs");
 
 // Track-mode enum (psxe cue.h subset we actually use).
 pub const TRACK_MODE_UNKNOWN: u32 = 0;
@@ -49,7 +42,7 @@ pub const SECTOR:     u32 = 2352;
 // Internal types — not exported (other modules treat Cue as an opaque
 // `*mut[] u8` blob and use the cueXxx functions to interact).
 pub const CueFile = struct {
-    file:     *mut[] u8,    // libc FILE* (opaque)
+    file:     File,         // std.fs.File handle
     sectors:  u32,          // file_size / SECTOR
     startLba: u32,          // LBA where this file's sector 0 lands
     pathLo:   u32,          // path stored separately, see Cue.pathBuf
@@ -76,8 +69,8 @@ pub const Cue = struct {
     pathBuf:   *mut[] u8,
     pathBufLen: u32,
     pathBufCap: u32,
-    // Parser scratch state (psxe-style fgetc loop).
-    file:      *mut[] u8,
+    // Parser scratch state (psxe-style readByte loop).
+    file:      File,
     cur:       u32,         // current character (sentinel-extended)
     rootPath:  *mut[] u8,   // directory of the .cue, used to resolve BIN paths
     rootLen:   u32,
@@ -115,10 +108,10 @@ pub fn parseMsf(raw: *mut[] u8) u32 {
     if (!isDigit(c[0].cur)) { return 0; }
     const m: u32 = parseNumber(raw);
     if (c[0].cur != 0x3A) { return 0; }     // ':'
-    c[0].cur = fgetc(c[0].file) as u32 & 0xFF;
+    c[0].cur = c[0].file.readByte() as u32 & 0xFF;
     const s: u32 = parseNumber(raw);
     if (c[0].cur != 0x3A) { return 0; }
-    c[0].cur = fgetc(c[0].file) as u32 & 0xFF;
+    c[0].cur = c[0].file.readByte() as u32 & 0xFF;
     const f: u32 = parseNumber(raw);
     return f + (s * 75) + (m * 4500);
 }
@@ -128,15 +121,15 @@ pub fn parseNumber(raw: *mut[] u8) u32 {
     var n: u32 = 0;
     while (isDigit(c[0].cur)) {
         n = n * 10 + (c[0].cur - 0x30);
-        c[0].cur = fgetc(c[0].file) as u32 & 0xFF;
+        c[0].cur = c[0].file.readByte() as u32 & 0xFF;
     }
     return n;
 }
 
 pub fn skipWs(raw: *mut[] u8) {
     var c: *mut[] Cue = raw as *mut[] Cue;
-    while (isSpace(c[0].cur) && feof(c[0].file) == 0) {
-        c[0].cur = fgetc(c[0].file) as u32 & 0xFF;
+    while (isSpace(c[0].cur) && !c[0].file.eof()) {
+        c[0].cur = c[0].file.readByte() as u32 & 0xFF;
     }
 }
 
@@ -148,7 +141,7 @@ pub fn parseKeyword(raw: *mut[] u8, buf: *mut[] u8) u32 {
            && n < 15) {
         buf[n] = c[0].cur as u8;
         n = n + 1;
-        c[0].cur = fgetc(c[0].file) as u32 & 0xFF;
+        c[0].cur = c[0].file.readByte() as u32 & 0xFF;
     }
     buf[n] = 0;
     return n;
@@ -212,7 +205,7 @@ pub fn cueFree(raw: *mut[] u8) {
     var i: u32 = 0;
     while (i < c[0].fileCount) {
         if (c[0].files[i].sectors != 0) {
-            fclose(c[0].files[i].file);
+            c[0].files[i].file.close();
         }
         i = i + 1;
     }
@@ -365,8 +358,9 @@ pub fn cueRead(raw: *mut[] u8, lba: u32, buf: *mut[] u8) i32 {
         while (j < 11) { buf[j] = 0xFF; j = j + 1; }
         return 1;
     }
-    fseek(c[0].files[fi].file, off, 0);
-    const got: u64 = fread(buf, 1, SECTOR as u64, c[0].files[fi].file);
+    var tf: File = c[0].files[fi].file;
+    tf.seek(off, 0);
+    const got: u64 = tf.read(buf[0..SECTOR]);
     if (got != SECTOR as u64) { return 0; }
     return 1;
 }
@@ -390,13 +384,13 @@ pub fn cueQuery(raw: *mut[] u8, lba: u32) u32 {
 // Stream the .cue text char-by-char (psxe's fgetc model). Each keyword
 // dispatches to its handler; FILE pushes onto files[], TRACK pushes
 // onto tracks[] with the most recent file, INDEX records its MSF.
-pub fn cueParse(raw: *mut[] u8, path: *const[] u8) i32 {
+pub fn cueParse(raw: *mut[] u8, path: []u8) i32 {
     var c: *mut[] Cue = raw as *mut[] Cue;
-    var rb: []u8 = "rb";
-    c[0].file = fopen(path, rb.ptr);
-    var afmt: []u8 = "rb";
-    if (access(path, 4) != 0) { return 1; }
-    c[0].cur = fgetc(c[0].file) as u32 & 0xFF;
+    match (File.open(path)) {
+        Some(opened) { c[0].file = opened; }
+        None { return 1; }
+    }
+    c[0].cur = c[0].file.readByte() as u32 & 0xFF;
     // Resolve any symlinks in the .cue path so the rootPath we extract is
     // the directory of the actual file. Without this, a symlinked
     // `./game.cue` whose target lives elsewhere produces rootPath="./",
@@ -416,7 +410,7 @@ pub fn cueParse(raw: *mut[] u8, path: *const[] u8) i32 {
         resolved[pi] = path[pi];
         pi = pi + 1;
     }
-    realpath(path, resolved.asMutPtr());
+    canonicalize(path, resolved.asMutPtr());
     // Compute root path = resolved path up to last '/' or '\\'.
     var i: u32 = 0;
     var lastSlash: u32 = 0;
@@ -437,7 +431,7 @@ pub fn cueParse(raw: *mut[] u8, path: *const[] u8) i32 {
     // plus a little slack; parseKeyword bounds itself to this size.
     var kwbuf: [16]u8 = [0; 16];
 
-    while (feof(c[0].file) == 0) {
+    while (!c[0].file.eof()) {
         const kn: u32 = parseKeyword(raw, kwbuf.asMutPtr());
         if (kn == 0) { break; }
         const kw: u32 = kwId(kwbuf.asMutPtr());
@@ -450,14 +444,14 @@ pub fn cueParse(raw: *mut[] u8, path: *const[] u8) i32 {
         } else {
             // REM / PREGAP / POSTGAP / FLAGS — skip to end of line.
             while (c[0].cur != 0x0A && c[0].cur != 0x0D
-                   && feof(c[0].file) == 0) {
-                c[0].cur = fgetc(c[0].file) as u32 & 0xFF;
+                   && !c[0].file.eof()) {
+                c[0].cur = c[0].file.readByte() as u32 & 0xFF;
             }
         }
         skipWs(raw);
     }
     // kwbuf / resolved auto-drop at function-scope exit.
-    fclose(c[0].file);
+    c[0].file.close();
     cueComputeRanges(raw);
     return 0;
 }
@@ -467,7 +461,7 @@ pub fn cueParseFile(raw: *mut[] u8) {
     var c: *mut[] Cue = raw as *mut[] Cue;
     skipWs(raw);
     if (c[0].cur != 0x22) { return; }       // expect '"'
-    c[0].cur = fgetc(c[0].file) as u32 & 0xFF;
+    c[0].cur = c[0].file.readByte() as u32 & 0xFF;
 
     // 512 bytes covers any realistic path made of rootPath + name.
     // Loop below bounds itself to 510 to leave room for NUL.
@@ -478,30 +472,33 @@ pub fn cueParseFile(raw: *mut[] u8) {
         nameBuf[ni] = c[0].rootPath[ni];
         ni = ni + 1;
     }
-    while (c[0].cur != 0x22 && feof(c[0].file) == 0 && ni < 510) {
+    while (c[0].cur != 0x22 && !c[0].file.eof() && ni < 510) {
         nameBuf[ni] = c[0].cur as u8;
         ni = ni + 1;
-        c[0].cur = fgetc(c[0].file) as u32 & 0xFF;
+        c[0].cur = c[0].file.readByte() as u32 & 0xFF;
     }
     nameBuf[ni] = 0;
-    c[0].cur = fgetc(c[0].file) as u32 & 0xFF;     // consume closing '"'
+    c[0].cur = c[0].file.readByte() as u32 & 0xFF;     // consume closing '"'
 
     // Skip type keyword (BINARY / WAVE / etc.) — we only treat as binary.
-    while (isSpace(c[0].cur)) { c[0].cur = fgetc(c[0].file) as u32 & 0xFF; }
-    while (isAlpha(c[0].cur)) { c[0].cur = fgetc(c[0].file) as u32 & 0xFF; }
+    while (isSpace(c[0].cur)) { c[0].cur = c[0].file.readByte() as u32 & 0xFF; }
+    while (isAlpha(c[0].cur)) { c[0].cur = c[0].file.readByte() as u32 & 0xFF; }
 
     if (c[0].fileCount >= MAX_FILES) { return; }
-    var rb: []u8 = "rb";
-    var f: *mut[] u8 = fopen(nameBuf.asPtr(), rb.ptr);
-    if (access(nameBuf.asPtr(), 4) != 0) { return; }
-    // Size by seeking to end.
-    fseek(f, 0, 2);
-    const sz: i64 = ftell(f);
-    fseek(f, 0, 0);
-    const fi: u32 = c[0].fileCount;
-    c[0].files[fi].file = f;
-    c[0].files[fi].sectors = (sz as u32) / SECTOR;
-    c[0].fileCount = fi + 1;
+    // nameBuf is a NUL-terminated path of length `ni`; view it as []u8.
+    var namePtr: *const[] u8 = nameBuf.asPtr();
+    var nameSlice: []u8 = namePtr[0..ni];
+    if (!exists(nameSlice)) { return; }
+    match (File.open(nameSlice)) {
+        Some(f) {
+            const sz: u64 = f.size();
+            const fi: u32 = c[0].fileCount;
+            c[0].files[fi].file = f;
+            c[0].files[fi].sectors = (sz as u32) / SECTOR;
+            c[0].fileCount = fi + 1;
+        }
+        None { return; }
+    }
     // nameBuf auto-drops on function-scope exit.
 }
 
