@@ -48,6 +48,13 @@ pub fn xaNegCoef(idx: u32) i32 {
     return -60;
 }
 
+// Wrap to int16 (psxe XA reconstruction truncates, not saturates;
+// audio.c:99 assigns the sum to int16_t). xaClampI16 is kept for the
+// output-mix path which legitimately saturates.
+pub fn xaWrap16(v: i32) i32 {
+    return ((v & 0xFFFF) ^ 0x8000) - 0x8000;
+}
+
 pub fn xaClampI16(v: i32) i32 {
     if (v < -32768) { return -32768; }
     if (v >  32767) { return  32767; }
@@ -114,7 +121,8 @@ pub fn xaDecodeBlock(secBuf: *mut[] u8,
         const old: i32 = (t << 12) >> 12;
         const shifted: i32 = old << shift;
         const pred: i32 = (f0 * hist[0] + f1 * hist[1] + 32) / 64;
-        const s: i32 = xaClampI16(shifted + pred);
+        // psxe wraps to int16 here, not saturates (audio.c:99).
+        const s: i32 = xaWrap16(shifted + pred);
         hist[1] = hist[0];
         hist[0] = s;
         dst[j] = s;

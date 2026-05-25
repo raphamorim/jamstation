@@ -27,7 +27,8 @@
 // then.
 
 const { irqRaise, IC_CDROM } = import("irq");
-const { discRead, discLoaded } = import("disc");
+const { discRead, discLoaded,
+        discTrackCount, discTrackLba, discTrackNumber, discQuery } = import("disc");
 const {
     xaSectorIsAudio, xaSectorMatchesFilter, xaSectorIsStereo,
     xaDecodeSector
@@ -110,6 +111,7 @@ const CD_ERR_NO_DISC:          u32 = 0x80;
 const CD_ERR_INVALID_COMMAND:  u32 = 0x40;
 const CD_ERR_WRONG_PARAM_CNT:  u32 = 0x20;
 const CD_ERR_INVALID_SUBFUNC:  u32 = 0x10;
+const CD_ERR_SEEK_FAILED:      u32 = 0x04;
 
 // CD-ROM controller state. Each field replaces a named byte offset from
 // the old buffer-based layout. Two 32-byte FIFOs (param / resp) ride
@@ -431,7 +433,8 @@ pub const Cdrom = struct {
             self.ifr = 3;
             self.pushResp(self.getStat());
             self.state = CD_STATE_TX_RESP2 as u8;
-            self.seekPrec = 1;
+            // seek_precision is set in resp2 on success, like psxe — not
+            // here in resp1.
             self.delay = CD_DELAY_FR;
             return;
         }
@@ -486,19 +489,28 @@ pub const Cdrom = struct {
         }
         if (cmd == CDL_GETLOCP) {
             self.ifr = 3;
-            const lba: u32 = self.lba;
-            const trackLba: u32 = 150;
-            var rel: i32 = (lba as i32) - (trackLba as i32);
-            if (self.seekPrec == 0) { rel = rel - 25; }
-            if (rel < 0) { rel = -rel; }
-            const rmm: u32 = (rel as u32) / (60 * 75);
-            const rss: u32 = ((rel as u32) % (60 * 75)) / 75;
-            const rff: u32 = ((rel as u32) % (60 * 75)) % 75;
-            const amm: u32 = lba / (60 * 75);
-            const ass: u32 = (lba % (60 * 75)) / 75;
-            const aff: u32 = (lba % (60 * 75)) % 75;
-            self.pushResp(bcdEnc(1));
-            self.pushResp(bcdEnc(1));
+            // psxe cdrom_cmd_getlocp (impl.c:418-459): track/index from
+            // the disc; subtract the 25-sector seek slop FIRST, then derive
+            // both the relative (within-track) and absolute MSF from it.
+            const lbaRaw: u32 = self.lba;
+            const track: u32 = discTrackNumber(disc, lbaRaw);
+            const trackLba: u32 = discTrackLba(disc, track);
+            var lba: i32 = lbaRaw as i32;
+            if (self.seekPrec == 0) { lba = lba - 25; }
+            var diff: i32 = lba - (trackLba as i32);
+            if (diff < 0) { diff = -diff; }
+            const du: u32 = diff as u32;
+            const lu: u32 = lba as u32;
+            const rmm: u32 = du / (60 * 75);
+            const rss: u32 = (du % (60 * 75)) / 75;
+            const rff: u32 = (du % (60 * 75)) % 75;
+            const amm: u32 = lu / (60 * 75);
+            const ass: u32 = (lu % (60 * 75)) / 75;
+            const aff: u32 = (lu % (60 * 75)) % 75;
+            var index: u32 = 1;
+            if (discQuery(disc, lbaRaw) == 2) { index = 0; }   // TS_PREGAP
+            self.pushResp(bcdEnc(track));
+            self.pushResp(bcdEnc(index));
             self.pushResp(bcdEnc(rmm));
             self.pushResp(bcdEnc(rss));
             self.pushResp(bcdEnc(rff));
@@ -509,10 +521,11 @@ pub const Cdrom = struct {
             return;
         }
         if (cmd == CDL_GETTN) {
+            // psxe: stat, first-track = 1 (raw), last = ITOB(track count).
             self.ifr = 3;
             self.pushResp(self.getStat());
-            self.pushResp(bcdEnc(1));
-            self.pushResp(bcdEnc(1));
+            self.pushResp(1);
+            self.pushResp(bcdEnc(discTrackCount(disc)));
             self.state = self.prevState;
             return;
         }
@@ -522,10 +535,20 @@ pub const Cdrom = struct {
                 self.errorOut(CD_STAT_SPINDLE, CD_ERR_INVALID_SUBFUNC);
                 return;
             }
+            // psxe cdrom_cmd_gettd: look up the track's absolute LBA →
+            // MM:SS; INT5 if past the last track (TS_FAR = 0xFFFFFFFF here).
+            const track: u32 = (bcd & 0x0F) + ((bcd >> 4) & 0x0F) * 10;
+            const f: u32 = discTrackLba(disc, track);
+            if (f == 0xFFFFFFFF) {
+                self.errorOut(CD_STAT_SPINDLE, CD_ERR_INVALID_SUBFUNC);
+                return;
+            }
             self.ifr = 3;
+            const mm: u32 = f / (60 * 75);
+            const ss: u32 = (f % (60 * 75)) / 75;
             self.pushResp(self.getStat());
-            self.pushResp(bcdEnc(0));
-            self.pushResp(bcdEnc(2));
+            self.pushResp(bcdEnc(mm));
+            self.pushResp(bcdEnc(ss));
             self.state = self.prevState;
             return;
         }
@@ -612,7 +635,7 @@ pub const Cdrom = struct {
 
     // Second-phase response for two-stage commands (Init / GetID /
     // Seek / Pause).
-    pub fn executeResp2(self: mut Self) {
+    pub fn executeResp2(self: mut Self, disc: *mut[] Disc) {
         const cmd: u32 = self.pendingCmd as u32;
         if (cmd == CDL_INIT) {
             self.ifr = 2;
@@ -621,7 +644,23 @@ pub const Cdrom = struct {
             return;
         }
         if (cmd == CDL_SEEKL) {
+            // psxe (impl.c:541-569): query the seek TARGET (pending_lba)
+            // FIRST; TS_FAR → INVALID_SUBFUNC, TS_AUDIO → SEEK_FAILED, and
+            // the seek is NOT committed on error. On success commit and
+            // set seek_precision = 1.
+            const tsl: u32 = discQuery(disc, self.pendingLba);
+            if (tsl == 3) {
+                self.errorOut(CD_STAT_SPINDLE | CD_STAT_SEEKERROR,
+                              CD_ERR_INVALID_SUBFUNC);
+                return;
+            }
+            if (tsl == 1) {
+                self.errorOut(CD_STAT_SPINDLE | CD_STAT_SEEKERROR,
+                              CD_ERR_SEEK_FAILED);
+                return;
+            }
             self.processSetloc();
+            self.seekPrec = 1;
             self.ifr = 2;
             self.pushResp(self.getStat());
             if (self.prevState == CD_STATE_READ as u8) {
@@ -629,6 +668,40 @@ pub const Cdrom = struct {
             } else {
                 self.state = CD_STATE_IDLE as u8;
             }
+            return;
+        }
+        if (cmd == CDL_SEEKP) {
+            // psxe cdrom_cmd_seekp (impl.c:577-587): INT2(stat), commit
+            // the seek, seek_precision = 0. No seek-error check (SeekP is
+            // the audio-seek command and may land on CDDA tracks).
+            self.ifr = 2;
+            self.pushResp(self.getStat());
+            self.processSetloc();
+            self.seekPrec = 0;
+            if (self.prevState == CD_STATE_READ as u8) {
+                self.state = CD_STATE_READ as u8;
+            } else {
+                self.state = CD_STATE_IDLE as u8;
+            }
+            return;
+        }
+        if (cmd == CDL_STOP) {
+            // psxe cdrom_cmd_stop (impl.c:267-278): rewind to LBA 150 and
+            // pause, then INT2(stat).
+            self.pendingLba = 150;
+            self.processSetloc();
+            self.readOngoing = 0;
+            self.ifr = 2;
+            self.pushResp(self.getStat());
+            self.state     = CD_STATE_IDLE as u8;
+            self.prevState = CD_STATE_IDLE as u8;
+            return;
+        }
+        if (cmd == CDL_MOTORON || cmd == CDL_SETSESSION || cmd == CDL_READTOC) {
+            // psxe: each sends a second INT2(stat) (impl.c:250,471,725).
+            self.ifr = 2;
+            self.pushResp(self.getStat());
+            self.state = CD_STATE_IDLE as u8;
             return;
         }
         if (cmd == CDL_PAUSE) {
@@ -713,7 +786,7 @@ pub const Cdrom = struct {
                 self.delay = self.readDelay() + 4 * 33869;
             }
         } else if (self.state == CD_STATE_TX_RESP2 as u8) {
-            self.executeResp2();
+            self.executeResp2(disc);
             if (self.state == CD_STATE_READ as u8) {
                 self.processSetloc();
                 self.delay = self.readDelay() + 4 * 33869;

@@ -133,6 +133,7 @@ pub fn bufWrite8(buf: *mut[] u8, off: u32, val: u32) {
 //   3 = scratchpad
 //   4 = I/O register file
 //   5 = EXP1 (returns 0xFF on read — psxe psx_exp1_read* with no cart loaded)
+//   6 = EXP2 (DTL debug-console region; only the ATC status byte matters)
 pub fn route(paddr: u32) BusRoute {
     if (paddr < 0x00800000) {
         var r: BusRoute = BusRoute { kind: 1, off: paddr & 0x001FFFFF };
@@ -146,8 +147,16 @@ pub fn route(paddr: u32) BusRoute {
         var r: BusRoute = BusRoute { kind: 3, off: paddr - 0x1F800000 };
         return r;
     }
-    if (paddr >= 0x1F801000 && paddr < 0x1F803000) {
+    if (paddr >= 0x1F801000 && paddr < 0x1F802000) {
         var r: BusRoute = BusRoute { kind: 4, off: paddr - 0x1F801000 };
+        return r;
+    }
+    // EXP2 (0x1F802000–0x1F9FFFFF): psxe routes this whole range to the
+    // EXP2/DTL device (exp2.h). Previously it fell into the I/O branch and
+    // read back the zero buffer; route it as kind 6 so the DTL ATC status
+    // byte reads correctly.
+    if (paddr >= 0x1F802000 && paddr < 0x1FA00000) {
+        var r: BusRoute = BusRoute { kind: 6, off: paddr - 0x1F802000 };
         return r;
     }
     if (paddr >= 0x1FC00000 && paddr < 0x1FC80000) {
@@ -385,6 +394,10 @@ pub fn busRead8(bus: Bus, addr: u32) u32 {
         3 { return bufRead8(bus.spad, r.off & (SPAD_SIZE - 1)); }
         4 { return ioRead8(bus, r.off); }
         5 { return 0xFF; }
+        // EXP2 DTL: ATC_STAT (off 0) reads atc_stat|8; jam never drives
+        // the DTL TTY so atc_stat is 0, making it a constant 8. ATC_DATA
+        // (off 2) and the rest read 0 (psxe exp2.c psx_exp2_read8:38-48).
+        6 { if (r.off == 0) { return 8; } return 0; }
         _ { return 0; }
     }
 }

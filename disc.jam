@@ -19,7 +19,7 @@
 // that's not part of the image file.
 
 const { cueAlloc, cueFree, cueParse, cueRead, cueQuery,
-        cueGetTrackCount } = import("cue");
+        cueGetTrackCount, cueGetTrackLba, cueGetTrackNumber } = import("cue");
 
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
@@ -137,4 +137,34 @@ pub fn discRead(d: *mut[] Disc, lba: u32, buf: *mut[] u8) i32 {
 pub fn discLoaded(d: *mut[] Disc) i32 {
     if (d[0].loaded == 0) { return 0; }
     return 1;
+}
+
+// ---- track info (for CDROM GetTN/GetTD/GetLocP/seek) -------------------
+// Route to the cue track table when cue-loaded; a raw .bin is a single
+// Mode2/2352 data track starting at the lead-in (LBA 150).
+
+pub fn discTrackCount(d: *mut[] Disc) u32 {
+    if (d[0].loaded == 0) { return 0; }
+    if (d[0].isCue != 0) { return cueGetTrackCount(d[0].cuePtr); }
+    return 1;
+}
+
+// Absolute start LBA of `track` (track 0 = lead-out / total). Returns
+// 0xFFFFFFFF for a track past the end (cue's TS_FAR sentinel).
+pub fn discTrackLba(d: *mut[] Disc, track: u32) u32 {
+    if (d[0].isCue != 0) { return cueGetTrackLba(d[0].cuePtr, track); }
+    if (track > 1) { return 0xFFFFFFFF; }
+    return LEAD_IN_SECTORS;
+}
+
+pub fn discTrackNumber(d: *mut[] Disc, lba: u32) u32 {
+    if (d[0].isCue != 0) { return cueGetTrackNumber(d[0].cuePtr, lba); }
+    return 1;
+}
+
+// Track state at `lba`: 0=DATA, 1=AUDIO, 2=PREGAP, 3=FAR (matches cueQuery).
+pub fn discQuery(d: *mut[] Disc, lba: u32) u32 {
+    if (d[0].isCue != 0) { return cueQuery(d[0].cuePtr, lba); }
+    if (lba < LEAD_IN_SECTORS) { return 2; }    // pregap
+    return 0;                                    // data
 }

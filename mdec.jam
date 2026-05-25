@@ -170,12 +170,12 @@ pub const Mdec = struct {
         }
 
         const qScale: u32 = (n >> 10) & 0x3F;
-        var val: i32 = exts10(n & 0x3FF) * (quant[0] as i32);
+        var val: i32 = mdecTrunc16(exts10(n & 0x3FF) * (quant[0] as i32));
 
         var k: u32 = 0;
         while (k < 64) {
             if (qScale == 0) {
-                val = exts10(n & 0x3FF) * 2;
+                val = mdecTrunc16(exts10(n & 0x3FF) * 2);
             }
             val = clampS10(val);
             if (qScale > 0) {
@@ -190,7 +190,7 @@ pub const Mdec = struct {
             k = k + ((n >> 10) & 0x3F) + 1;
             if (k < 64) {
                 const q: i32 = quant[k] as i32;
-                val = (exts10(n & 0x3FF) * q * (qScale as i32) + 4) / 8;
+                val = mdecTrunc16((exts10(n & 0x3FF) * q * (qScale as i32) + 4) / 8);
             }
         }
 
@@ -516,6 +516,14 @@ pub fn clampS10(v: i32) i32 {
     if (v < -0x400) { return -0x400; }
     if (v > 0x3FF)  { return  0x3FF; }
     return v;
+}
+
+// Wrap an i32 to int16. psxe rl_decode_block holds the dequant product
+// in an int16_t, so it TRUNCATES before the CLAMP(-0x400,0x3ff)
+// (mdec.c:90,96,114). For products past int16 range the wrap can flip
+// the sign and clamp to the opposite bound — must be applied pre-clamp.
+pub fn mdecTrunc16(v: i32) i32 {
+    return ((v & 0xFFFF) ^ 0x8000) - 0x8000;
 }
 
 pub fn clampSByte(v: i32) i32 {

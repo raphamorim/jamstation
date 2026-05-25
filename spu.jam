@@ -492,6 +492,13 @@ pub fn sat16(v: i32) i32 {
     if (v >  32767) { return  32767; }
     return v;
 }
+
+// Wrap an i32 to int16 (low 16 bits, sign-extended). psxe's ADPCM
+// reconstruction assigns the sum to an int16_t, which TRUNCATES (wraps)
+// rather than saturates (spu.c:165 — its <INT16_MIN clamp is dead code).
+pub fn wrap16(v: i32) i32 {
+    return ((v & 0xFFFF) ^ 0x8000) - 0x8000;
+}
 pub fn clamp7fff(v: i32) i32 {
     if (v < 0)      { return 0; }
     if (v > 0x7FFF) { return 0x7FFF; }
@@ -527,7 +534,8 @@ pub fn spuReadBlock(s: *mut[] u8, ram: *mut[] u8, v: u32) {
         if ((nibble & 0x8) != 0) { t = t - 16; }
         const tShifted: i32 = t << shift;
         const pred: i32 = ((h0 * f0) + (h1 * f1) + 32) / 64;
-        const sample: i32 = sat16(tShifted + pred);
+        // psxe wraps to int16 here (not saturates) — see wrap16.
+        const sample: i32 = wrap16(tShifted + pred);
 
         h1 = h0;
         h0 = sample;

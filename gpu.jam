@@ -1060,21 +1060,40 @@ pub fn gpuDivClamp(num: i64, den: i64, maxOut: u32) u32 {
 }
 
 pub fn gpuLineCmd(g: *mut[] u32, vram: *mut[] u8) {
+    const flags: u32 = (g[0] >> 24) & 0xFF;
+    const isGour: bool = (flags & 0x10) != 0;
+    const isPoly: bool = (flags & 0x08) != 0;
     if (g[19] == GP_RECV_CMD) {
-        const flags: u32 = (g[0] >> 24) & 0xFF;
-        const isGour: bool = (flags & 0x10) != 0;
-        // Single-segment line: 2 verts (each xy=1 word, +1 if gouraud).
-        // Poly-lines (bit 0x08) end on a 0x55555555 terminator — we
-        // approximate them as a single segment for now.
+        g[19] = GP_RECV_ARGS;
+        // psxe gpu_line (gpu.c:1019-1031): poly-lines (bit 0x08) set
+        // cmd_args_remaining = -1 and drain words until a vertex word
+        // masks to 0x50005000; single segments take 2 verts (3 if
+        // gouraud). g[17] is unused on the poly-line path — it ends on
+        // the terminator below, not on an arg count.
+        if (isPoly) { g[17] = 2; return; }
         var args: u32 = 2;
         if (isGour) { args = args + 1; }
         g[17] = args;
-        g[19] = GP_RECV_ARGS;
+        return;
+    }
+    // RECV_ARGS.
+    if (isPoly) {
+        // Match psxe: a poly-line ends when the most-recently received
+        // word masks to 0x50005000, and it draws NOTHING (psxe's render
+        // loop is commented out, gpu.c:1033-1065). Bound the FIFO write
+        // index so we don't overflow the 16-word buffer — psxe lets
+        // buf_index grow (a latent overflow), but with no draw the words
+        // are never read back, so overwriting one slot is observably the
+        // same while keeping jam's state intact.
+        const last: u32 = g[g[16] - 1];
+        if ((last & 0xF000F000) == 0x50005000) {
+            g[19] = GP_RECV_CMD;
+            return;
+        }
+        g[16] = 1;
         return;
     }
     if (g[17] != 0) { return; }
-    const flags: u32 = (g[0] >> 24) & 0xFF;
-    const isGour: bool = (flags & 0x10) != 0;
     var v0xy: u32 = 0;
     var v1xy: u32 = 0;
     if (isGour) {
