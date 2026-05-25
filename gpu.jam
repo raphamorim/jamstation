@@ -809,8 +809,13 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
     // untextured / shaded polys read it from GPUSTAT bits 5-6.
     const isTransp: bool = (flags & 0x02) != 0;
     var transpMode: u32 = (g[46] >> 5) & 3;
-    if (isTex && !isGour) {
-        const page: u32 = (g[4] >> 16) & 0xFFFF;
+    // psxe uses the texture-page transp mode for ALL textured polys, not
+    // just flat ones. The tpage word sits at buf[4] for flat-textured and
+    // at buf[5] for shaded-textured (the extra per-vertex colour words
+    // shift it), so pick the right word by isGour.
+    if (isTex) {
+        var page: u32 = (g[4] >> 16) & 0xFFFF;
+        if (isGour) { page = (g[5] >> 16) & 0xFFFF; }
         transpMode = (page >> 5) & 3;
     }
 
@@ -906,15 +911,44 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
                                        + z2 * (cv2 as i64));
                         const txu: u32 = gpuDivClamp(tx, absArea, 0xFF);
                         const tyu: u32 = gpuDivClamp(ty, absArea, 0xFF);
-                        const texel: u32 = gpuFetchTexel(vram, txu, tyu,
+                        // GP0(0xE2) texture window: mask/offset/wrap.
+                        const txw: u32 = gpuTexWinX(g, txu);
+                        const tyw: u32 = gpuTexWinY(g, tyu);
+                        const texel: u32 = gpuFetchTexel(vram, txw, tyw,
                                                          tpx, tpy,
                                                          clutX, clutY, depth);
                         if (texel == 0) {
                             x = x + 1;
                             continue;
                         }
-                        if (isRaw) { color = texel; }
-                        else       { color = gpuModulate(texel, baseColor); }
+                        if (isRaw) {
+                            color = texel;
+                        } else {
+                            // Modulate by the per-vertex gouraud colour
+                            // when shaded (psxe gpu_render_triangle uses
+                            // the interpolated colour as the modulator,
+                            // gpu.c:299-327,348-354), else the flat base.
+                            var modc: u32 = baseColor;
+                            if (isGour) {
+                                const ar: i64 = (ac as i64) & 0xFF;
+                                const ag: i64 = ((ac as i64) >> 8) & 0xFF;
+                                const ab: i64 = ((ac as i64) >> 16) & 0xFF;
+                                const br: i64 = (bc2 as i64) & 0xFF;
+                                const bg: i64 = ((bc2 as i64) >> 8) & 0xFF;
+                                const bb: i64 = ((bc2 as i64) >> 16) & 0xFF;
+                                const cr: i64 = (cc2 as i64) & 0xFF;
+                                const cg: i64 = ((cc2 as i64) >> 8) & 0xFF;
+                                const cb: i64 = ((cc2 as i64) >> 16) & 0xFF;
+                                const nr: i64 = z0 * ar + z1 * br + z2 * cr;
+                                const ng: i64 = z0 * ag + z1 * bg + z2 * cg;
+                                const nb: i64 = z0 * ab + z1 * bb + z2 * cb;
+                                const ir: u32 = gpuSatChan(nr, absArea, 0);
+                                const ig: u32 = gpuSatChan(ng, absArea, 0);
+                                const ib: u32 = gpuSatChan(nb, absArea, 0);
+                                modc = ir | (ig << 8) | (ib << 16);
+                            }
+                            color = gpuModulate(texel, modc);
+                        }
                         // Texel bit 15 → blend per transparency mode.
                         // For untextured polys, transparency applies
                         // unconditionally when isTransp is set.
@@ -1244,8 +1278,8 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
                 const py: i64 = sy + (iy as i64);
                 if (px >= dx1 && px <= dx2 && py >= dy1 && py <= dy2 &&
                     px >= 0 && px < 1024 && py >= 0 && py < 512) {
-                    const tx: u32 = (uu0 + ix) & 0xFF;
-                    const ty: u32 = (vv0 + iy) & 0xFF;
+                    const tx: u32 = gpuTexWinX(g, (uu0 + ix) & 0xFF);
+                    const ty: u32 = gpuTexWinY(g, (vv0 + iy) & 0xFF);
                     const texel: u32 = gpuFetchTexel(vram, tx, ty, g[60], g[61],
                                                       clutx, cluty, g[62]);
                     if (texel != 0) {
@@ -1275,6 +1309,19 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
         }
     }
     g[19] = GP_RECV_CMD;
+}
+
+// Apply the GP0(0xE2) texture window to a texel coordinate, then wrap to
+// the 256x256 page. Mirrors psxe gpu_fetch_texel (gpu.c:150-153):
+//   t = (t & ~mask) | (offset & mask); t &= 0xff
+// The window regs are pre-shifted to pixel units in g[54..57]
+// (mask_x, mask_y, off_x, off_y). With no window set (mask 0) this is a
+// pass-through, so it is always safe to apply.
+pub fn gpuTexWinX(g: *mut[] u32, t: u32) u32 {
+    return ((t & (~g[54])) | (g[56] & g[54])) & 0xFF;
+}
+pub fn gpuTexWinY(g: *mut[] u32, t: u32) u32 {
+    return ((t & (~g[55])) | (g[57] & g[55])) & 0xFF;
 }
 
 // Fetch one 16-bit BGR555 texel from VRAM, decoding CLUT-indexed
@@ -1311,9 +1358,12 @@ pub fn gpuModulate(texel: u32, mod: u32) u32 {
     const mr: u32 = mod & 0xFF;
     const mg: u32 = (mod >> 8) & 0xFF;
     const mb: u32 = (mod >> 16) & 0xFF;
-    var cr: u32 = (tr * mr) >> 7;
-    var cg: u32 = (tg * mg) >> 7;
-    var cb: u32 = (tb * mb) >> 7;
+    // psxe rounds: roundf((tex * mod) / 128) (gpu.c:352-362). +0x40
+    // before >>7 gives round-half-up, which matches for non-negative
+    // channels (tex, mod are unsigned here).
+    var cr: u32 = ((tr * mr) + 0x40) >> 7;
+    var cg: u32 = ((tg * mg) + 0x40) >> 7;
+    var cb: u32 = ((tb * mb) + 0x40) >> 7;
     if (cr > 255) { cr = 255; }
     if (cg > 255) { cg = 255; }
     if (cb > 255) { cb = 255; }

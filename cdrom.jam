@@ -377,6 +377,16 @@ pub const Cdrom = struct {
                 const m: u32 = self.popParam();
                 const s: u32 = self.popParam();
                 const f: u32 = self.popParam();
+                // psxe validates VALID_MSF before accepting (impl.c:138-158):
+                // BCD-valid nibbles, seconds < 0x60, frame < 0x75. Invalid
+                // MSF → INT5(stat, 0x10) instead of an INT3 success.
+                const bcdOk: bool = ((m & 0x0F) <= 9) && ((m >> 4) <= 9) &&
+                                    ((s & 0x0F) <= 9) && ((s >> 4) <= 9) &&
+                                    ((f & 0x0F) <= 9) && ((f >> 4) <= 9);
+                if (!bcdOk || s >= 0x60 || f >= 0x75) {
+                    self.errorOut(CD_STAT_SPINDLE, CD_ERR_INVALID_SUBFUNC);
+                    return;
+                }
                 const mB: u32 = (m & 0x0F) + ((m >> 4) & 0x0F) * 10;
                 const sB: u32 = (s & 0x0F) + ((s >> 4) & 0x0F) * 10;
                 const fB: u32 = (f & 0x0F) + ((f >> 4) & 0x0F) * 10;
@@ -719,7 +729,9 @@ pub const Cdrom = struct {
     pub fn handleRead(self: mut Self, disc: *mut[] Disc, spu: *mut[] u8) {
         self.processSetloc();
         if (self.hasDisc == 0) {
-            self.errorOut(CD_STAT_SPINDLE, CD_ERR_NO_DISC);
+            // psxe reports no-disc as SHELLOPEN (0x10), giving INT5(11h,80h)
+            // (cdrom_handle_resp1:300) — not SPINDLE (which gave 03h,80h).
+            self.errorOut(CD_STAT_SHELLOPEN, CD_ERR_NO_DISC);
             return;
         }
         const lba: u32 = self.lba;
