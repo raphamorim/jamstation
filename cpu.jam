@@ -31,7 +31,7 @@ const { dmaAlloc } = import("dma");
 const { irqAlloc } = import("irq");
 const { Timer } = import("timer");
 const { gteAlloc, gteDataRead, gteDataWrite,
-        gteCtrlRead, gteCtrlWrite, gteExec } = import("gte");
+        gteCtrlRead, gteCtrlWrite, gteExec, gteOpCycles } = import("gte");
 const { Cdrom } = import("cdrom");
 const { Mcd } = import("mcd");
 const { Sio1 } = import("sio1");
@@ -928,6 +928,10 @@ pub fn iCop2Unimpl(c: mut Cpu, opc: u32, bus: Bus,
     // operation; gteExec dispatches on the low 6.
     commitLoad(c, regs);
     gteExec(bus.gte, opc);
+    // GTE math ops cost more than the 2-cycle base step() already charged
+    // (RTPS=15, NCDT=44, ...); add the remainder so device timing matches
+    // psxe through GTE-heavy code (cpu.c psx_cpu_execute GTE switch).
+    c.cycles = c.cycles + (gteOpCycles(opc) as u64) - 2;
 }
 
 // LWC2 / SWC2 (primary 0x32 / 0x3A) — load/store a single COP2 data
@@ -1216,6 +1220,16 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     // next cycle. We do the same here; without the return, every IRQ
     // handler runs 1 instruction ahead of psxe (divergence verified
     // via REG_TRACE diff against Harvest Moon at L=19258536).
+    //
+    // Fetch-access cost (psxe cpu.c:302, last_cycles = bus access cycles):
+    // reading an opcode from the BIOS ROM costs 18 cycles (bios.c
+    // bus_delay=18); RAM/scratchpad/IO cost 0. This is the dominant
+    // per-instruction timing difference from a flat model — BIOS code,
+    // where the CD/IO polling loops live, advances device clocks ~10×
+    // faster per instruction.
+    var fetchCyc: u64 = 0;
+    if (inBios) { fetchCyc = 18; }
+
     if (cpuIrqPending(cop0)) {
         // psxe quirk: a COP2 (GTE) math op "wins" over a pending IRQ —
         // it executes before the interrupt is taken, and because EPC
@@ -1224,9 +1238,15 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         // instruction about to run (at c.pc == savedPc) is a GTE math
         // op: primary 0x12 with the COP2 command bit set (0x4A......).
         const irqOpc: u32 = busRead32(bus, c.pc);
+        // psxe charges fetch + (GTE op cycles if the op won); execute() does
+        // not run on an IRQ-taken cycle, so there is no +2 base here
+        // (cpu.c psx_cpu_cycle: total_cycles += last_cycles, then return).
+        var irqCyc: u64 = fetchCyc;
         if ((irqOpc & 0xFE000000) == 0x4A000000) {
             gteExec(bus.gte, irqOpc);
+            irqCyc = irqCyc + (gteOpCycles(irqOpc) as u64);
         }
+        c.cycles = c.cycles + irqCyc;
         c.pc = c.nextPc;
         c.nextPc = c.nextPc + 4;
         raiseException(c, cop0, CAUSE_INT);
@@ -1237,7 +1257,10 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
 
     c.pc = c.nextPc;
     c.nextPc = c.nextPc + 4;
-    c.cycles = c.cycles + 2;
+    // psxe: last_cycles = fetch cycles + instruction cycles. Most
+    // instructions cost 2 (psx_cpu_execute returns 2); the COP2 math path
+    // below adds the remainder of its GTE op cost on top of this base.
+    c.cycles = c.cycles + fetchCyc + 2;
 
     dispatch(c, opc, bus, regs, cop0);
 

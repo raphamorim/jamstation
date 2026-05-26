@@ -318,6 +318,12 @@ pub const Cdrom = struct {
                 var delay: u32 = CD_DELAY_FR;
                 if ((val & 0xFF) == CDL_INIT) { delay = CD_DELAY_INIT_FR; }
                 self.delay = delay;
+                // psxe cdrom.c:668-669: a command issued while a read is in
+                // progress raises BUSYSTS (status bit 7) until the command's
+                // first response is ready. Without this, a game whose CD-sync
+                // polls BUSYSTS during streaming never sees the busy edge and
+                // spins re-issuing SetMode/SetLoc/SeekL/ReadN (FMV hang).
+                if (self.prevState == CD_STATE_READ as u8) { self.busy = 1; }
             }
             // Push parameter byte.
             2 { self.pushParam(val); }
@@ -354,6 +360,51 @@ pub const Cdrom = struct {
                           ic: *mut[] u32, cop0: *mut[] u32) {
         const cmd: u32 = self.pendingCmd as u32;
         self.busy = 0;
+
+        // psxe cdrom_handle_resp1 prechecks (cdrom.c:271-447), before
+        // dispatch: (1) disc-required commands with no disc → INT5(11h,80h),
+        // (3) wrong parameter count → INT5(03h,20h), unknown command →
+        // INT5(03h,40h). (Stage 2 version checks are omitted — jam models a
+        // single CD-ROM revision.) `pcnt` = parameters queued for this cmd.
+        const pcnt: u32 = ((self.paramW as u32) - (self.paramR as u32)) & 0xFF;
+        const c0: bool = cmd == CDL_GETSTAT || cmd == CDL_FORWARD ||
+            cmd == CDL_BACKWARD || cmd == CDL_READN || cmd == CDL_MOTORON ||
+            cmd == CDL_STOP || cmd == CDL_PAUSE || cmd == CDL_INIT ||
+            cmd == CDL_MUTE || cmd == CDL_DEMUTE || cmd == CDL_GETPARAM ||
+            cmd == CDL_GETLOCL || cmd == CDL_GETLOCP || cmd == CDL_GETTN ||
+            cmd == CDL_SEEKL || cmd == CDL_SEEKP || cmd == CDL_GETID ||
+            cmd == CDL_READS || cmd == CDL_RESET || cmd == CDL_READTOC;
+        const c1: bool = cmd == CDL_SETMODE || cmd == CDL_GETTD || cmd == CDL_TEST;
+        const c2: bool = cmd == CDL_SETFILTER || cmd == CDL_GETQ;
+        const needsDisc: bool = cmd == CDL_SETLOC || cmd == CDL_PLAY ||
+            cmd == CDL_FORWARD || cmd == CDL_BACKWARD || cmd == CDL_READN ||
+            cmd == CDL_MOTORON || cmd == CDL_STOP || cmd == CDL_PAUSE ||
+            cmd == CDL_MUTE || cmd == CDL_DEMUTE || cmd == CDL_SETFILTER ||
+            cmd == CDL_GETLOCL || cmd == CDL_GETLOCP || cmd == CDL_SETSESSION ||
+            cmd == CDL_GETTN || cmd == CDL_GETTD || cmd == CDL_SEEKL ||
+            cmd == CDL_SEEKP || cmd == CDL_GETID || cmd == CDL_READS ||
+            cmd == CDL_GETQ;
+        if (self.hasDisc == 0 && needsDisc) {
+            self.errorOut(CD_STAT_SHELLOPEN, CD_ERR_NO_DISC);
+            return;
+        }
+        const known: bool = c0 || c1 || c2 ||
+            cmd == CDL_SETLOC || cmd == CDL_PLAY;
+        if (!known) {
+            self.errorOut(CD_STAT_SPINDLE, CD_ERR_INVALID_COMMAND);
+            return;
+        }
+        var pbad: bool = false;
+        if (c0 && pcnt != 0) { pbad = true; }
+        if (c1 && pcnt != 1) { pbad = true; }
+        if (c2 && pcnt != 2) { pbad = true; }
+        if (cmd == CDL_SETLOC && pcnt != 3) { pbad = true; }
+        if (cmd == CDL_PLAY && pcnt > 1) { pbad = true; }
+        if (pbad) {
+            self.errorOut(CD_STAT_SPINDLE, CD_ERR_WRONG_PARAM_CNT);
+            return;
+        }
+
         if (cmd == CDL_TEST) {
             const subf: u32 = self.popParam();
             if (subf == 0x20) {

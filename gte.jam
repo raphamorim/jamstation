@@ -9,8 +9,10 @@
 // SQR, AVSZ3, AVSZ4, DPCS, INTPL, CDP, NCCS, CC, NCS, NCT, DCPL, DPCT,
 // GPF, GPL, NCCT — 22 of psxe's 22 GTE ops.
 //
-// Saturation FLAG bookkeeping is approximate (we set IR/SXY/SZ3 clamp
-// bits where it matters for the BIOS, but skip rare overflow markers).
+// Saturation FLAG bookkeeping is psxe-faithful: every clamp (IR/IR0/SXY/
+// SZ3/RGB/MAC0) ORs its FLAG bit, the 44-bit MAC overflow is truncated
+// per-term (gteCheckMac) and nested between additive terms exactly as
+// psxe does, and bit 31 is synthesized from the error summary on read.
 //
 // Data register layout (32 × u32):
 //   0  V0  (xy packed, low half of vertex 0)
@@ -240,9 +242,9 @@ pub fn gteCtrlWrite(g: *mut[] u32, idx: u32, val: u32) {
 }
 
 // Dispatch on the bottom 6 bits of the GTE math opcode. psxe's full
-// table covers 22 ops (RTPS=0x01, NCLIP=0x06, ..., NCCT=0x3F). Almost
-// all are NOPs here; RTPS gets a pass-through implementation so the
-// BIOS's vertex stream lands at the input coords instead of (0,0).
+// table covers 22 ops (RTPS=0x01, NCLIP=0x06, ..., NCCT=0x3F) — all 22
+// are implemented below. FLAG is cleared at the top of every op (psxe
+// sets R_FLAG = 0 in each psx_gte_i_*).
 pub fn gteExec(g: *mut[] u32, opc: u32) {
     g[32 + C_FLAG] = 0;        // clear FLAG every instruction
     const op: u32 = opc & 0x3F;
@@ -292,6 +294,39 @@ pub fn gteExec(g: *mut[] u32, opc: u32) {
         gteNccs(g, 1, sf, lm);
         gteNccs(g, 2, sf, lm);
     }
+}
+
+// CPU-cycle cost of a COP2 (GTE) math op, keyed by the low 6 bits of the
+// opcode. These mirror psxe's per-op cycle counts in the GTE switch
+// (cpu.c psx_cpu_cycle / psx_cpu_execute) exactly. The CPU dispatcher adds
+// this — instead of the flat 2-cycle base — when it runs a GTE math op, so
+// device timing (DMA, CDROM, timers) advances at psxe's rate through
+// GTE-heavy code. Unknown sub-ops fall back to the 2-cycle base.
+pub fn gteOpCycles(opc: u32) u32 {
+    const op: u32 = opc & 0x3F;
+    if (op == 0x01) { return 15; }   // RTPS
+    if (op == 0x06) { return 8; }    // NCLIP
+    if (op == 0x0C) { return 6; }    // OP
+    if (op == 0x10) { return 8; }    // DPCS
+    if (op == 0x11) { return 8; }    // INTPL
+    if (op == 0x12) { return 8; }    // MVMVA
+    if (op == 0x13) { return 19; }   // NCDS
+    if (op == 0x14) { return 13; }   // CDP
+    if (op == 0x16) { return 44; }   // NCDT
+    if (op == 0x1B) { return 17; }   // NCCS
+    if (op == 0x1C) { return 11; }   // CC
+    if (op == 0x1E) { return 14; }   // NCS
+    if (op == 0x20) { return 30; }   // NCT
+    if (op == 0x28) { return 5; }    // SQR
+    if (op == 0x29) { return 8; }    // DCPL
+    if (op == 0x2A) { return 17; }   // DPCT
+    if (op == 0x2D) { return 5; }    // AVSZ3
+    if (op == 0x2E) { return 6; }    // AVSZ4
+    if (op == 0x30) { return 23; }   // RTPT
+    if (op == 0x3D) { return 5; }    // GPF
+    if (op == 0x3E) { return 5; }    // GPL
+    if (op == 0x3F) { return 39; }   // NCCT
+    return 2;
 }
 
 // Push (MAC1>>4, MAC2>>4, MAC3>>4, CODE) onto the RGB FIFO — used by
@@ -354,10 +389,19 @@ pub fn gteApplyLightColor(g: *mut[] u32, sf: u32, lm: u32) {
     const rbk: i64 = s32ToI64(g[32 + 13]);
     const gbk: i64 = s32ToI64(g[32 + 14]);
     const bbk: i64 = s32ToI64(g[32 + 15]);
-    var m1: i64 = (rbk << 12) + lr1 * ir1 + lr2 * ir2 + lr3 * ir3;
-    var m2: i64 = (gbk << 12) + lg1 * ir1 + lg2 * ir2 + lg3 * ir3;
-    var m3: i64 = (bbk << 12) + lb1 * ir1 + lb2 * ir2 + lb3 * ir3;
-    m1 = gteClampMac(g, 1, m1, sf); m2 = gteClampMac(g, 2, m2, sf); m3 = gteClampMac(g, 3, m3, sf);
+    // psxe nests gte_check_mac between the BK<<12 term and each LC*IR term
+    // so an intermediate exceeding 44 bits wraps before the next add
+    // (cpu.c:1800-1802). The L*V first stage is a single clamp_mac (see
+    // gteApplyLight) and is intentionally left unnested to match psxe.
+    const a1a: i64 = gteCheckMac(g, 1, (rbk << 12) + lr1 * ir1);
+    const a1b: i64 = gteCheckMac(g, 1, a1a + lr2 * ir2);
+    const m1: i64 = gteClampMac(g, 1, a1b + lr3 * ir3, sf);
+    const a2a: i64 = gteCheckMac(g, 2, (gbk << 12) + lg1 * ir1);
+    const a2b: i64 = gteCheckMac(g, 2, a2a + lg2 * ir2);
+    const m2: i64 = gteClampMac(g, 2, a2b + lg3 * ir3, sf);
+    const a3a: i64 = gteCheckMac(g, 3, (bbk << 12) + lb1 * ir1);
+    const a3b: i64 = gteCheckMac(g, 3, a3a + lb2 * ir2);
+    const m3: i64 = gteClampMac(g, 3, a3b + lb3 * ir3, sf);
     g[D_MAC1] = (m1 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC2] = (m2 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC3] = (m3 as u64 & 0xFFFFFFFF) as u32;
@@ -744,6 +788,32 @@ pub fn gteCheckMac(g: *mut[] u32, i: u32, v: i64) i64 {
     return (v << 20) >> 20;
 }
 
+// Truncate an i64 to the signed 32-bit value range (low 32 bits,
+// sign-extended). Models psxe's `(int32_t)` casts inside gte_clamp_ir_z.
+pub fn truncI32(v: i64) i64 {
+    const lo: u32 = (v as u64 & 0xFFFFFFFF) as u32;
+    return s32ToI64(lo);
+}
+
+// IR3 clamp for RTPS/RTPT (psxe gte_clamp_ir_z, cpu.c:1595-1607). The
+// returned value clamps `value >> sf` to [lm?0:-0x8000, 0x7FFF], but FLAG
+// bit 22 is keyed off `value >> 12` (each int32-truncated first). At sf=12
+// the two shifts agree; at sf=0 they diverge — so a plain gteClampIr on the
+// shifted MAC sets bit 22 from the wrong magnitude. Note clamp_ir_z does
+// NOT flag on the value-clamp itself, only on the >>12 range check.
+pub fn gteClampIrZ(g: *mut[] u32, value: i64, sf: u32, lm: u32) i64 {
+    const valueSf: i64 = truncI32(value >> sf);
+    const value12: i64 = truncI32(value >> 12);
+    var lo: i64 = -32768;
+    if (lm != 0) { lo = 0; }
+    if (value12 < -32768 || value12 > 32767) {
+        g[32 + C_FLAG] = g[32 + C_FLAG] | 0x400000;   // FLAG bit 22 (IR3 sat)
+    }
+    if (valueSf < lo) { return lo; }
+    if (valueSf > 32767) { return 32767; }
+    return valueSf;
+}
+
 // Saturate to u16 (used for SZ3).
 pub fn satSz3(v: i64) u32 {
     if (v < 0) { return 0; }
@@ -798,9 +868,9 @@ pub fn gteDivide(g: *mut[] u32, h: u32, sz3: u32) u32 {
 
 // RTPS — rotate, translate, perspective single. Computes a screen-
 // space projection of vertex `vidx` and pushes it onto the SXY/SZ
-// FIFO. Port of psxe's GTE_RTP macro, minus the per-instruction FLAG
-// bookkeeping (kept simple; visual artifacts from missing flags are
-// preferable to faulting out of the boot sequence).
+// FIFO. Faithful port of psxe's GTE_RTP_DQ macro including the nested
+// 44-bit MAC truncation, the clamp_ir_z IR3 path, and the full FLAG
+// bookkeeping (cpu.c:1728-1748).
 pub fn gteRtps(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     const vSlot: u32 = vidx * 2;        // V0 at 0, V1 at 2, V2 at 4
     const vxy: u32 = g[vSlot];
@@ -831,27 +901,37 @@ pub fn gteRtps(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     const try_: i64 = s32ToI64(g[32 + 6]);
     const trz: i64 = s32ToI64(g[32 + 7]);
 
-    // MAC = TR * 4096 + R * V.
-    const mac1: i64 = (trx << 12) + rt11 * vx + rt12 * vy + rt13 * vzS;
-    const mac2: i64 = (try_ << 12) + rt21 * vx + rt22 * vy + rt23 * vzS;
-    const mac3: i64 = (trz << 12) + rt31 * vx + rt32 * vy + rt33 * vzS;
+    // MAC = TR*4096 + R*V, with psxe's per-term 44-bit truncation nested
+    // between the additive terms (gte_check_mac) so an intermediate that
+    // crosses 44 bits wraps before the next add — exactly like the GTE_RTP*
+    // macros (cpu.c:1732-1734). Normal geometry never crosses 44 bits, so
+    // the values are unchanged there; only the overflow FLAG/wrap differs.
+    const c1a: i64 = gteCheckMac(g, 1, (trx << 12) + rt11 * vx);
+    const c1b: i64 = gteCheckMac(g, 1, c1a + rt12 * vy);
+    const sm1: i64 = gteClampMac(g, 1, c1b + rt13 * vzS, sf);
+    const c2a: i64 = gteCheckMac(g, 2, (try_ << 12) + rt21 * vx);
+    const c2b: i64 = gteCheckMac(g, 2, c2a + rt22 * vy);
+    const sm2: i64 = gteClampMac(g, 2, c2b + rt23 * vzS, sf);
+    // macRaw3 is the raw (pre-shift) MAC3 sum — psxe stores it as s_mac3
+    // and feeds it to BOTH gte_clamp_sz3 and gte_clamp_ir_z (cpu.c:1737,1741).
+    const c3a: i64 = gteCheckMac(g, 3, (trz << 12) + rt31 * vx);
+    const c3b: i64 = gteCheckMac(g, 3, c3a + rt32 * vy);
+    const macRaw3: i64 = c3b + rt33 * vzS;
+    const sm3: i64 = gteClampMac(g, 3, macRaw3, sf);
 
-    // IR = MAC >> sf (sf is 0 or 12). lm=1 clamps IR to 0..0x7FFF,
-    // lm=0 clamps to -0x8000..0x7FFF.
-    var sm1: i64 = mac1;
-    var sm2: i64 = mac2;
-    var sm3: i64 = mac3;
-    sm1 = gteClampMac(g, 1, mac1, sf); sm2 = gteClampMac(g, 2, mac2, sf); sm3 = gteClampMac(g, 3, mac3, sf);
+    // IR1/IR2 clamp the shifted MAC; IR3 uses the special clamp_ir_z which
+    // keys FLAG bit 22 off macRaw3>>12 while clamping macRaw3>>sf
+    // (cpu.c:1737) — differs from a plain IR clamp only when sf=0.
     const ir1: i64 = gteClampIr(g, 1, sm1, lm);
     const ir2: i64 = gteClampIr(g, 2, sm2, lm);
-    const ir3: i64 = gteClampIr(g, 3, sm3, lm);
+    const ir3: i64 = gteClampIrZ(g, macRaw3, sf, lm);
 
-    // SZ FIFO: SZ0←SZ1, SZ1←SZ2, SZ2←SZ3, SZ3← new. SZ3 always uses
-    // the >>12 form regardless of `sf` (per psxe gte_clamp_ir_z).
+    // SZ FIFO: SZ0←SZ1, SZ1←SZ2, SZ2←SZ3, SZ3←clamp_sz3(macRaw3>>12),
+    // always the >>12 form regardless of `sf`.
     g[16] = g[17];
     g[17] = g[18];
     g[18] = g[19];
-    g[19] = gteClampSz3(g, mac3 >> 12);
+    g[19] = gteClampSz3(g, macRaw3 >> 12);
 
     // Perspective division.
     const h: u32 = g[32 + 26] & 0xFFFF;
@@ -1020,10 +1100,17 @@ pub fn gteNcds(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     const gbk: i64 = s32ToI64(g[32 + 14]);
     const bbk: i64 = s32ToI64(g[32 + 15]);
 
-    var m1b: i64 = (rbk << 12) + lr1 * ir1a + lr2 * ir2a + lr3 * ir3a;
-    var m2b: i64 = (gbk << 12) + lg1 * ir1a + lg2 * ir2a + lg3 * ir3a;
-    var m3b: i64 = (bbk << 12) + lb1 * ir1a + lb2 * ir2a + lb3 * ir3a;
-    m1b = gteClampMac(g, 1, m1b, sf); m2b = gteClampMac(g, 2, m2b, sf); m3b = gteClampMac(g, 3, m3b, sf);
+    // BK<<12 + LC*IR with the same nested 44-bit truncation psxe applies
+    // (NCDS macro, cpu.c:1855-1857).
+    const b1a: i64 = gteCheckMac(g, 1, (rbk << 12) + lr1 * ir1a);
+    const b1b: i64 = gteCheckMac(g, 1, b1a + lr2 * ir2a);
+    const m1b: i64 = gteClampMac(g, 1, b1b + lr3 * ir3a, sf);
+    const b2a: i64 = gteCheckMac(g, 2, (gbk << 12) + lg1 * ir1a);
+    const b2b: i64 = gteCheckMac(g, 2, b2a + lg2 * ir2a);
+    const m2b: i64 = gteClampMac(g, 2, b2b + lg3 * ir3a, sf);
+    const b3a: i64 = gteCheckMac(g, 3, (bbk << 12) + lb1 * ir1a);
+    const b3b: i64 = gteCheckMac(g, 3, b3a + lb2 * ir2a);
+    const m3b: i64 = gteClampMac(g, 3, b3b + lb3 * ir3a, sf);
     const ir1b: i64 = gteClampIr(g, 1, m1b, lm);
     const ir2b: i64 = gteClampIr(g, 2, m2b, lm);
     const ir3b: i64 = gteClampIr(g, 3, m3b, lm);
@@ -1174,25 +1261,38 @@ pub fn gteMvmva(g: *mut[] u32, opc: u32) {
     }
     // cvSel == 3: zero translation.
 
-    // CV=FC (cvSel==2) is a hardware bug: the (CV<<12 + M*VX) column is
-    // computed for flags but lost from the result, so MAC keeps only the
-    // VY/VZ columns (psxe cpu.c:2024-2041). All other CV select the
-    // normal (CV<<12) + M*V.
-    var mac1: i64 = 0; var mac2: i64 = 0; var mac3: i64 = 0;
+    // MAC = (CV<<12) + M*V with psxe's nested 44-bit truncation between the
+    // additive terms (gte_check_mac, cpu.c:2038-2040). CV=FC (cvSel==2) is
+    // the hardware bug case: the (CV<<12 + M*VX) column is computed only for
+    // its FLAG side effects and dropped from the result, leaving the VY/VZ
+    // columns (cpu.c:2024-2036).
+    var sm1: i64 = 0; var sm2: i64 = 0; var sm3: i64 = 0;
     if (cvSel == 2) {
-        mac1 = m12 * vy + m13 * vz;
-        mac2 = m22 * vy + m23 * vz;
-        mac3 = m32 * vy + m33 * vz;
+        const k1: i64 = gteCheckMac(g, 1, m12 * vy);
+        sm1 = gteClampMac(g, 1, k1 + m13 * vz, sf);
+        const k2: i64 = gteCheckMac(g, 2, m22 * vy);
+        sm2 = gteClampMac(g, 2, k2 + m23 * vz, sf);
+        const k3: i64 = gteCheckMac(g, 3, m32 * vy);
+        sm3 = gteClampMac(g, 3, k3 + m33 * vz, sf);
+        // Dropped VX column: clamp_mac + clamp_ir purely to raise FLAG bits
+        // (the results are discarded, exactly as psxe does at cpu.c:2030-2036).
+        const d1: i64 = gteClampMac(g, 1, (tx << 12) + m11 * vx, sf);
+        const d2: i64 = gteClampMac(g, 2, (ty << 12) + m21 * vx, sf);
+        const d3: i64 = gteClampMac(g, 3, (tz << 12) + m31 * vx, sf);
+        gteClampIr(g, 1, d1, 0);
+        gteClampIr(g, 2, d2, 0);
+        gteClampIr(g, 3, d3, 0);
     } else {
-        mac1 = (tx << 12) + m11 * vx + m12 * vy + m13 * vz;
-        mac2 = (ty << 12) + m21 * vx + m22 * vy + m23 * vz;
-        mac3 = (tz << 12) + m31 * vx + m32 * vy + m33 * vz;
+        const c1a: i64 = gteCheckMac(g, 1, (tx << 12) + m11 * vx);
+        const c1b: i64 = gteCheckMac(g, 1, c1a + m12 * vy);
+        sm1 = gteClampMac(g, 1, c1b + m13 * vz, sf);
+        const c2a: i64 = gteCheckMac(g, 2, (ty << 12) + m21 * vx);
+        const c2b: i64 = gteCheckMac(g, 2, c2a + m22 * vy);
+        sm2 = gteClampMac(g, 2, c2b + m23 * vz, sf);
+        const c3a: i64 = gteCheckMac(g, 3, (tz << 12) + m31 * vx);
+        const c3b: i64 = gteCheckMac(g, 3, c3a + m32 * vy);
+        sm3 = gteClampMac(g, 3, c3b + m33 * vz, sf);
     }
-
-    var sm1: i64 = mac1;
-    var sm2: i64 = mac2;
-    var sm3: i64 = mac3;
-    sm1 = gteClampMac(g, 1, mac1, sf); sm2 = gteClampMac(g, 2, mac2, sf); sm3 = gteClampMac(g, 3, mac3, sf);
 
     g[D_MAC1] = (sm1 as u64 & 0xFFFFFFFF) as u32;
     g[D_MAC2] = (sm2 as u64 & 0xFFFFFFFF) as u32;
