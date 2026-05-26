@@ -13,7 +13,12 @@ const { irqRaise, IC_TIMER0, IC_TIMER1, IC_TIMER2 } = import("irq");
 // flag bits stay u32 so they round-trip cleanly through the mode
 // register's pack/unpack without per-field width juggling.
 pub const TimerChannel = struct {
-    counter:       u32,
+    // psxe stores the counter as a `float` (timer.h:100) and accumulates
+    // `+= (float)cyc` / `/8.0f` / `*dotclock_div`, so it DRIFTS from an
+    // exact integer over time. We mirror that f32 drift bit-for-bit (an
+    // exact u32 counter diverged from psxe ~0.3% by frame ~224, found via
+    // REG_TRACE cmp). Reads truncate to u16; IRQ/target compare the float.
+    counter:       f32,
     target:        u32,
     syncEnable:    u32,
     syncMode:      u32,
@@ -32,7 +37,7 @@ pub const TimerChannel = struct {
 
     pub fn init() Self {
         return Self {
-            counter: 0, target: 0, syncEnable: 0, syncMode: 0,
+            counter: 0.0, target: 0, syncEnable: 0, syncMode: 0,
             irqTarget: 0, irqMax: 0, irqRepeat: 0, irqToggle: 0,
             irq: 0, targetReached: 0, maxReached: 0, resetTarget: 0,
             irqFired: 0, paused: 0, blankOnce: 0, clkSource: 0,
@@ -102,7 +107,7 @@ pub const Timer = struct {
         self.channels[idx].maxReached    = 0;
         self.channels[idx].irq           = 1;
         self.channels[idx].irqFired      = 0;
-        self.channels[idx].counter       = 0;
+        self.channels[idx].counter       = 0.0;
         self.channels[idx].blankOnce     = 0;
         self.channels[idx].paused        = 0;
 
@@ -138,19 +143,21 @@ pub const Timer = struct {
     // on target-hit if resetTarget is set.
     pub fn handleIrq(self: mut Self, idx: u32,
                      ic: *mut[] u32, cop0: *mut[] u32) {
-        const counter: u32 = self.channels[idx].counter;
+        // psxe timer_handle_irq compares the FLOAT counter directly to the
+        // target and to 65535.0f.
+        const counter: f32 = self.channels[idx].counter;
         const target:  u32 = self.channels[idx].target;
         var fireIrq: u32 = 0;
 
-        if (counter > target) {
+        if (counter > (target as f32)) {
             self.channels[idx].targetReached = 1;
             if (self.channels[idx].resetTarget != 0) {
-                self.channels[idx].counter = 0;
+                self.channels[idx].counter = 0.0;
             }
             if (self.channels[idx].irqTarget != 0) { fireIrq = 1; }
         }
-        if (counter > 0xFFFF) {
-            self.channels[idx].counter = 0;
+        if (counter > 65535.0) {
+            self.channels[idx].counter = 0.0;
             self.channels[idx].maxReached = 1;
             if (self.channels[idx].irqMax != 0) { fireIrq = 1; }
         }
@@ -194,7 +201,7 @@ pub const Timer = struct {
         const reg: u32 = off & 0xF;
         if (idx >= 3) { return 0; }
         match (reg) {
-            0 { return self.channels[idx].counter; }
+            0 { return self.channels[idx].counter as u32; }
             4 { return self.getMode(idx); }
             8 { return self.channels[idx].target; }
             _ { return 0; }
@@ -210,7 +217,7 @@ pub const Timer = struct {
         const reg: u32 = off & 0xF;
         if (idx >= 3) { return; }
         match (reg) {
-            0 { self.channels[idx].counter = val & 0xFFFF; }
+            0 { self.channels[idx].counter = (val & 0xFFFF) as f32; }
             4 { self.setMode(idx, val); }
             8 { self.channels[idx].target = val & 0xFFFF; }
             _ {}
@@ -248,36 +255,18 @@ pub const Timer = struct {
         if (self.channels[idx].paused != 0) { return; }
         // Timer 1 sourced from hblank is incremented in hblankBegin.
         if (idx == 1 && (self.channels[idx].clkSource & 1) != 0) { return; }
-        const prevCounter: u32 = self.channels[idx].counter;
-        // Timer 2 with clk_source >= 2 ticks at sysclk/8. We
-        // accumulate sub-cycles in `subtick` and add whole /8
-        // increments to the counter. Keep the full 32-bit width (not
-        // & 0xFFFF) so handleIrq can see counter > 0xFFFF and raise the
-        // FFFF-overflow (maxReached / irqMax) — psxe leaves the counter
-        // unmasked here (timer.c:332). handleIrq snaps it back to 0 on
-        // overflow, so reads still observe a clean 16-bit value.
+        const cf: f32 = cyc as f32;
+        // Mirror psxe timer_update_timer* (timer.c:300-333) on the float
+        // counter. Timer 2 with clk_source>=2 ticks at sysclk/8 (`+= cyc/8`).
+        // (Timer 0 dotclock source is deferred — psxe's else branch `+= cyc`
+        // is used; revisit if a divergence shows the game using it.) The
+        // old jam integer subtick + leap-past-target adjustment is dropped:
+        // psxe does neither, and matching its exact float overshoot/reset is
+        // the whole point of moving to f32.
         if (idx == 2 && self.channels[idx].clkSource >= 2) {
-            const acc: u32 = self.subtick + cyc;
-            const incr: u32 = acc >> 3;
-            self.subtick = acc & 7;
-            self.channels[idx].counter = (self.channels[idx].counter + incr) & 0xFFFFFFFF;
+            self.channels[idx].counter = self.channels[idx].counter + cf / 8.0;
         } else {
-            self.channels[idx].counter = (self.channels[idx].counter + cyc) & 0xFFFFFFFF;
-        }
-        // ps1-tests timers `testTimerTargetBehaviour` reads the
-        // counter in a tight loop and asserts `target` is observed
-        // before resetTarget snaps it back. Our cycle-aggregated
-        // tick can leap past target (e.g. counter += 2 jumps
-        // target=10 from 8 straight to 12). When this happens with
-        // resetTarget set, land at target this update — the next
-        // call will pick up from target+1 and clear via the normal
-        // reset path.
-        const target: u32 = self.channels[idx].target;
-        if (self.channels[idx].resetTarget != 0 &&
-            prevCounter < target &&
-            self.channels[idx].counter > target &&
-            self.channels[idx].counter <= 0xFFFF) {
-            self.channels[idx].counter = target;
+            self.channels[idx].counter = self.channels[idx].counter + cf;
         }
         self.handleIrq(idx, ic, cop0);
     }
@@ -290,19 +279,18 @@ pub const Timer = struct {
 
         if ((self.channels[1].clkSource & 1) != 0 &&
             self.channels[1].paused == 0) {
-            // Full-width add (not & 0xFFFF) so the 0xFFFF→0x10000 wrap
-            // is visible to handleIrq's overflow check; it resets to 0.
-            self.channels[1].counter =
-                (self.channels[1].counter + 1) & 0xFFFFFFFF;
+            // psxe increments the hblank-sourced T1 counter by 1.0 each
+            // hblank; handleIrq's float overflow/target checks reset it.
+            self.channels[1].counter = self.channels[1].counter + 1.0;
             self.handleIrq(1, ic, cop0);
         }
 
         if (self.channels[0].syncEnable == 0) { return; }
         match (self.channels[0].syncMode) {
             0 { self.channels[0].paused = 1; }
-            1 { self.channels[0].counter = 0; }
+            1 { self.channels[0].counter = 0.0; }
             2 {
-                self.channels[0].counter = 0;
+                self.channels[0].counter = 0.0;
                 self.channels[0].paused = 0;
             }
             3 {
@@ -333,9 +321,9 @@ pub const Timer = struct {
         if (self.channels[1].syncEnable == 0) { return; }
         match (self.channels[1].syncMode) {
             0 { self.channels[1].paused = 1; }
-            1 { self.channels[1].counter = 0; }
+            1 { self.channels[1].counter = 0.0; }
             2 {
-                self.channels[1].counter = 0;
+                self.channels[1].counter = 0.0;
                 self.channels[1].paused = 0;
             }
             3 {

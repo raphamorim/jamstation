@@ -46,6 +46,13 @@ pub extern fn fflush(stream: u64) i32;
 pub extern fn getenv(name: *const[] u8) u64;
 pub extern fn fopen(path: u64, mode: *const[] u8) u64;
 pub extern fn fprintf(stream: u64, fmt: *const[] u8, ...) i32;
+// TEMP REG_TRACE downsample/window (rebuild jam + psxe -DTRACE_* to change):
+// emit one line every TRACE_STRIDE instructions, starting at TRACE_START.
+// STRIDE=10000 downsamples the whole run to localize the diverging frame;
+// then STRIDE=1 + START=<window> detail-traces it.
+const TRACE_START:  u64 = 0;
+const TRACE_STRIDE: u64 = 10000;
+const TRACE_END:    u64 = 9000000000;
 
 const Disc = struct {
     file: *mut[] u8,
@@ -1245,17 +1252,22 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         }
     }
     if (c.traceFp != 0) {
-        const topc: u32 = busRead32(bus, c.savedPc);
-        var tfmt: []u8 = "%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n";
-        fprintf(c.traceFp, tfmt.ptr, c.savedPc, topc,
-            regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7],
-            regs[8], regs[9], regs[10], regs[11], regs[12], regs[13], regs[14], regs[15],
-            regs[16], regs[17], regs[18], regs[19], regs[20], regs[21], regs[22], regs[23],
-            regs[24], regs[25], regs[26], regs[27], regs[28], regs[29], regs[30], regs[31],
-            c.hi, c.lo);
-        c.traceN = c.traceN + 1;
-        if ((c.traceN & 0xFFFFF) == 0) { fflush(c.traceFp); }
-        if (c.traceN >= 60000000) { fflush(c.traceFp); c.traceFp = 0; }
+        const ic: u64 = c.traceN;            // instruction index
+        c.traceN = ic + 1;
+        if (ic >= TRACE_START && ic < TRACE_END && ((ic - TRACE_START) % TRACE_STRIDE) == 0) {
+            const topc: u32 = busRead32(bus, c.savedPc);
+            // Leading %llu = cumulative cycle count BEFORE this instruction
+            // (jam c.cycles ↔ psxe total_cycles). Lets `cmp` of field 1
+            // pinpoint where the cycle models first disagree.
+            var tfmt: []u8 = "%llu %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n";
+            fprintf(c.traceFp, tfmt.ptr, c.cycles, c.savedPc, topc,
+                regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7],
+                regs[8], regs[9], regs[10], regs[11], regs[12], regs[13], regs[14], regs[15],
+                regs[16], regs[17], regs[18], regs[19], regs[20], regs[21], regs[22], regs[23],
+                regs[24], regs[25], regs[26], regs[27], regs[28], regs[29], regs[30], regs[31],
+                c.hi, c.lo);
+        }
+        if ((ic & 0x3FFFFF) == 0) { fflush(c.traceFp); }
     }
 
     //

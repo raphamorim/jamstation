@@ -293,48 +293,40 @@ fn loadBios(path: []u8, bus: Bus) u64 {
     return 0;
 }
 
-// Run one full NTSC frame.
+// Run one full NTSC frame, mirroring psxe's GPU timing EXACTLY.
 //
-// psxe (psx.c:39): NTSC framerate = 59.29 Hz, so cycles/frame =
-// 33,868,800 / 59.29 ≈ 571,366. Per scanline: 571,366 / 263 ≈ 2172.49.
-//
-// psxe runs the GPU on its own 53.693175 MHz clock: a scanline is 3413
-// GPU cycles, which is 3413 × (33.8688 / 53.693175) = 2152.97 CPU cycles.
-// We round to 2153. (An earlier 2172 was ~19 cycles/scanline too long —
-// ~5000/frame — which, combined with doing the line/VBlank update at the
-// scanline END instead of psxe's HBlank-start, drifted GPUSTAT bit 31 and
-// mistimed the VBlank IRQ; a full-instruction REG_TRACE diff against psxe
-// pinned the first divergence to exactly that, at L≈19.25M.)
-const CYCLES_PER_SCANLINE: u32 = 2153;
+// psxe runs the GPU on its own 53.693175 MHz clock (gpu.c psx_gpu_update):
+// a scanline is 3413 GPU cycles and HBlank spans [2560, 3413] (the last
+// ~25%). Each instruction advances a *float* accumulator by
+// `delta_cpu_cycles × (53.693175 / 33.868800)` GPU cycles. The HBlank
+// event — line++, GPUSTAT bit-31 (odd/even), VBlank IRQ — fires on the
+// crossing INTO [2560,3413]; the scanline wraps (acc -= 3413) on the
+// crossing back out. We replicate this in f32 so the sub-cycle phase
+// tracks psxe bit-for-bit: an integer cycles/scanline drifts ~0.03
+// cyc/line and by ~19M instructions mistimes a VBlank IRQ enough to
+// diverge (found via REG_TRACE cmp — see jamstation-psxe-parity memory).
+// jam's f32 behaviour on these exact values is pinned in
+// ../jam/tests/unit/test_float_psxe_parity.jam.
+const GPU_CYCLES_HDRAW: f32 = 2560.0;
+const GPU_CYCLES_SCANL: f32 = 3413.0;
 const SCANLINES_VDRAW: u32 = 240;
 const SCANLINES_TOTAL: u32 = 263;
 
-// Per-CPU-cycle peripheral ticking, mirroring psxe psx.c:27-46 psx_update.
-// Each iteration: one CPU instruction (typically 2 cycles), then tick
-// every peripheral with the actual delta. HBlank/VBlank events fire when
-// the cumulative cycle counter crosses the scanline / VDraw boundaries.
-//
-// Why this matters: psxe's IRQs land at exact CPU cycles. Our previous
-// per-scanline batch (cyc=2172 dumped once at line boundary) made IRQs
-// land at quantized points up to 2k cycles after the equivalent psxe
-// fire — games that polled an IRQ flag at instruction-level granularity
-// (Musashi, Harvest Moon) saw IRQs at the wrong instruction.
-
-// psxe: hblank window is ~25% of the scanline (cycles 2560..3413 of
-// 3413 GPU cycles, ≈ 75% draw + 25% blank). We mark HBlank_Begin at
-// HDRAW (cycles_per_scanline * 3/4) and HBlank_End at the scanline
-// boundary. Without the gap, T0 sync modes 0/2 collapse to noise and
-// any BIOS code that polls `hblank==1` busy-loops forever.
-const CYCLES_HDRAW: u32 = (CYCLES_PER_SCANLINE * 3) / 4;
+// f32↔u32 type-pun so the float scanline accumulator can persist across
+// frames in a GPU scratch u32 slot (slot 37); `line` lives in slot 36.
+const FloatBits = union { i: u32, f: f32 };
 
 fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
-    // The scanline counter and intra-scanline cycle accumulator are
+    // The scanline counter and the float GPU-cycle accumulator are
     // CONTINUOUS across frames, exactly like psxe's free-running gpu->line
-    // / gpu->cycles. Persist them in GPU scratch slots 36/37 so the phase
-    // doesn't reset (and re-quantize the VBlank IRQ) every frame.
+    // / gpu->cycles. Persist them in GPU scratch slots 36/37 (the f32 via
+    // a u32 type-pun) so the sub-cycle phase doesn't reset every frame.
     var gpuBuf: *mut[] u32 = bus.gpu.bufPtr();
-    var line:    u32 = gpuBuf[36];
-    var lineCyc: u32 = gpuBuf[37];
+    var line: u32 = gpuBuf[36];
+    var accB: FloatBits = FloatBits { i: gpuBuf[37] };
+    var acc: f32 = accB.f;
+    // psxe gpu.c: GPU cycles per CPU cycle = 53.693175 / 33.868800 MHz.
+    const ratio: f32 = (53.693175 as f32) / (33.868800 as f32);
     var frameDone: bool = false;
     while (!frameDone) {
         biosHook(c, bus, regs);
@@ -352,17 +344,14 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         // pitch from CPU loop speed, matching psxe (psx.c never calls
         // psx_spu_update either).
 
-        // Mirror psxe psx_gpu_update (gpu.c:1962-1983): the scanline is a
-        // single [0..SCANLINE] cycle window. The HBlank event — line++,
-        // GPUSTAT bit-31 odd/even flag, and the VBlank IRQ — fires when the
-        // accumulator first crosses INTO the hblank region [HDRAW,SCANLINE]
-        // (~75% through the line), NOT at the scanline end. The scanline
-        // wraps when it crosses back out. Doing the line/VBlank update at
-        // the scanline end (the old code) shifted every VBlank ~25% of a
-        // scanline late and flipped bit 31 at the wrong cycle.
-        const prevHb: bool = lineCyc >= CYCLES_HDRAW && lineCyc <= CYCLES_PER_SCANLINE;
-        lineCyc = lineCyc + delta;
-        const currHb: bool = lineCyc >= CYCLES_HDRAW && lineCyc <= CYCLES_PER_SCANLINE;
+        // Mirror psxe psx_gpu_update (gpu.c:1962-1983): a scanline is the
+        // GPU-cycle window [0,3413]; HBlank is [2560,3413]. The HBlank event
+        // — line++, GPUSTAT bit-31 odd/even flag, VBlank IRQ — fires on the
+        // crossing INTO [2560,3413] (~75% through the line), NOT at the
+        // scanline end; the scanline wraps on the crossing back out.
+        const prevHb: bool = acc >= GPU_CYCLES_HDRAW && acc <= GPU_CYCLES_SCANL;
+        acc = acc + (delta as f32) * ratio;
+        const currHb: bool = acc >= GPU_CYCLES_HDRAW && acc <= GPU_CYCLES_SCANL;
         if (currHb && !prevHb) {
             // psxe gpu_hblank_event (gpu.c:1908-1962), fired from the
             // HBlank-begin edge.
@@ -386,15 +375,17 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
                 frameDone = true;
             }
         } else if (prevHb && !currHb) {
-            // HBlank-end edge → wrap the scanline accumulator.
+            // HBlank-end edge → wrap the scanline accumulator (psxe:
+            // gpu->cycles -= 3413).
             bus.timer.hblankEnd();
-            lineCyc = lineCyc - CYCLES_PER_SCANLINE;
+            acc = acc - GPU_CYCLES_SCANL;
         }
     }
     // NOTE: do NOT commitLoad here — each instruction's own commitLoad
     // handles the R3000 load-delay slot.
     gpuBuf[36] = line;
-    gpuBuf[37] = lineCyc;
+    var outB: FloatBits = FloatBits { f: acc };
+    gpuBuf[37] = outB.i;
 }
 
 // Pre-fill VRAM with a soft gradient so the user sees the SDL pipe is

@@ -235,8 +235,14 @@ pub fn gpuGp1(g: *mut[] u32, val: u32) {
             g[46] = g[46] & (~0x00800000);
             g[46] = g[46] | ((val << 23) & 0x00800000);
         }
-        // DMA direction — stored in GPUSTAT bits 30..29.
-        0x04 { g[46] = (g[46] & (~0x60000000)) | ((val & 3) << 29); }
+        // GP1(04h) DMA direction. psxe IGNORES this command entirely
+        // (gpu.c:1850 `case 0x04: {} break;`) — it never reflects the
+        // direction into GPUSTAT bits 29-30, so they stay 0. Real hardware
+        // *does* set them, but matching psxe is the goal: storing the
+        // direction here made GPUSTAT bit 30 read 1 (dir 2) where psxe
+        // reads 0, and a game branch on that bit diverged the two
+        // (REG_TRACE cmp, L≈19.477M). Keep it a no-op.
+        0x04 { }
         0x05 {
             g[63] = val & 0x3FF;
             g[64] = (val >> 10) & 0x1FF;
