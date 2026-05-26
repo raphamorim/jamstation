@@ -659,6 +659,23 @@ pub fn spuHandleAdsr(s: *mut[] u8, v: u32) {
     setI32(s, base + D_ACYCLES, getI32(s, base + D_ACYRELOAD));
 }
 
+// Advance every playing voice's ADSR envelope by ONE SPU sample. Called
+// CPU-synchronously (once per 768 CPU cycles = 44.1 kHz) from runOneFrame
+// so the envelope level the game POLLS at voice reg 0xC (ENVCVOL) is
+// deterministic and matches psxe/hardware — instead of advancing on the
+// wall-clock audio thread (which desyncs from the CPU and made Brave Fencer
+// read a wrong envelope level, looping the intro resource-load → black FMV).
+// The audio thread no longer steps the envelope (removed from spuGetSample).
+pub fn spuStepAdsrCpu(s: *mut[] u8) {
+    var v: u32 = 0;
+    while (v < VOICE_COUNT) {
+        if (getU32(s, voiceRTBase(v) + D_PLAYING) != 0) {
+            spuHandleAdsr(s, v);
+        }
+        v = v + 1;
+    }
+}
+
 // ---------- KON / KOFF -----------------------------------------------
 
 pub fn spuKon(s: *mut[] u8, ram: *mut[] u8, value: u32) {
@@ -1157,19 +1174,14 @@ pub fn spuGaussInit(s: *mut[] u8) {
 // race — the audible effect is a one-block (~0.6 ms) glitch in the
 // worst case.
 pub export fn psone_audio_cb(userdata: u64, stream: *mut[] u8, len: i32) {
-    var ctx: *mut[] u8 = userdata as *mut[] u8;
-    var spu:    *mut[] u8  = getU64(ctx,  0) as *mut[] u8;
-    var spuram: *mut[] u8  = getU64(ctx,  8) as *mut[] u8;
-    var ic:     *mut[] u32 = getU64(ctx, 16) as *mut[] u32;
-    var cop0:   *mut[] u32 = getU64(ctx, 24) as *mut[] u32;
-
+    // The SPU is now advanced CPU-synchronously from runOneFrame (one
+    // sample per 768 CPU cycles) so the state the game polls is
+    // deterministic. The audio thread must NOT advance it (that would
+    // double-step). Output silence for now; reconnecting audio means
+    // feeding the CPU-generated samples here via a ring buffer (TODO).
     var i: i32 = 0;
     while (i < len) {
-        const sample: u32 = spuGetSample(spu, spuram, ic, cop0);
-        stream[i    ] = (sample         & 0xFF) as u8;
-        stream[i + 1] = ((sample >>  8) & 0xFF) as u8;
-        stream[i + 2] = ((sample >> 16) & 0xFF) as u8;
-        stream[i + 3] = ((sample >> 24) & 0xFF) as u8;
-        i = i + 4;
+        stream[i] = 0;
+        i = i + 1;
     }
 }

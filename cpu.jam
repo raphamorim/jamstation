@@ -50,9 +50,9 @@ pub extern fn fprintf(stream: u64, fmt: *const[] u8, ...) i32;
 // emit one line every TRACE_STRIDE instructions, starting at TRACE_START.
 // STRIDE=10000 downsamples the whole run to localize the diverging frame;
 // then STRIDE=1 + START=<window> detail-traces it.
-const TRACE_START:  u64 = 0;
-const TRACE_STRIDE: u64 = 10000;
-const TRACE_END:    u64 = 9000000000;
+const TRACE_START:  u64 = 50325000;
+const TRACE_STRIDE: u64 = 1;
+const TRACE_END:    u64 = 50335000;
 
 const Disc = struct {
     file: *mut[] u8,
@@ -1259,13 +1259,15 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
             // Leading %llu = cumulative cycle count BEFORE this instruction
             // (jam c.cycles ↔ psxe total_cycles). Lets `cmp` of field 1
             // pinpoint where the cycle models first disagree.
-            var tfmt: []u8 = "%llu %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n";
+            var tfmt: []u8 = "%llu %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n";
             fprintf(c.traceFp, tfmt.ptr, c.cycles, c.savedPc, topc,
                 regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7],
                 regs[8], regs[9], regs[10], regs[11], regs[12], regs[13], regs[14], regs[15],
                 regs[16], regs[17], regs[18], regs[19], regs[20], regs[21], regs[22], regs[23],
                 regs[24], regs[25], regs[26], regs[27], regs[28], regs[29], regs[30], regs[31],
-                c.hi, c.lo);
+                c.hi, c.lo,
+                bus.timer.dbgTimerCounter(0), bus.timer.dbgTimerCounter(1),
+                bus.timer.dbgTimerCounter(2));
         }
         if ((ic & 0x3FFFFF) == 0) { fflush(c.traceFp); }
     }

@@ -243,6 +243,12 @@ pub const Timer = struct {
         self.updateCyc(ic, cop0, 2);
     }
 
+    // TEMP REG_TRACE: truncated counter (as the game reads it) for the
+    // psxe divergence diff, to pin which timer's value drifts.
+    pub fn dbgTimerCounter(self: mut Self, i: u32) u32 {
+        return self.channels[i].counter as u32;
+    }
+
     pub fn updateCyc(self: mut Self, ic: *mut[] u32, cop0: *mut[] u32,
                  cyc: u32) {
         self.updateOne(0, cyc, ic, cop0);

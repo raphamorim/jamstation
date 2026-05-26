@@ -883,6 +883,15 @@ pub const Cdrom = struct {
         self.dataRidx = rIdx;
         self.dataWidx = wEnd;
 
+        if (lba >= 4805 && lba <= 4820) {
+            // TEMP: what did discReadAt load? sub=submode(0x12), the data
+            // word the game's size=504 DMA reads first is at byte rIdx+32.
+            var pf: []u8 = "[CDrd] lba=%u sub=%02x dataAt%u=%02x%02x%02x%02x\n";
+            printf(pf.ptr, lba, self.dataBuf[18] as u32, rIdx + 32,
+                self.dataBuf[rIdx + 32] as u32, self.dataBuf[rIdx + 33] as u32,
+                self.dataBuf[rIdx + 34] as u32, self.dataBuf[rIdx + 35] as u32);
+        }
+
         if ((self.mode as u32 & MODE_XA_ADPCM) != 0) {
             self.tryDecodeXa(spu);
         }
@@ -955,6 +964,10 @@ pub const Cdrom = struct {
             | ((self.readOngoing as u32) << 8)
             | ((self.mode as u32) << 16)
             | ((self.ifr as u32) << 24);
+    }
+    // TEMP: pack FIFO state — dataReq(bit28) | dataWidx(<<12) | dataRidx.
+    pub fn dbgFifo(self: mut Self) u32 {
+        return self.dataRidx | (self.dataWidx << 12) | ((self.dataReq as u32) << 28);
     }
 
     // Read one byte from the data FIFO (the 0x1F801802 register).

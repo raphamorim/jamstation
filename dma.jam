@@ -69,8 +69,9 @@ const Bus = struct {
 //           channel stay "busy" while the test polls CHCR — ps1-tests
 //           spu/memory-transfer testDMAWriteTiming asserts that the
 //           transfer is observable in-flight (loopCount > 0).
-const DMA_STATE_WORDS: u32 = 30;
+const DMA_STATE_WORDS: u32 = 32;
 const F_SPU_REMAIN: u32 = 29;
+// TEMP FMV probe: d[30]=mdecIn call count, d[31]=mdecOut call count.
 
 const F_MADR: u32 = 0;
 const F_BCR:  u32 = 1;
@@ -347,6 +348,7 @@ pub fn dmaDoMdecIn(d: *mut[] u32, bus: Bus) {
     const size: u32 = bcrSize(d, 0) * bcrBlocks(d, 0);
     const step: u32 = chcrStep(d, 0);
     var addr: u32 = d[chBase(0) + F_MADR];
+    const startAddr0: u32 = addr;
     var i: u32 = 0;
     while (i < size) {
         const w: u32 = ramRead32(bus, addr);
@@ -358,6 +360,11 @@ pub fn dmaDoMdecIn(d: *mut[] u32, bus: Bus) {
     d[chBase(0) + F_CHCR] = 0;
     d[chBase(0) + F_BCR]  = 0;
     d[23] = size;
+    d[30] = d[30] + 1;
+    if (d[30] <= 20 || (d[30] % 500) == 0) {
+        var pf: []u8 = "[MDECin] #%u size=%u madr=%08x mdecStat=%08x\n";
+        printf(pf.ptr, d[30], size, startAddr0, bus.mdec.read32(bus.mdecOut, 4));
+    }
 }
 
 // DMA1: MDEC output port → RAM. Match psxe exactly (dma.c:208-235).
@@ -377,6 +384,11 @@ pub fn dmaDoMdecOut(d: *mut[] u32, bus: Bus) {
     d[chBase(1) + F_CHCR] = 0;
     d[chBase(1) + F_BCR]  = 0;
     d[24] = size;
+    d[31] = d[31] + 1;
+    if (d[31] <= 20 || (d[31] % 500) == 0) {
+        var pf: []u8 = "[MDECout] #%u size=%u madr=%08x\n";
+        printf(pf.ptr, d[31], size, d[chBase(1) + F_MADR]);
+    }
 }
 
 // CD-ROM → RAM transfer. Each "word" in BCR.size is 4 bytes from the
@@ -393,6 +405,7 @@ pub fn dmaDoCdrom(d: *mut[] u32, bus: Bus) {
     const step: u32 = chcrStep(d, 3);
     var firstW: u32 = 0;
     var nonZero: u32 = 0;
+    const fifo0: u32 = bus.cdrom.dbgFifo();   // FIFO state BEFORE the transfer
     var i: u32 = 0;
     while (i < size) {
         const b0: u32 = bus.cdrom.readData();
@@ -407,9 +420,9 @@ pub fn dmaDoCdrom(d: *mut[] u32, bus: Bus) {
         i = i + 1;
     }
     const cdi: u32 = bus.cdrom.dbgInfo();
-    var df: []u8 = "[CDdma] madr=%08x size=%u firstW=%08x nonZero=%u lba=%u ifr=%02x\n";
-    printf(df.ptr, startAddr, size, firstW, nonZero,
-        bus.cdrom.dbgLba(), (cdi >> 24) & 0xFF);
+    var df: []u8 = "[CDdma] size=%u firstW=%08x nonZero=%u lba=%u req=%u ridx=%u widx=%u\n";
+    printf(df.ptr, size, firstW, nonZero, bus.cdrom.dbgLba(),
+        (fifo0 >> 28) & 1, fifo0 & 0xFFF, (fifo0 >> 12) & 0xFFF);
     d[chBase(3) + F_MADR] = addr;
     d[chBase(3) + F_CHCR] = 0;
     d[chBase(3) + F_BCR]  = 0;

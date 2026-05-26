@@ -22,7 +22,8 @@ const { Cdrom } = import("cdrom");
 const { discAlloc, discOpen } = import("disc");
 const { dmaAlloc, dmaTickSpu, dmaUpdate } = import("dma");
 const { padAlloc, padUpdate, padSetButtons } = import("pad");
-const { spuAlloc, spuRamAlloc, psone_audio_cb, setU64 } = import("spu");
+const { spuAlloc, spuRamAlloc, psone_audio_cb, setU64, spuStepAdsrCpu,
+        spuGetSample } = import("spu");
 const { Sio1 } = import("sio1");
 const { Mdec } = import("mdec");
 const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
@@ -327,6 +328,9 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     var acc: f32 = accB.f;
     // psxe gpu.c: GPU cycles per CPU cycle = 53.693175 / 33.868800 MHz.
     const ratio: f32 = (53.693175 as f32) / (33.868800 as f32);
+    // SPU sample accumulator: 1 sample per 768 CPU cycles (33.8688MHz/44100).
+    // Drives the ADSR envelope CPU-synchronously (slot 35, persisted).
+    var spuAcc: u32 = gpuBuf[35];
     var frameDone: bool = false;
     while (!frameDone) {
         biosHook(c, bus, regs);
@@ -339,10 +343,21 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         bus.cdrom.update(bus.disc, bus.spu, bus.irq, cop0, delta);
         padUpdate(bus.pad, bus.irq, cop0, delta);
         bus.sio1.update(bus.irq, cop0, delta);
-        // SPU is no longer ticked here — the audio thread owns its
-        // sample clock via psone_audio_cb at 44.1 kHz. This decouples
-        // pitch from CPU loop speed, matching psxe (psx.c never calls
-        // psx_spu_update either).
+        // SPU audio OUTPUT is generated on the audio thread (psone_audio_cb),
+        // but the ADSR ENVELOPE state must advance locked to the CPU so the
+        // level the game polls (voice reg 0xC) is deterministic — step it
+        // once per 768 CPU cycles (44.1 kHz). Without this the envelope rode
+        // the wall-clock audio thread and desynced, looping the FMV intro.
+        spuAcc = spuAcc + delta;
+        while (spuAcc >= 768) {
+            spuAcc = spuAcc - 768;
+            // Advance the WHOLE SPU (envelope + playback + ENDX) one sample,
+            // CPU-locked, so all SPU state the game polls is deterministic.
+            // (psone_audio_cb is now silent so it doesn't double-advance;
+            // audio output to be reconnected via a ring buffer later.) Stash
+            // the sample in a free GPU scratch slot to consume the return.
+            gpuBuf[34] = spuGetSample(bus.spu, bus.spuram, bus.irq, cop0);
+        }
 
         // Mirror psxe psx_gpu_update (gpu.c:1962-1983): a scanline is the
         // GPU-cycle window [0,3413]; HBlank is [2560,3413]. The HBlank event
@@ -386,6 +401,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     gpuBuf[36] = line;
     var outB: FloatBits = FloatBits { f: acc };
     gpuBuf[37] = outB.i;
+    gpuBuf[35] = spuAcc;
 }
 
 // Pre-fill VRAM with a soft gradient so the user sees the SDL pipe is
