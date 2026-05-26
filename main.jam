@@ -136,6 +136,9 @@ const Cpu = struct {
     savedPc: u32,
     hi: u32,
     lo: u32,
+    traceFp:   u64,
+    traceInit: u32,
+    traceN:    u64,
     loadD: u32,
     loadV: u32,
     branch: u8,
@@ -295,12 +298,14 @@ fn loadBios(path: []u8, bus: Bus) u64 {
 // psxe (psx.c:39): NTSC framerate = 59.29 Hz, so cycles/frame =
 // 33,868,800 / 59.29 ≈ 571,366. Per scanline: 571,366 / 263 ≈ 2172.49.
 //
-// We round to 2172 (per-frame total 571,236; 130 cycles short of psxe).
-// Earlier 2147 (33,868,800 / 60 / 263) was 6,700 short per frame and
-// drifted noticeably across multi-second boots; earlier 2175 was 459
-// long and triggered BIOS "VSync: timeout" messages. The current value
-// is within 130 cycles of psxe and matches its 59.29 Hz cadence.
-const CYCLES_PER_SCANLINE: u32 = 2172;
+// psxe runs the GPU on its own 53.693175 MHz clock: a scanline is 3413
+// GPU cycles, which is 3413 × (33.8688 / 53.693175) = 2152.97 CPU cycles.
+// We round to 2153. (An earlier 2172 was ~19 cycles/scanline too long —
+// ~5000/frame — which, combined with doing the line/VBlank update at the
+// scanline END instead of psxe's HBlank-start, drifted GPUSTAT bit 31 and
+// mistimed the VBlank IRQ; a full-instruction REG_TRACE diff against psxe
+// pinned the first divergence to exactly that, at L≈19.25M.)
+const CYCLES_PER_SCANLINE: u32 = 2153;
 const SCANLINES_VDRAW: u32 = 240;
 const SCANLINES_TOTAL: u32 = 263;
 
@@ -323,10 +328,15 @@ const SCANLINES_TOTAL: u32 = 263;
 const CYCLES_HDRAW: u32 = (CYCLES_PER_SCANLINE * 3) / 4;
 
 fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
-    var line: u32 = 0;
-    var lineCyc: u32 = 0;
-    var hblankFired: bool = false;
-    while (line < SCANLINES_TOTAL) {
+    // The scanline counter and intra-scanline cycle accumulator are
+    // CONTINUOUS across frames, exactly like psxe's free-running gpu->line
+    // / gpu->cycles. Persist them in GPU scratch slots 36/37 so the phase
+    // doesn't reset (and re-quantize the VBlank IRQ) every frame.
+    var gpuBuf: *mut[] u32 = bus.gpu.bufPtr();
+    var line:    u32 = gpuBuf[36];
+    var lineCyc: u32 = gpuBuf[37];
+    var frameDone: bool = false;
+    while (!frameDone) {
         biosHook(c, bus, regs);
         const before: u64 = c.cycles;
         step(c, bus, regs, cop0);
@@ -341,22 +351,22 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         // sample clock via psone_audio_cb at 44.1 kHz. This decouples
         // pitch from CPU loop speed, matching psxe (psx.c never calls
         // psx_spu_update either).
+
+        // Mirror psxe psx_gpu_update (gpu.c:1962-1983): the scanline is a
+        // single [0..SCANLINE] cycle window. The HBlank event — line++,
+        // GPUSTAT bit-31 odd/even flag, and the VBlank IRQ — fires when the
+        // accumulator first crosses INTO the hblank region [HDRAW,SCANLINE]
+        // (~75% through the line), NOT at the scanline end. The scanline
+        // wraps when it crosses back out. Doing the line/VBlank update at
+        // the scanline end (the old code) shifted every VBlank ~25% of a
+        // scanline late and flipped bit 31 at the wrong cycle.
+        const prevHb: bool = lineCyc >= CYCLES_HDRAW && lineCyc <= CYCLES_PER_SCANLINE;
         lineCyc = lineCyc + delta;
-        // HBlank begins ~75% into the scanline. Fire once per line.
-        if (!hblankFired && lineCyc >= CYCLES_HDRAW) {
+        const currHb: bool = lineCyc >= CYCLES_HDRAW && lineCyc <= CYCLES_PER_SCANLINE;
+        if (currHb && !prevHb) {
+            // psxe gpu_hblank_event (gpu.c:1908-1962), fired from the
+            // HBlank-begin edge.
             bus.timer.hblankBegin(bus.irq, cop0);
-            hblankFired = true;
-        }
-        if (lineCyc >= CYCLES_PER_SCANLINE) {
-            lineCyc = lineCyc - CYCLES_PER_SCANLINE;
-            hblankFired = false;
-            // HBlank ends at the scanline boundary, before the next line.
-            bus.timer.hblankEnd();
-            // psxe gpu.c:1908-1946: toggle GPUSTAT bit 31 (odd-line flag)
-            // per scanline. BIOS VSync uses this as a heartbeat; if it
-            // stays at 0, the BIOS busy-spins on GPUSTAT instead of
-            // returning to the VBlank handler chain that runs pad-poll.
-            var gpuBuf: *mut[] u32 = bus.gpu.bufPtr();
             if (line < SCANLINES_VDRAW) {
                 if ((line & 1) != 0) {
                     gpuBuf[46] = gpuBuf[46] | 0x80000000;
@@ -366,22 +376,25 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
             } else {
                 gpuBuf[46] = gpuBuf[46] & (~0x80000000);
             }
-            // psxe fires VBlank when `line` *becomes* 240, i.e. after the
-            // increment. Previously we fired before the increment, so
-            // VBlank arrived one scanline late (~2172 cycles).
             line = line + 1;
             if (line == SCANLINES_VDRAW) {
                 bus.timer.vblankBegin(bus.irq, cop0);
                 irqRaise(bus.irq, cop0, IC_VBLANK());
+            } else if (line == SCANLINES_TOTAL) {
+                bus.timer.vblankEnd();
+                line = 0;
+                frameDone = true;
             }
+        } else if (prevHb && !currHb) {
+            // HBlank-end edge → wrap the scanline accumulator.
+            bus.timer.hblankEnd();
+            lineCyc = lineCyc - CYCLES_PER_SCANLINE;
         }
     }
-    // NOTE: do NOT commitLoad here. Each instruction's own commitLoad
-    // handles the R3000 load-delay slot. Flushing at frame boundaries
-    // would eat the delay slot when a load lands on the last cycle of
-    // the frame (the delay-slot instruction runs in the next frame,
-    // and would see the new value instead of the old one).
-    bus.timer.vblankEnd();
+    // NOTE: do NOT commitLoad here — each instruction's own commitLoad
+    // handles the R3000 load-delay slot.
+    gpuBuf[36] = line;
+    gpuBuf[37] = lineCyc;
 }
 
 // Pre-fill VRAM with a soft gradient so the user sees the SDL pipe is
@@ -727,6 +740,12 @@ fn main() {
             printf(fmt.ptr, frames,
                 gpuState[72], gpuState[73], gpuState[74], gpuState[75],
                 gpuState[76], gpuState[77], gpuState[78], gpuState[79]);
+            const cdinfo: u32 = bus.cdrom.dbgInfo();
+            var cdfmt: []u8 = "      cd: lba=%u state=%02x readOngoing=%u mode=%02x ifr=%02x dispmode=%06x 24bpp=%u\n";
+            printf(cdfmt.ptr, bus.cdrom.dbgLba(),
+                cdinfo & 0xFF, (cdinfo >> 8) & 0xFF,
+                (cdinfo >> 16) & 0xFF, (cdinfo >> 24) & 0xFF,
+                gpuState[47], (gpuState[47] >> 4) & 1);
             flushAll();
         }
 

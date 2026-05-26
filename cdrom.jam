@@ -35,6 +35,9 @@ const {
 } = import("xa");
 const { spuPushCdSample } = import("spu");
 
+// TEMP FMV-debug: command/response trace.
+pub extern fn printf(format: *const[] u8, ...) i32;
+
 // Disc struct redeclaration (same shape as disc.jam).
 const Disc = struct {
     file: *mut[] u8,
@@ -360,6 +363,11 @@ pub const Cdrom = struct {
                           ic: *mut[] u32, cop0: *mut[] u32) {
         const cmd: u32 = self.pendingCmd as u32;
         self.busy = 0;
+
+        var dbgf: []u8 = "[CDcmd] cmd=%02x pcnt=%u pendingLba=%u lba=%u state=%02x mode=%02x\n";
+        printf(dbgf.ptr, cmd,
+            ((self.paramW as u32) - (self.paramR as u32)) & 0xFF,
+            self.pendingLba, self.lba, self.state as u32, self.mode as u32);
 
         // psxe cdrom_handle_resp1 prechecks (cdrom.c:271-447), before
         // dispatch: (1) disc-required commands with no disc → INT5(11h,80h),
@@ -688,6 +696,8 @@ pub const Cdrom = struct {
     // Seek / Pause).
     pub fn executeResp2(self: mut Self, disc: *mut[] Disc) {
         const cmd: u32 = self.pendingCmd as u32;
+        var dbgf2: []u8 = "[CDr2 ] cmd=%02x pendingLba=%u lba=%u state=%02x\n";
+        printf(dbgf2.ptr, cmd, self.pendingLba, self.lba, self.state as u32);
         if (cmd == CDL_INIT) {
             self.ifr = 2;
             self.pushResp(self.getStat());
@@ -935,6 +945,16 @@ pub const Cdrom = struct {
     // Read one sector at `lba` into the dataBuf. Returns 1 on success.
     pub fn discReadAt(self: mut Self, disc: *mut[] Disc, lba: u32) i32 {
         return discRead(disc, lba, self.dataBuf.asMutPtr());
+    }
+
+    // Debug: expose read position + packed state so the FMV probe can
+    // tell whether the drive is actively streaming sectors or idle.
+    pub fn dbgLba(self: mut Self) u32 { return self.lba; }
+    pub fn dbgInfo(self: mut Self) u32 {
+        return (self.state as u32)
+            | ((self.readOngoing as u32) << 8)
+            | ((self.mode as u32) << 16)
+            | ((self.ifr as u32) << 24);
     }
 
     // Read one byte from the data FIFO (the 0x1F801802 register).
