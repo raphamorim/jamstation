@@ -21,9 +21,7 @@
 // buffer is kept as a separate heap allocation (Bus.mcdRam) so callers
 // can load/save it from disk without owning the device state.
 
-pub extern fn malloc(size: u64) *mut[] u8;
-pub extern fn free(ptr: *mut[] u8);
-pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+const { Vec } = import("std/collections");
 // File I/O via std.fs (its libc externs are the single source).
 const { File } = import("std/fs");
 
@@ -234,13 +232,13 @@ pub const Mcd = struct {
     }
 };
 
-pub fn mcdRamAlloc() *mut[] u8 {
-    var raw: *mut[] u8 = malloc(MCD_MEMORY_SIZE);
-    memset(raw, 0, MCD_MEMORY_SIZE);
-    return raw;
+// 128 KB memory-card backing store, zero-filled via typed slot writes
+// (Buf.filled is safe for any T; optimizer collapses the u8 loop to a
+// memset at -O1+). Owned by the Bus's `mcdRam` Buf — its drop frees on
+// scope exit, no mcdRamFree helper needed.
+pub fn mcdRamAlloc() Vec(u8) {
+    return Vec(u8).filled(0, MCD_MEMORY_SIZE as u32);
 }
-
-pub fn mcdRamFree(r: *mut[] u8) { free(r); }
 
 // Read a 128 KB memory-card image from `path` into `ram`. Returns 1 on
 // success, 0 if the file is absent or unreadable. We use access(R_OK=4)

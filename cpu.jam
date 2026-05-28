@@ -29,7 +29,7 @@ const { busRead32, busRead16, busRead8,
 const { Gpu } = import("gpu");
 const { dmaAlloc } = import("dma");
 const { irqAlloc } = import("irq");
-const { Buf } = import("std/buf");
+const { Vec } = import("std/collections");
 const { Bus } = import("bus");
 const { Timer } = import("timer");
 const { gteAlloc, gteDataRead, gteDataWrite,
@@ -39,10 +39,9 @@ const { Mcd } = import("mcd");
 const { Sio1 } = import("sio1");
 const { Mdec } = import("mdec");
 
-pub extern fn malloc(size: u64) *mut[] u8;
-pub extern fn free(ptr: *mut[] u8);
-pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 pub extern fn putchar(c: i32) i32;
+
+const { Vec } = import("std/collections");
 pub extern fn fflush(stream: u64) i32;
 
 const Disc = struct {
@@ -107,22 +106,12 @@ const CAUSE_OV:      u32 = 0x30;
 
 // ---------- register file ----------------------------------------------
 //
-// 32 GPRs + 16 COP0 registers — both live in heap-allocated `*mut[] u32`
-// buffers. The buffers are cast from malloc's `*mut[] u8` return; the
-// codegen now honours pointer-type-aware loads and stores so a 4-byte
-// read is a single `LDR` rather than the hand-rolled little-endian decode
-// the original implementation needed.
-
-pub fn allocRegFile(n: u32) *mut[] u32 {
-    const bytes: u64 = (n as u64) * @sizeOf(u32);
-    var raw: *mut[] u8 = malloc(bytes);
-    memset(raw, 0, bytes);
-    return raw as *mut[] u32;
-}
-
-pub fn freeRegFile(p: *mut[] u32) {
-    free(p as *mut[] u8);
-}
+// 32 GPRs + 16 COP0 registers — both live in heap-allocated `Vec(u32)`
+// buffers that auto-drop with their owning scope. Callers pass `regs.ptr`
+// (typed `*mut[] u32`) into the gprRead/Write/cop0Read/Write helpers so
+// the hot loop stays as a single `LDR` per access (no per-call Vec
+// indirection in the helpers).
+pub fn allocRegFile(n: u32) Vec(u32) { return Vec(u32).filled(0, n); }
 
 pub fn gprRead(regs: *mut[] u32, idx: u32) u32 { return regs[idx]; }
 pub fn gprWrite(regs: *mut[] u32, idx: u32, val: u32) {
@@ -879,32 +868,32 @@ pub fn iCop2Unimpl(c: mut Cpu, opc: u32, bus: Bus,
         // MFC2 — unconditional pending-load commit, like psxe (cpu.c:1449).
         commitLoad(c, regs);
         c.loadD = opRt(opc);
-        c.loadV = gteDataRead(bus.gte, opRd(opc));
+        c.loadV = gteDataRead(bus.gte.ptr, opRd(opc));
         return;
     }
     if (rs == 0x02) {
         // CFC2 — unconditional pending-load commit, like psxe (cpu.c:1458).
         commitLoad(c, regs);
         c.loadD = opRt(opc);
-        c.loadV = gteCtrlRead(bus.gte, opRd(opc));
+        c.loadV = gteCtrlRead(bus.gte.ptr, opRd(opc));
         return;
     }
     if (rs == 0x04) {
         const v: u32 = gprRead(regs, opRt(opc));
         commitLoad(c, regs);
-        gteDataWrite(bus.gte, opRd(opc), v);
+        gteDataWrite(bus.gte.ptr, opRd(opc), v);
         return;
     }
     if (rs == 0x06) {
         const v: u32 = gprRead(regs, opRt(opc));
         commitLoad(c, regs);
-        gteCtrlWrite(bus.gte, opRd(opc), v);
+        gteCtrlWrite(bus.gte.ptr, opRd(opc), v);
         return;
     }
     // COP2 math op (RTPS, NCLIP, ...) — bottom 25 bits encode the
     // operation; gteExec dispatches on the low 6.
     commitLoad(c, regs);
-    gteExec(bus.gte, opc);
+    gteExec(bus.gte.ptr, opc);
     // GTE math ops cost more than the 2-cycle base step() already charged
     // (RTPS=15, NCDT=44, ...); add the remainder so device timing matches
     // psxe through GTE-heavy code (cpu.c psx_cpu_execute GTE switch).
@@ -924,7 +913,7 @@ pub fn iCop2Lwc(c: mut Cpu, opc: u32, bus: Bus,
         raiseException(c, cop0, CAUSE_ADEL);
         return;
     }
-    gteDataWrite(bus.gte, opRt(opc), busRead32(bus, addr));
+    gteDataWrite(bus.gte.ptr, opRt(opc), busRead32(bus, addr));
 }
 
 pub fn iCop2Swc(c: mut Cpu, opc: u32, bus: Bus,
@@ -941,7 +930,7 @@ pub fn iCop2Swc(c: mut Cpu, opc: u32, bus: Bus,
     // is isolated. Real R3000 routes the access to the I-cache instead
     // of memory; emulators just no-op the store.
     if ((cop0Read(cop0, C0_SR) & SR_ISC) != 0) { return; }
-    busWrite32(bus, cop0, addr, gteDataRead(bus.gte, opRt(opc)));
+    busWrite32(bus, cop0, addr, gteDataRead(bus.gte.ptr, opRt(opc)));
 }
 
 pub fn illegal(c: mut Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) {
@@ -1220,7 +1209,7 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         // (cpu.c psx_cpu_cycle: total_cycles += last_cycles, then return).
         var irqCyc: u64 = fetchCyc;
         if ((irqOpc & 0xFE000000) == 0x4A000000) {
-            gteExec(bus.gte, irqOpc);
+            gteExec(bus.gte.ptr, irqOpc);
             irqCyc = irqCyc + (gteOpCycles(irqOpc) as u64);
         }
         c.cycles = c.cycles + irqCyc;

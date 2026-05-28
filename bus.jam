@@ -12,23 +12,23 @@
 
 const { Gpu } = import("gpu");
 const { dmaRead32, dmaRead16, dmaRead8,
-        dmaWrite32, dmaWrite16, dmaWrite8, dmaAlloc, dmaFree } = import("dma");
+        dmaWrite32, dmaWrite16, dmaWrite8, dmaAlloc } = import("dma");
 const { irqRead32, irqRead16, irqRead8,
         irqWrite32, irqWrite16, irqWrite8, irqAlloc } = import("irq");
-const { Buf } = import("std/buf");
+const { Vec } = import("std/collections");
 const { Timer } = import("timer");
-const { gteAlloc, gteFree } = import("gte");
+const { gteAlloc } = import("gte");
 const { Cdrom } = import("cdrom");
 const { discAlloc, discFree } = import("disc");
 const { padRead32, padRead16, padRead8,
         padWrite32, padWrite16, padWrite8,
-        padAlloc, padFree } = import("pad");
+        padAlloc } = import("pad");
 const { spuRead32, spuRead16, spuRead8,
         spuWrite32, spuWrite16, spuWrite8,
-        spuAlloc, spuRamAlloc, spuFree, spuRamFree } = import("spu");
-const { Mdec, mdecInputAlloc, mdecOutputAlloc, mdecBufFree } = import("mdec");
+        spuAlloc, spuRamAlloc } = import("spu");
+const { Mdec, mdecInputAlloc, mdecOutputAlloc } = import("mdec");
 const { Sio1 } = import("sio1");
-const { Mcd, mcdRamAlloc, mcdRamFree } = import("mcd");
+const { Mcd, mcdRamAlloc } = import("mcd");
 
 // Disc shape — kept in sync with disc.jam so callers can reference the
 // stored pointer via `bus.disc[0]`.
@@ -41,9 +41,6 @@ const Disc = struct {
     cuePtr: *mut[] u8,
 };
 
-pub extern fn malloc(size: u64) *mut[] u8;
-pub extern fn free(ptr: *mut[] u8);
-pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 pub extern fn fflush(stream: u64) i32;
 
 // The Bus struct holds every piece of state we route through the
@@ -52,27 +49,27 @@ pub extern fn fflush(stream: u64) i32;
 // shape structurally — Jam v0.1.0 doesn't reliably export struct types
 // across modules.
 pub const Bus = struct {
-    ram:  *mut[] u8,
-    bios: *mut[] u8,
-    spad: *mut[] u8,
-    io:   *mut[] u8,
-    vram: *mut[] u8,
+    ram:  Vec(u8),
+    bios: Vec(u8),
+    spad: Vec(u8),
+    io:   Vec(u8),
+    vram: Vec(u8),
     gpu:   Gpu,
-    dma:   *mut[] u32,
-    irq:   Buf(u32),
+    dma:   Vec(u32),
+    irq:   Vec(u32),
     timer: Timer,
-    gte:   *mut[] u32,
+    gte:   Vec(u32),
     cdrom: Cdrom,
     disc:  *mut[] Disc,
-    pad:   *mut[] u8,
-    spu:     *mut[] u8,
-    spuram:  *mut[] u8,
+    pad:   Vec(u8),
+    spu:     Vec(u8),
+    spuram:  Vec(u8),
     mdec:    Mdec,
-    mdecIn:  *mut[] u8,
-    mdecOut: *mut[] u8,
+    mdecIn:  Vec(u8),
+    mdecOut: Vec(u8),
     sio1:    Sio1,
     mcd:     Mcd,
-    mcdRam:  *mut[] u8,
+    mcdRam:  Vec(u8),
     biosLoaded: u8,
 };
 
@@ -176,31 +173,33 @@ pub fn route(paddr: u32) BusRoute {
 // ---------- public surface ---------------------------------------------
 
 pub fn allocBus() Bus {
-    var ram:  *mut[] u8 = malloc(RAM_SIZE  as u64);
-    var bios: *mut[] u8 = malloc(BIOS_SIZE as u64);
-    var spad: *mut[] u8 = malloc(SPAD_SIZE as u64);
-    var io:   *mut[] u8 = malloc(IO_SIZE   as u64);
-    var vram: *mut[] u8 = malloc(VRAM_SIZE as u64);
-    memset(ram,  0, RAM_SIZE  as u64);
-    memset(bios, 0, BIOS_SIZE as u64);
-    memset(spad, 0, SPAD_SIZE as u64);
-    memset(io,   0, IO_SIZE   as u64);
-    memset(vram, 0, VRAM_SIZE as u64);
+    // RAM/BIOS get rewritten end-to-end by the loader (fread overwrites
+    // every byte), so withCapacity+setLen avoids the zero-fill traffic
+    // — Rust's `Vec::with_capacity(n) + set_len(n)` pattern. SPAD/IO/VRAM
+    // need zeroed defaults at boot (the BIOS reads them before writing),
+    // so they take the filled(0, N) path.
+    var ram:  Vec(u8) = Vec(u8).withCapacity(RAM_SIZE);
+    var bios: Vec(u8) = Vec(u8).withCapacity(BIOS_SIZE);
+    ram.setLen(RAM_SIZE);
+    bios.setLen(BIOS_SIZE);
+    var spad: Vec(u8) = Vec(u8).filled(0, SPAD_SIZE);
+    var io:   Vec(u8) = Vec(u8).filled(0, IO_SIZE);
+    var vram: Vec(u8) = Vec(u8).filled(0, VRAM_SIZE);
     // Pre-init MC1 (0x1F801000..0x1F801023) and MC2 (0x1F801060) with the
     // BIOS-expected default values per psxe mc1.c/mc2.c. The BIOS reads
     // these at boot to verify access timings and RAM mirror config; before
     // it writes them itself the values must match real hardware so the
     // self-check doesn't latch a "?" error.
-    bufWrite32(io, 0x00, 0x1F000000);  // EXP1_BASE
-    bufWrite32(io, 0x04, 0x1F802000);  // EXP2_BASE
-    bufWrite32(io, 0x08, 0x0013243F);  // EXP1_DELAY
-    bufWrite32(io, 0x0C, 0x00003022);  // EXP3_DELAY
-    bufWrite32(io, 0x10, 0x0013243F);  // BIOS_DELAY
-    bufWrite32(io, 0x14, 0x200931E1);  // SPU_DELAY
-    bufWrite32(io, 0x18, 0x00020843);  // CDROM_DELAY
-    bufWrite32(io, 0x1C, 0x00070777);  // EXP2_DELAY
-    bufWrite32(io, 0x20, 0x00031125);  // COM_DELAY
-    bufWrite32(io, 0x60, 0x00000B88);  // MC2 RAM_SIZE (2 MB mirror config)
+    bufWrite32(io.ptr, 0x00, 0x1F000000);  // EXP1_BASE
+    bufWrite32(io.ptr, 0x04, 0x1F802000);  // EXP2_BASE
+    bufWrite32(io.ptr, 0x08, 0x0013243F);  // EXP1_DELAY
+    bufWrite32(io.ptr, 0x0C, 0x00003022);  // EXP3_DELAY
+    bufWrite32(io.ptr, 0x10, 0x0013243F);  // BIOS_DELAY
+    bufWrite32(io.ptr, 0x14, 0x200931E1);  // SPU_DELAY
+    bufWrite32(io.ptr, 0x18, 0x00020843);  // CDROM_DELAY
+    bufWrite32(io.ptr, 0x1C, 0x00070777);  // EXP2_DELAY
+    bufWrite32(io.ptr, 0x20, 0x00031125);  // COM_DELAY
+    bufWrite32(io.ptr, 0x60, 0x00000B88);  // MC2 RAM_SIZE (2 MB mirror config)
     var b: Bus = Bus {
         ram: ram, bios: bios, spad: spad, io: io, vram: vram,
         gpu:   Gpu.init(),
@@ -225,80 +224,74 @@ pub fn allocBus() Bus {
 }
 
 pub fn freeBus(b: Bus) {
-    free(b.ram);
-    free(b.bios);
-    free(b.spad);
-    free(b.io);
-    free(b.vram);
+    // b.ram.ptr/bios/spad/io/vram are Vec(u8) — auto-dropped with `b`.
     // b.gpu is by-value; no free needed.
-    dmaFree(b.dma);
-    // b.irq is a Buf(u32) — auto-dropped when `b` goes out of scope.
+    // b.dma is a Vec(u32) — auto-dropped when `b` goes out of scope.
+    // b.irq is a Vec(u32) — auto-dropped when `b` goes out of scope.
     // b.timer is by-value; no free needed.
-    gteFree(b.gte);
+    // b.gte is a Vec(u32) — auto-dropped when `b` goes out of scope.
     // b.cdrom is by-value; no free needed.
     discFree(b.disc);
-    padFree(b.pad);
-    spuFree(b.spu);
-    spuRamFree(b.spuram);
+    // b.pad is a Vec(u8) — auto-dropped when `b` goes out of scope.
+    // b.spu and b.spuram are Vec(u8) — auto-dropped when `b` goes out of scope.
     // b.mdec is by-value; no free needed.
-    mdecBufFree(b.mdecIn);
-    mdecBufFree(b.mdecOut);
+    // b.mdecIn and b.mdecOut are Vec(u8) — auto-dropped when `b` goes out of scope.
     // b.sio1 is by-value; no free needed.
     // b.mcd is by-value; no free needed.
-    mcdRamFree(b.mcdRam);
+    // b.mcdRam is a Vec(u8) — auto-dropped when `b` goes out of scope.
 }
 
 // Dispatch an IO-region address to the right device. The offset is
 // relative to 0x1F801000 (i.e. r.off from the BusRoute).
 pub fn ioRead32(bus: Bus, off: u32) u32 {
     match (off) {
-        0x040..=0x04F { return padRead32(bus.pad, bus.mcd, bus.mcdRam, off - 0x040); }
+        0x040..=0x04F { return padRead32(bus.pad.ptr, bus.mcd, bus.mcdRam.ptr, off - 0x040); }
         0x050..=0x05F { return bus.sio1.read32(off - 0x050); }
-        0x070..=0x07F { return irqRead32(bus.irq.typed(), off - 0x070); }
-        0x080..=0x0FF { return dmaRead32(bus.dma, off - 0x080); }
+        0x070..=0x07F { return irqRead32(bus.irq.ptr, off - 0x070); }
+        0x080..=0x0FF { return dmaRead32(bus.dma.ptr, off - 0x080); }
         0x100..=0x12F { return bus.timer.read32(off - 0x100); }
         0x800..=0x803 { return bus.cdrom.read32(off - 0x800); }
-        0x810..=0x817 { return bus.gpu.read32(bus.vram, off - 0x810); }
-        0x820..=0x827 { return bus.mdec.read32(bus.mdecOut, off - 0x820); }
-        0xC00..=0xFFF { return spuRead32(bus.spu, bus.spuram, off - 0xC00); }
+        0x810..=0x817 { return bus.gpu.read32(bus.vram.ptr, off - 0x810); }
+        0x820..=0x827 { return bus.mdec.read32(bus.mdecOut.ptr, off - 0x820); }
+        0xC00..=0xFFF { return spuRead32(bus.spu.ptr, bus.spuram.ptr, off - 0xC00); }
         _ {}
     }
     if (off >= IO_SIZE) { return 0; }
-    return bufRead32(bus.io, off);
+    return bufRead32(bus.io.ptr, off);
 }
 
 pub fn ioRead16(bus: Bus, off: u32) u32 {
     match (off) {
-        0x040..=0x04F { return padRead16(bus.pad, bus.mcd, bus.mcdRam, off - 0x040); }
+        0x040..=0x04F { return padRead16(bus.pad.ptr, bus.mcd, bus.mcdRam.ptr, off - 0x040); }
         0x050..=0x05F { return bus.sio1.read16(off - 0x050); }
-        0x070..=0x07F { return irqRead16(bus.irq.typed(), off - 0x070); }
-        0x080..=0x0FF { return dmaRead16(bus.dma, off - 0x080); }
+        0x070..=0x07F { return irqRead16(bus.irq.ptr, off - 0x070); }
+        0x080..=0x0FF { return dmaRead16(bus.dma.ptr, off - 0x080); }
         0x100..=0x12F { return bus.timer.read16(off - 0x100); }
         0x800..=0x803 { return bus.cdrom.read16(off - 0x800); }
-        0x810..=0x817 { return bus.gpu.read16(bus.vram, off - 0x810); }
-        0x820..=0x827 { return bus.mdec.read16(bus.mdecOut, off - 0x820); }
-        0xC00..=0xFFF { return spuRead16(bus.spu, bus.spuram, off - 0xC00); }
+        0x810..=0x817 { return bus.gpu.read16(bus.vram.ptr, off - 0x810); }
+        0x820..=0x827 { return bus.mdec.read16(bus.mdecOut.ptr, off - 0x820); }
+        0xC00..=0xFFF { return spuRead16(bus.spu.ptr, bus.spuram.ptr, off - 0xC00); }
         _ {}
     }
     if (off >= IO_SIZE) { return 0; }
-    return bufRead16(bus.io, off);
+    return bufRead16(bus.io.ptr, off);
 }
 
 pub fn ioRead8(bus: Bus, off: u32) u32 {
     match (off) {
-        0x040..=0x04F { return padRead8(bus.pad, bus.mcd, bus.mcdRam, off - 0x040); }
+        0x040..=0x04F { return padRead8(bus.pad.ptr, bus.mcd, bus.mcdRam.ptr, off - 0x040); }
         0x050..=0x05F { return bus.sio1.read8(off - 0x050); }
-        0x070..=0x07F { return irqRead8(bus.irq.typed(), off - 0x070); }
-        0x080..=0x0FF { return dmaRead8(bus.dma, off - 0x080); }
+        0x070..=0x07F { return irqRead8(bus.irq.ptr, off - 0x070); }
+        0x080..=0x0FF { return dmaRead8(bus.dma.ptr, off - 0x080); }
         0x100..=0x12F { return bus.timer.read8(off - 0x100); }
         0x800..=0x803 { return bus.cdrom.read8(off - 0x800); }
-        0x810..=0x817 { return bus.gpu.read8(bus.vram, off - 0x810); }
-        0x820..=0x827 { return bus.mdec.read8(bus.mdecOut, off - 0x820); }
-        0xC00..=0xFFF { return spuRead8(bus.spu, bus.spuram, off - 0xC00); }
+        0x810..=0x817 { return bus.gpu.read8(bus.vram.ptr, off - 0x810); }
+        0x820..=0x827 { return bus.mdec.read8(bus.mdecOut.ptr, off - 0x820); }
+        0xC00..=0xFFF { return spuRead8(bus.spu.ptr, bus.spuram.ptr, off - 0xC00); }
         _ {}
     }
     if (off >= IO_SIZE) { return 0; }
-    return bufRead8(bus.io, off);
+    return bufRead8(bus.io.ptr, off);
 }
 
 // Write dispatch — same table for writes. Note that DMA writes need
@@ -307,53 +300,53 @@ pub fn ioRead8(bus: Bus, off: u32) u32 {
 // require those parameters at the outer interface.
 pub fn ioWrite32(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     match (off) {
-        0x040..=0x04F { padWrite32(bus.pad, bus.mcd, off - 0x040, val); return; }
+        0x040..=0x04F { padWrite32(bus.pad.ptr, bus.mcd, off - 0x040, val); return; }
         0x050..=0x05F { bus.sio1.write32(off - 0x050, val); return; }
-        0x070..=0x07F { irqWrite32(bus.irq.typed(), cop0, off - 0x070, val); return; }
-        0x080..=0x0FF { dmaWrite32(bus.dma, bus, cop0, off - 0x080, val); return; }
-        0x100..=0x12F { bus.timer.write32(bus.irq.typed(), cop0, off - 0x100, val); return; }
+        0x070..=0x07F { irqWrite32(bus.irq.ptr, cop0, off - 0x070, val); return; }
+        0x080..=0x0FF { dmaWrite32(bus.dma.ptr, bus, cop0, off - 0x080, val); return; }
+        0x100..=0x12F { bus.timer.write32(bus.irq.ptr, cop0, off - 0x100, val); return; }
         0x800..=0x803 { bus.cdrom.write32(off - 0x800, val); return; }
-        0x810..=0x817 { bus.gpu.write32(bus.vram, off - 0x810, val); return; }
-        0x820..=0x827 { bus.mdec.write32(bus.mdecIn, bus.mdecOut, off - 0x820, val); return; }
-        0xC00..=0xFFF { spuWrite32(bus.spu, bus.spuram, off - 0xC00, val); return; }
+        0x810..=0x817 { bus.gpu.write32(bus.vram.ptr, off - 0x810, val); return; }
+        0x820..=0x827 { bus.mdec.write32(bus.mdecIn.ptr, bus.mdecOut.ptr, off - 0x820, val); return; }
+        0xC00..=0xFFF { spuWrite32(bus.spu.ptr, bus.spuram.ptr, off - 0xC00, val); return; }
         _ {}
     }
     if (off >= IO_SIZE) { return; }
-    bufWrite32(bus.io, off, val);
+    bufWrite32(bus.io.ptr, off, val);
 }
 
 pub fn ioWrite16(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     match (off) {
-        0x040..=0x04F { padWrite16(bus.pad, bus.mcd, off - 0x040, val); return; }
+        0x040..=0x04F { padWrite16(bus.pad.ptr, bus.mcd, off - 0x040, val); return; }
         0x050..=0x05F { bus.sio1.write16(off - 0x050, val); return; }
-        0x070..=0x07F { irqWrite16(bus.irq.typed(), cop0, off - 0x070, val); return; }
-        0x080..=0x0FF { dmaWrite16(bus.dma, bus, cop0, off - 0x080, val); return; }
-        0x100..=0x12F { bus.timer.write16(bus.irq.typed(), cop0, off - 0x100, val); return; }
+        0x070..=0x07F { irqWrite16(bus.irq.ptr, cop0, off - 0x070, val); return; }
+        0x080..=0x0FF { dmaWrite16(bus.dma.ptr, bus, cop0, off - 0x080, val); return; }
+        0x100..=0x12F { bus.timer.write16(bus.irq.ptr, cop0, off - 0x100, val); return; }
         0x800..=0x803 { bus.cdrom.write16(off - 0x800, val); return; }
-        0x810..=0x817 { bus.gpu.write16(bus.vram, off - 0x810, val); return; }
-        0x820..=0x827 { bus.mdec.write16(bus.mdecIn, bus.mdecOut, off - 0x820, val); return; }
-        0xC00..=0xFFF { spuWrite16(bus.spu, bus.spuram, off - 0xC00, val); return; }
+        0x810..=0x817 { bus.gpu.write16(bus.vram.ptr, off - 0x810, val); return; }
+        0x820..=0x827 { bus.mdec.write16(bus.mdecIn.ptr, bus.mdecOut.ptr, off - 0x820, val); return; }
+        0xC00..=0xFFF { spuWrite16(bus.spu.ptr, bus.spuram.ptr, off - 0xC00, val); return; }
         _ {}
     }
     if (off >= IO_SIZE) { return; }
-    bufWrite16(bus.io, off, val);
+    bufWrite16(bus.io.ptr, off, val);
 }
 
 pub fn ioWrite8(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     match (off) {
-        0x040..=0x04F { padWrite8(bus.pad, bus.mcd, off - 0x040, val); return; }
+        0x040..=0x04F { padWrite8(bus.pad.ptr, bus.mcd, off - 0x040, val); return; }
         0x050..=0x05F { bus.sio1.write8(off - 0x050, val); return; }
-        0x070..=0x07F { irqWrite8(bus.irq.typed(), cop0, off - 0x070, val); return; }
-        0x080..=0x0FF { dmaWrite8(bus.dma, bus, cop0, off - 0x080, val); return; }
-        0x100..=0x12F { bus.timer.write8(bus.irq.typed(), cop0, off - 0x100, val); return; }
+        0x070..=0x07F { irqWrite8(bus.irq.ptr, cop0, off - 0x070, val); return; }
+        0x080..=0x0FF { dmaWrite8(bus.dma.ptr, bus, cop0, off - 0x080, val); return; }
+        0x100..=0x12F { bus.timer.write8(bus.irq.ptr, cop0, off - 0x100, val); return; }
         0x800..=0x803 { bus.cdrom.write8(off - 0x800, val); return; }
-        0x810..=0x817 { bus.gpu.write8(bus.vram, off - 0x810, val); return; }
-        0x820..=0x827 { bus.mdec.write8(bus.mdecIn, bus.mdecOut, off - 0x820, val); return; }
-        0xC00..=0xFFF { spuWrite8(bus.spu, bus.spuram, off - 0xC00, val); return; }
+        0x810..=0x817 { bus.gpu.write8(bus.vram.ptr, off - 0x810, val); return; }
+        0x820..=0x827 { bus.mdec.write8(bus.mdecIn.ptr, bus.mdecOut.ptr, off - 0x820, val); return; }
+        0xC00..=0xFFF { spuWrite8(bus.spu.ptr, bus.spuram.ptr, off - 0xC00, val); return; }
         _ {}
     }
     if (off >= IO_SIZE) { return; }
-    bufWrite8(bus.io, off, val);
+    bufWrite8(bus.io.ptr, off, val);
 }
 
 // `busRead/Write` is the public memory-access surface — `cop0` is only
@@ -364,9 +357,9 @@ pub fn busRead32(bus: Bus, addr: u32) u32 {
     const paddr: u32 = addr & regionMask(addr);
     const r: BusRoute = route(paddr);
     match (r.kind) {
-        1 { return bufRead32(bus.ram,  r.off & (RAM_SIZE  - 1)); }
-        2 { return bufRead32(bus.bios, r.off & (BIOS_SIZE - 1)); }
-        3 { return bufRead32(bus.spad, r.off & (SPAD_SIZE - 1)); }
+        1 { return bufRead32(bus.ram.ptr,  r.off & (RAM_SIZE  - 1)); }
+        2 { return bufRead32(bus.bios.ptr, r.off & (BIOS_SIZE - 1)); }
+        3 { return bufRead32(bus.spad.ptr, r.off & (SPAD_SIZE - 1)); }
         4 { return ioRead32(bus, r.off); }
         // kind 5: EXP1 (no cart loaded) — psxe exp1.c reads return 0xFF per byte.
         5 { return 0xFFFFFFFF; }
@@ -378,9 +371,9 @@ pub fn busRead16(bus: Bus, addr: u32) u32 {
     const paddr: u32 = addr & regionMask(addr);
     const r: BusRoute = route(paddr);
     match (r.kind) {
-        1 { return bufRead16(bus.ram,  r.off & (RAM_SIZE  - 1)); }
-        2 { return bufRead16(bus.bios, r.off & (BIOS_SIZE - 1)); }
-        3 { return bufRead16(bus.spad, r.off & (SPAD_SIZE - 1)); }
+        1 { return bufRead16(bus.ram.ptr,  r.off & (RAM_SIZE  - 1)); }
+        2 { return bufRead16(bus.bios.ptr, r.off & (BIOS_SIZE - 1)); }
+        3 { return bufRead16(bus.spad.ptr, r.off & (SPAD_SIZE - 1)); }
         4 { return ioRead16(bus, r.off); }
         5 { return 0xFFFF; }
         _ { return 0; }
@@ -391,9 +384,9 @@ pub fn busRead8(bus: Bus, addr: u32) u32 {
     const paddr: u32 = addr & regionMask(addr);
     const r: BusRoute = route(paddr);
     match (r.kind) {
-        1 { return bufRead8(bus.ram,  r.off & (RAM_SIZE  - 1)); }
-        2 { return bufRead8(bus.bios, r.off & (BIOS_SIZE - 1)); }
-        3 { return bufRead8(bus.spad, r.off & (SPAD_SIZE - 1)); }
+        1 { return bufRead8(bus.ram.ptr,  r.off & (RAM_SIZE  - 1)); }
+        2 { return bufRead8(bus.bios.ptr, r.off & (BIOS_SIZE - 1)); }
+        3 { return bufRead8(bus.spad.ptr, r.off & (SPAD_SIZE - 1)); }
         4 { return ioRead8(bus, r.off); }
         5 { return 0xFF; }
         // EXP2 DTL: ATC_STAT (off 0) reads atc_stat|8; jam never drives
@@ -408,8 +401,8 @@ pub fn busWrite32(bus: Bus, cop0: *mut[] u32, addr: u32, val: u32) {
     const paddr: u32 = addr & regionMask(addr);
     const r: BusRoute = route(paddr);
     match (r.kind) {
-        1 { bufWrite32(bus.ram,  r.off & (RAM_SIZE  - 1), val); }
-        3 { bufWrite32(bus.spad, r.off & (SPAD_SIZE - 1), val); }
+        1 { bufWrite32(bus.ram.ptr,  r.off & (RAM_SIZE  - 1), val); }
+        3 { bufWrite32(bus.spad.ptr, r.off & (SPAD_SIZE - 1), val); }
         4 { ioWrite32(bus, cop0, r.off, val); }
         _ {}
     }
@@ -419,8 +412,8 @@ pub fn busWrite16(bus: Bus, cop0: *mut[] u32, addr: u32, val: u32) {
     const paddr: u32 = addr & regionMask(addr);
     const r: BusRoute = route(paddr);
     match (r.kind) {
-        1 { bufWrite16(bus.ram,  r.off & (RAM_SIZE  - 1), val); }
-        3 { bufWrite16(bus.spad, r.off & (SPAD_SIZE - 1), val); }
+        1 { bufWrite16(bus.ram.ptr,  r.off & (RAM_SIZE  - 1), val); }
+        3 { bufWrite16(bus.spad.ptr, r.off & (SPAD_SIZE - 1), val); }
         4 { ioWrite16(bus, cop0, r.off, val); }
         _ {}
     }
@@ -430,21 +423,21 @@ pub fn busWrite8(bus: Bus, cop0: *mut[] u32, addr: u32, val: u32) {
     const paddr: u32 = addr & regionMask(addr);
     const r: BusRoute = route(paddr);
     match (r.kind) {
-        1 { bufWrite8(bus.ram,  r.off & (RAM_SIZE  - 1), val); }
-        3 { bufWrite8(bus.spad, r.off & (SPAD_SIZE - 1), val); }
+        1 { bufWrite8(bus.ram.ptr,  r.off & (RAM_SIZE  - 1), val); }
+        3 { bufWrite8(bus.spad.ptr, r.off & (SPAD_SIZE - 1), val); }
         4 { ioWrite8(bus, cop0, r.off, val); }
         _ {}
     }
 }
 
 // Direct buffer accessors.
-pub fn busRamPtr(bus: Bus)  *mut[] u8 { return bus.ram;  }
-pub fn busBiosPtr(bus: Bus) *mut[] u8 { return bus.bios; }
-pub fn busVramPtr(bus: Bus) *mut[] u8 { return bus.vram; }
+pub fn busRamPtr(bus: Bus)  *mut[] u8 { return bus.ram.ptr;  }
+pub fn busBiosPtr(bus: Bus) *mut[] u8 { return bus.bios.ptr; }
+pub fn busVramPtr(bus: Bus) *mut[] u8 { return bus.vram.ptr; }
 // busGpuPtr removed — use `bus.gpu.bufPtr()` directly for raw slot
 // access. The `bus.gpu` field is now a `Gpu` struct value.
-pub fn busDmaPtr(bus: Bus) *mut[] u32 { return bus.dma; }
-pub fn busIrqPtr(bus: Bus) *mut[] u32 { return bus.irq.typed(); }
+pub fn busDmaPtr(bus: Bus) *mut[] u32 { return bus.dma.ptr; }
+pub fn busIrqPtr(bus: Bus) *mut[] u32 { return bus.irq.ptr; }
 // busTimerPtr removed — `bus.timer` is by-value now. Callers use
 // the Timer methods directly via `bus.timer.method(...)`.
-pub fn busGtePtr(bus: Bus) *mut[] u32 { return bus.gte; }
+pub fn busGtePtr(bus: Bus) *mut[] u32 { return bus.gte.ptr; }

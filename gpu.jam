@@ -34,10 +34,6 @@
 
 const { irqRaise, IC_VBLANK } = import("irq");
 
-pub extern fn malloc(size: u64) *mut[] u8;
-pub extern fn free(ptr: *mut[] u8);
-pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
-
 const GPU_STATE_WORDS: u32 = 80;
 const VRAM_PIXELS: u32 = 524288;       // 1024 * 512
 
@@ -52,22 +48,6 @@ pub fn gpuToBgr555(c: u32) u32 {
          | ((c & 0x00F800) >> 6)
          | ((c & 0xF80000) >> 9);
 }
-
-pub fn gpuAlloc() *mut[] u32 {
-    var raw: *mut[] u8 = malloc((GPU_STATE_WORDS as u64) * 4);
-    memset(raw, 0, (GPU_STATE_WORDS as u64) * 4);
-    var g: *mut[] u32 = raw as *mut[] u32;
-    g[19] = GP_RECV_CMD;
-    // psxe init (gpu.c:59): only sets bit 23 (display disabled). Reads
-    // OR 0x1C000000 on the fly. Our previous 0x14802000 was wrong —
-    // bit 28 is OR'd by read anyway, bit 13 is junk that leaked into
-    // game state and produced a GPUSTAT diff at PC=0x8005C204.
-    g[46] = 0x00800000;
-    g[47] = 1;            // default display_mode
-    return g;
-}
-
-pub fn gpuFree(g: *mut[] u32) { free(g as *mut[] u8); }
 
 // End-of-run diagnostic: how many GP0 commands of each family did the
 // BIOS issue? Family index = top 3 bits of the command byte (0 = misc,

@@ -8,12 +8,12 @@
 //
 // dma.jam does NOT import bus.jam (that would form a cycle through
 // bus.jam ↦ dma.jam ↦ bus.jam). Instead the Bus type is redeclared
-// structurally and we reach into bus.ram / bus.gpu directly, calling
+// structurally and we reach into bus.ram.ptr / bus.gpu directly, calling
 // gpuGp0 / vram helpers from gpu.jam where necessary.
 
 const { Gpu } = import("gpu");
 const { irqRaise, IC_DMA } = import("irq");
-const { Buf } = import("std/buf");
+const { Vec } = import("std/collections");
 const { Bus } = import("bus");
 const { Cdrom } = import("cdrom");
 const { Mdec } = import("mdec");
@@ -21,9 +21,6 @@ const { spuWrite16, spuRead16 } = import("spu");
 
 const SPU_TFIFO_OFF: u32 = 0x1A8;
 
-pub extern fn malloc(size: u64) *mut[] u8;
-pub extern fn free(ptr: *mut[] u8);
-pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 
 // Disc shape — keep in sync with disc.jam / bus.jam so the structural
 // match holds at the call site. Members aren't accessed here; only the
@@ -65,15 +62,13 @@ const DICR_FLAGS: u32 = 0x7F000000;
 const DICR_IRQEN: u32 = 0x00800000;
 const DICR_IRQSI: u32 = 0x80000000;
 
-pub fn dmaAlloc() *mut[] u32 {
-    var raw: *mut[] u8 = malloc((DMA_STATE_WORDS as u64) * 4);
-    memset(raw, 0, (DMA_STATE_WORDS as u64) * 4);
-    var d: *mut[] u32 = raw as *mut[] u32;
-    d[21] = 0x07654321;
-    return d;
+// Owned DMA-state buffer. d[21] = DPCR is pre-set to the psxe default
+// (psxe dma.c). Auto-drops with the Bus.
+pub fn dmaAlloc() Vec(u32) {
+    var b: Vec(u32) = Vec(u32).filled(0, DMA_STATE_WORDS);
+    b[21] = 0x07654321;
+    return b;
 }
-
-pub fn dmaFree(d: *mut[] u32) { free(d as *mut[] u8); }
 
 pub fn chBase(ch: u32) u32 { return ch * 3; }
 
@@ -86,7 +81,7 @@ pub fn chBase(ch: u32) u32 { return ch * 3; }
 
 pub fn ramRead32(bus: Bus, addr: u32) u32 {
     const off: u32 = addr & 0x001FFFFC;
-    var p: *mut[] u8 = bus.ram;
+    var p: *mut[] u8 = bus.ram.ptr;
     return  (p[off]       as u32)
          | ((p[off + 1]    as u32) << 8)
          | ((p[off + 2]    as u32) << 16)
@@ -95,7 +90,7 @@ pub fn ramRead32(bus: Bus, addr: u32) u32 {
 
 pub fn ramWrite32(bus: Bus, addr: u32, val: u32) {
     const off: u32 = addr & 0x001FFFFC;
-    var p: *mut[] u8 = bus.ram;
+    var p: *mut[] u8 = bus.ram.ptr;
     p[off]     = (val         & 0xFF) as u8;
     p[off + 1] = ((val >> 8)  & 0xFF) as u8;
     p[off + 2] = ((val >> 16) & 0xFF) as u8;
@@ -104,7 +99,7 @@ pub fn ramWrite32(bus: Bus, addr: u32, val: u32) {
 
 pub fn ramWrite16(bus: Bus, addr: u32, val: u32) {
     const off: u32 = addr & 0x001FFFFE;
-    var p: *mut[] u8 = bus.ram;
+    var p: *mut[] u8 = bus.ram.ptr;
     p[off]     = (val        & 0xFF) as u8;
     p[off + 1] = ((val >> 8) & 0xFF) as u8;
 }
@@ -278,7 +273,7 @@ pub fn dmaDoGpuRequest(d: *mut[] u32, bus: Bus) {
         var i: u32 = 0;
         while (i < size) {
             const data: u32 = ramRead32(bus, addr);
-            bus.gpu.gp0(bus.vram, data);
+            bus.gpu.gp0(bus.vram.ptr, data);
             addr = addr + step;
             i = i + 1;
         }
@@ -291,7 +286,7 @@ pub fn dmaDoGpuRequest(d: *mut[] u32, bus: Bus) {
         // composites, etc.).
         var i: u32 = 0;
         while (i < size) {
-            const data: u32 = bus.gpu.read32(bus.vram, 0);
+            const data: u32 = bus.gpu.read32(bus.vram.ptr, 0);
             ramWrite32(bus, addr, data);
             addr = addr + step;
             i = i + 1;
@@ -311,7 +306,7 @@ pub fn dmaDoGpuLinked(d: *mut[] u32, bus: Bus) {
         while (size > 0) {
             addr = (addr + step) & 0x001FFFFC;
             const cmd: u32 = ramRead32(bus, addr);
-            bus.gpu.gp0(bus.vram, cmd);
+            bus.gpu.gp0(bus.vram.ptr, cmd);
             size = size - 1;
         }
         addr = hdr & 0xFFFFFF;
@@ -334,7 +329,7 @@ pub fn dmaDoMdecIn(d: *mut[] u32, bus: Bus) {
     var i: u32 = 0;
     while (i < size) {
         const w: u32 = ramRead32(bus, addr);
-        bus.mdec.write32(bus.mdecIn, bus.mdecOut, 0, w);
+        bus.mdec.write32(bus.mdecIn.ptr, bus.mdecOut.ptr, 0, w);
         addr = addr + step;
         i = i + 1;
     }
@@ -352,7 +347,7 @@ pub fn dmaDoMdecOut(d: *mut[] u32, bus: Bus) {
     var addr: u32 = d[chBase(1) + F_MADR];
     var i: u32 = 0;
     while (i < size) {
-        const w: u32 = bus.mdec.read32(bus.mdecOut, 0);
+        const w: u32 = bus.mdec.read32(bus.mdecOut.ptr, 0);
         ramWrite32(bus, addr, w);
         addr = addr + step;
         i = i + 1;
@@ -418,16 +413,16 @@ pub fn dmaDoSpu(d: *mut[] u32, bus: Bus) {
         var i: u32 = 0;
         while (i < words) {
             const data: u32 = ramRead32(bus, addr);
-            spuWrite16(bus.spu, bus.spuram, SPU_TFIFO_OFF, data & 0xFFFF);
-            spuWrite16(bus.spu, bus.spuram, SPU_TFIFO_OFF, (data >> 16) & 0xFFFF);
+            spuWrite16(bus.spu.ptr, bus.spuram.ptr, SPU_TFIFO_OFF, data & 0xFFFF);
+            spuWrite16(bus.spu.ptr, bus.spuram.ptr, SPU_TFIFO_OFF, (data >> 16) & 0xFFFF);
             addr = addr + step;
             i = i + 1;
         }
     } else {
         var i: u32 = 0;
         while (i < words) {
-            const lo: u32 = spuRead16(bus.spu, bus.spuram, SPU_TFIFO_OFF);
-            const hi: u32 = spuRead16(bus.spu, bus.spuram, SPU_TFIFO_OFF);
+            const lo: u32 = spuRead16(bus.spu.ptr, bus.spuram.ptr, SPU_TFIFO_OFF);
+            const hi: u32 = spuRead16(bus.spu.ptr, bus.spuram.ptr, SPU_TFIFO_OFF);
             ramWrite32(bus, addr, lo | (hi << 16));
             addr = addr + step;
             i = i + 1;

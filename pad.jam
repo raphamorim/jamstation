@@ -22,10 +22,9 @@
 const { irqRaise, IC_JOY } = import("irq");
 const { Mcd } = import("mcd");
 
-pub extern fn malloc(size: u64) *mut[] u8;
-pub extern fn free(ptr: *mut[] u8);
-pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 pub extern fn fflush(stream: u64) i32;
+
+const { Vec } = import("std/collections");
 
 const PAD_STATE_SIZE: u32 = 32;
 
@@ -76,16 +75,14 @@ const DEST_MCD: u32 = 0x81;
 
 const JOY_IRQ_DELAY: u32 = 512;
 
-pub fn padAlloc() *mut[] u8 {
-    var raw: *mut[] u8 = malloc(PAD_STATE_SIZE as u64);
-    memset(raw, 0, PAD_STATE_SIZE as u64);
+// Owned PAD-state buffer (32 bytes). Auto-drops with the Bus.
+pub fn padAlloc() Vec(u8) {
+    var b: Vec(u8) = Vec(u8).filled(0, PAD_STATE_SIZE);
     // sw defaults to 0xFFFF (no buttons pressed).
-    raw[P_SW_LO] = 0xFF;
-    raw[P_SW_HI] = 0xFF;
-    return raw;
+    b[P_SW_LO] = 0xFF;
+    b[P_SW_HI] = 0xFF;
+    return b;
 }
-
-pub fn padFree(p: *mut[] u8) { free(p); }
 
 // Update the SDA digital-pad button mask (active-low: bit clear =
 // pressed). PSX bit layout: 0=Select, 3=Start, 4=Up, 5=Right, 6=Down,

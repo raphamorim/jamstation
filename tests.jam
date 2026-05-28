@@ -14,7 +14,7 @@ const {
 
 const {
     freshCpu, freshCpuAt,
-    allocRegFile, freeRegFile,
+    allocRegFile,
     gprRead, gprWrite,
     cop0Read, cop0Write,
     run, runHooked,
@@ -25,7 +25,7 @@ const {
 // Force device modules into this module's codegen context so bus.jam's
 // allocBus body (which calls gpuAlloc / dmaAlloc / etc.) resolves.
 const { Gpu } = import("gpu");
-const { gteAlloc, gteFree, gteExec, gteDivide,
+const { gteAlloc, gteExec, gteDivide,
         gteDataRead, gteDataWrite, gteCtrlWrite, gteCtrlRead,
         gteOpCycles } = import("gte");
 const { Cdrom } = import("cdrom");
@@ -35,7 +35,7 @@ const { padAlloc, padUpdate } = import("pad");
 const { spuAlloc, spuRamAlloc, spuUpdate } = import("spu");
 const { Sio1 } = import("sio1");
 const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
-const { Buf } = import("std/buf");
+const { Vec } = import("std/collections");
 const { Timer } = import("timer");
 const { Mcd } = import("mcd");
 const { Mdec } = import("mdec");
@@ -65,9 +65,6 @@ const Cpu = struct {
     savedPc: u32,
     hi: u32,
     lo: u32,
-    traceFp:   u64,
-    traceInit: u32,
-    traceN:    u64,
     loadD: u32,
     loadV: u32,
     branch: u8,
@@ -86,14 +83,14 @@ const Cpu = struct {
 // allocate / free with one call each.
 const Harness = struct {
     cpu: Cpu,
-    regs: *mut[] u32,
-    cop0: *mut[] u32,
+    regs: Vec(u32),
+    cop0: Vec(u32),
     bus: Bus,
 };
 
 fn allocHarness() Harness {
-    var regs: *mut[] u32 = allocRegFile(32);
-    var cop0: *mut[] u32 = allocRegFile(16);
+    var regs: Vec(u32) = allocRegFile(32);
+    var cop0: Vec(u32) = allocRegFile(16);
     var bus: Bus = allocBus();
     var cpu: Cpu = freshCpuAt(0x80000000);
     var h: Harness = Harness { cpu: cpu, regs: regs, cop0: cop0, bus: bus };
@@ -101,101 +98,99 @@ fn allocHarness() Harness {
 }
 
 fn freeHarness(h: Harness) {
-    freeRegFile(h.regs);
-    freeRegFile(h.cop0);
     freeBus(h.bus);
 }
 
-fn placeOp(bus: Bus, cop0: *mut[] u32, addr: u32, opc: u32) {
-    busWrite32(bus, cop0, addr, opc);
+fn placeOp(bus: Bus, cop0: Vec(u32), addr: u32, opc: u32) {
+    busWrite32(bus, cop0.ptr, addr, opc);
 }
 
 fn tOriImm() u32 {
     var h: Harness = allocHarness();
-    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0D, 0, 8, 0x1234));
-    run(h.cpu, h.bus, h.regs, h.cop0, 4);
-    const v: u32 = gprRead(h.regs, 8);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encI(0x0D, 0, 8, 0x1234));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 4);
+    const v: u32 = gprRead(h.regs.ptr, 8);
     freeHarness(h);
     return v;
 }
 
 fn tLuiOri() u32 {
     var h: Harness = allocHarness();
-    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0F, 0, 9, 0xABCD));
-    placeOp(h.bus, h.cop0, 0x80000004, encI(0x0D, 9, 9, 0xEF01));
-    run(h.cpu, h.bus, h.regs, h.cop0, 4);
-    const v: u32 = gprRead(h.regs, 9);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encI(0x0F, 0, 9, 0xABCD));
+    placeOp(h.bus, h.cop0.ptr, 0x80000004, encI(0x0D, 9, 9, 0xEF01));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 4);
+    const v: u32 = gprRead(h.regs.ptr, 9);
     freeHarness(h);
     return v;
 }
 
 fn tAdduChain() u32 {
     var h: Harness = allocHarness();
-    placeOp(h.bus, h.cop0, 0x80000000, encI(0x09, 0, 8, 7));
-    placeOp(h.bus, h.cop0, 0x80000004, encI(0x09, 0, 9, 5));
-    placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 10, 0, 0x21));
-    run(h.cpu, h.bus, h.regs, h.cop0, 8);
-    const v: u32 = gprRead(h.regs, 10);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encI(0x09, 0, 8, 7));
+    placeOp(h.bus, h.cop0.ptr, 0x80000004, encI(0x09, 0, 9, 5));
+    placeOp(h.bus, h.cop0.ptr, 0x80000008, encR(0x00, 8, 9, 10, 0, 0x21));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 8);
+    const v: u32 = gprRead(h.regs.ptr, 10);
     freeHarness(h);
     return v;
 }
 
 fn tSltSigned() u32 {
     var h: Harness = allocHarness();
-    placeOp(h.bus, h.cop0, 0x80000000, encI(0x09, 0, 8, 0xFFFF));
-    placeOp(h.bus, h.cop0, 0x80000004, encI(0x09, 0, 9, 1));
-    placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 10, 0, 0x2A));
-    run(h.cpu, h.bus, h.regs, h.cop0, 8);
-    const v: u32 = gprRead(h.regs, 10);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encI(0x09, 0, 8, 0xFFFF));
+    placeOp(h.bus, h.cop0.ptr, 0x80000004, encI(0x09, 0, 9, 1));
+    placeOp(h.bus, h.cop0.ptr, 0x80000008, encR(0x00, 8, 9, 10, 0, 0x2A));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 8);
+    const v: u32 = gprRead(h.regs.ptr, 10);
     freeHarness(h);
     return v;
 }
 
 fn tSltuSigned() u32 {
     var h: Harness = allocHarness();
-    placeOp(h.bus, h.cop0, 0x80000000, encI(0x09, 0, 8, 0xFFFF));
-    placeOp(h.bus, h.cop0, 0x80000004, encI(0x09, 0, 9, 1));
-    placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 10, 0, 0x2B));
-    run(h.cpu, h.bus, h.regs, h.cop0, 8);
-    const v: u32 = gprRead(h.regs, 10);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encI(0x09, 0, 8, 0xFFFF));
+    placeOp(h.bus, h.cop0.ptr, 0x80000004, encI(0x09, 0, 9, 1));
+    placeOp(h.bus, h.cop0.ptr, 0x80000008, encR(0x00, 8, 9, 10, 0, 0x2B));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 8);
+    const v: u32 = gprRead(h.regs.ptr, 10);
     freeHarness(h);
     return v;
 }
 
 fn tShiftSra() u32 {
     var h: Harness = allocHarness();
-    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0F, 0, 8, 0x8000));
-    placeOp(h.bus, h.cop0, 0x80000004, encR(0x00, 0, 8, 9, 2, 0x03));
-    run(h.cpu, h.bus, h.regs, h.cop0, 4);
-    const v: u32 = gprRead(h.regs, 9);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encI(0x0F, 0, 8, 0x8000));
+    placeOp(h.bus, h.cop0.ptr, 0x80000004, encR(0x00, 0, 8, 9, 2, 0x03));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 4);
+    const v: u32 = gprRead(h.regs.ptr, 9);
     freeHarness(h);
     return v;
 }
 
 fn tAndOr() u32 {
     var h: Harness = allocHarness();
-    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0D, 0, 8, 0xF0F0));
-    placeOp(h.bus, h.cop0, 0x80000004, encI(0x0D, 0, 9, 0x0FF0));
-    placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 10, 0, 0x24));
-    placeOp(h.bus, h.cop0, 0x8000000C, encR(0x00, 8, 9, 11, 0, 0x25));
-    run(h.cpu, h.bus, h.regs, h.cop0, 8);
-    const a: u32 = gprRead(h.regs, 10);
-    const o: u32 = gprRead(h.regs, 11);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encI(0x0D, 0, 8, 0xF0F0));
+    placeOp(h.bus, h.cop0.ptr, 0x80000004, encI(0x0D, 0, 9, 0x0FF0));
+    placeOp(h.bus, h.cop0.ptr, 0x80000008, encR(0x00, 8, 9, 10, 0, 0x24));
+    placeOp(h.bus, h.cop0.ptr, 0x8000000C, encR(0x00, 8, 9, 11, 0, 0x25));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 8);
+    const a: u32 = gprRead(h.regs.ptr, 10);
+    const o: u32 = gprRead(h.regs.ptr, 11);
     freeHarness(h);
     return (a << 16) | o;
 }
 
 fn tBranchDelay() u32 {
     var h: Harness = allocHarness();
-    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0D, 0, 8, 7));
-    placeOp(h.bus, h.cop0, 0x80000004, encI(0x04, 8, 8, 2));
-    placeOp(h.bus, h.cop0, 0x80000008, encI(0x0D, 0, 9, 1));
-    placeOp(h.bus, h.cop0, 0x8000000C, encI(0x0D, 0, 10, 0xFFFF));
-    placeOp(h.bus, h.cop0, 0x80000010, encI(0x0D, 0, 11, 0x5555));
-    run(h.cpu, h.bus, h.regs, h.cop0, 6);
-    const t1: u32 = gprRead(h.regs, 9);
-    const t2: u32 = gprRead(h.regs, 10);
-    const t3: u32 = gprRead(h.regs, 11);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encI(0x0D, 0, 8, 7));
+    placeOp(h.bus, h.cop0.ptr, 0x80000004, encI(0x04, 8, 8, 2));
+    placeOp(h.bus, h.cop0.ptr, 0x80000008, encI(0x0D, 0, 9, 1));
+    placeOp(h.bus, h.cop0.ptr, 0x8000000C, encI(0x0D, 0, 10, 0xFFFF));
+    placeOp(h.bus, h.cop0.ptr, 0x80000010, encI(0x0D, 0, 11, 0x5555));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 6);
+    const t1: u32 = gprRead(h.regs.ptr, 9);
+    const t2: u32 = gprRead(h.regs.ptr, 10);
+    const t3: u32 = gprRead(h.regs.ptr, 11);
     freeHarness(h);
     return (t1 << 24) | (t2 << 16) | t3;
 }
@@ -203,13 +198,13 @@ fn tBranchDelay() u32 {
 fn tJumpDelay() u32 {
     var h: Harness = allocHarness();
     const tgt: u32 = (0x80000020 >> 2) & 0x03FFFFFF;
-    placeOp(h.bus, h.cop0, 0x80000000, encJ(0x02, tgt));
-    placeOp(h.bus, h.cop0, 0x80000004, encI(0x0D, 0, 8, 1));
-    placeOp(h.bus, h.cop0, 0x80000008, encI(0x0D, 0, 9, 0xFFFF));
-    placeOp(h.bus, h.cop0, 0x80000020, encI(0x0D, 0, 9, 0xAA));
-    run(h.cpu, h.bus, h.regs, h.cop0, 6);
-    const t0: u32 = gprRead(h.regs, 8);
-    const t1: u32 = gprRead(h.regs, 9);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encJ(0x02, tgt));
+    placeOp(h.bus, h.cop0.ptr, 0x80000004, encI(0x0D, 0, 8, 1));
+    placeOp(h.bus, h.cop0.ptr, 0x80000008, encI(0x0D, 0, 9, 0xFFFF));
+    placeOp(h.bus, h.cop0.ptr, 0x80000020, encI(0x0D, 0, 9, 0xAA));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 6);
+    const t0: u32 = gprRead(h.regs.ptr, 8);
+    const t1: u32 = gprRead(h.regs.ptr, 9);
     freeHarness(h);
     return (t0 << 16) | t1;
 }
@@ -217,105 +212,105 @@ fn tJumpDelay() u32 {
 fn tJalJr() u32 {
     var h: Harness = allocHarness();
     const tgt: u32 = (0x80000020 >> 2) & 0x03FFFFFF;
-    placeOp(h.bus, h.cop0, 0x80000000, encJ(0x03, tgt));
-    placeOp(h.bus, h.cop0, 0x80000004, encI(0x09, 0, 0, 0));
-    placeOp(h.bus, h.cop0, 0x80000008, encI(0x0D, 0, 11, 0x33));
-    placeOp(h.bus, h.cop0, 0x80000020, encI(0x0D, 0, 8, 0x42));
-    placeOp(h.bus, h.cop0, 0x80000024, encR(0x00, 31, 0, 0, 0, 0x08));
-    placeOp(h.bus, h.cop0, 0x80000028, encI(0x09, 0, 0, 0));
-    run(h.cpu, h.bus, h.regs, h.cop0, 12);
-    const t0: u32 = gprRead(h.regs, 8);
-    const t3: u32 = gprRead(h.regs, 11);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encJ(0x03, tgt));
+    placeOp(h.bus, h.cop0.ptr, 0x80000004, encI(0x09, 0, 0, 0));
+    placeOp(h.bus, h.cop0.ptr, 0x80000008, encI(0x0D, 0, 11, 0x33));
+    placeOp(h.bus, h.cop0.ptr, 0x80000020, encI(0x0D, 0, 8, 0x42));
+    placeOp(h.bus, h.cop0.ptr, 0x80000024, encR(0x00, 31, 0, 0, 0, 0x08));
+    placeOp(h.bus, h.cop0.ptr, 0x80000028, encI(0x09, 0, 0, 0));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 12);
+    const t0: u32 = gprRead(h.regs.ptr, 8);
+    const t3: u32 = gprRead(h.regs.ptr, 11);
     freeHarness(h);
     return (t0 << 16) | t3;
 }
 
 fn tLwSw() u32 {
     var h: Harness = allocHarness();
-    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0F, 0, 8, 0xDEAD));
-    placeOp(h.bus, h.cop0, 0x80000004, encI(0x0D, 8, 8, 0xBEEF));
-    placeOp(h.bus, h.cop0, 0x80000008, encI(0x0F, 0, 9, 0x8000));
-    placeOp(h.bus, h.cop0, 0x8000000C, encI(0x0D, 9, 9, 0x0100));
-    placeOp(h.bus, h.cop0, 0x80000010, encI(0x2B, 9, 8, 0));
-    placeOp(h.bus, h.cop0, 0x80000014, encI(0x23, 9, 10, 0));
-    run(h.cpu, h.bus, h.regs, h.cop0, 8);
-    const v: u32 = gprRead(h.regs, 10);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encI(0x0F, 0, 8, 0xDEAD));
+    placeOp(h.bus, h.cop0.ptr, 0x80000004, encI(0x0D, 8, 8, 0xBEEF));
+    placeOp(h.bus, h.cop0.ptr, 0x80000008, encI(0x0F, 0, 9, 0x8000));
+    placeOp(h.bus, h.cop0.ptr, 0x8000000C, encI(0x0D, 9, 9, 0x0100));
+    placeOp(h.bus, h.cop0.ptr, 0x80000010, encI(0x2B, 9, 8, 0));
+    placeOp(h.bus, h.cop0.ptr, 0x80000014, encI(0x23, 9, 10, 0));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 8);
+    const v: u32 = gprRead(h.regs.ptr, 10);
     freeHarness(h);
     return v;
 }
 
 fn tLbSignExt() u32 {
     var h: Harness = allocHarness();
-    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0D, 0, 8, 0x80));
-    placeOp(h.bus, h.cop0, 0x80000004, encI(0x0F, 0, 9, 0x8000));
-    placeOp(h.bus, h.cop0, 0x80000008, encI(0x0D, 9, 9, 0x0100));
-    placeOp(h.bus, h.cop0, 0x8000000C, encI(0x28, 9, 8, 0));
-    placeOp(h.bus, h.cop0, 0x80000010, encI(0x20, 9, 10, 0));
-    run(h.cpu, h.bus, h.regs, h.cop0, 8);
-    const v: u32 = gprRead(h.regs, 10);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encI(0x0D, 0, 8, 0x80));
+    placeOp(h.bus, h.cop0.ptr, 0x80000004, encI(0x0F, 0, 9, 0x8000));
+    placeOp(h.bus, h.cop0.ptr, 0x80000008, encI(0x0D, 9, 9, 0x0100));
+    placeOp(h.bus, h.cop0.ptr, 0x8000000C, encI(0x28, 9, 8, 0));
+    placeOp(h.bus, h.cop0.ptr, 0x80000010, encI(0x20, 9, 10, 0));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 8);
+    const v: u32 = gprRead(h.regs.ptr, 10);
     freeHarness(h);
     return v;
 }
 
 fn tMultSigned() u64 {
     var h: Harness = allocHarness();
-    placeOp(h.bus, h.cop0, 0x80000000, encI(0x09, 0, 8, 0xFFFF));
-    placeOp(h.bus, h.cop0, 0x80000004, encI(0x09, 0, 9, 2));
-    placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 0, 0, 0x18));
-    placeOp(h.bus, h.cop0, 0x8000000C, encR(0x00, 0, 0, 10, 0, 0x10));
-    placeOp(h.bus, h.cop0, 0x80000010, encR(0x00, 0, 0, 11, 0, 0x12));
-    run(h.cpu, h.bus, h.regs, h.cop0, 8);
-    const hi: u64 = gprRead(h.regs, 10) as u64;
-    const lo: u64 = gprRead(h.regs, 11) as u64;
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encI(0x09, 0, 8, 0xFFFF));
+    placeOp(h.bus, h.cop0.ptr, 0x80000004, encI(0x09, 0, 9, 2));
+    placeOp(h.bus, h.cop0.ptr, 0x80000008, encR(0x00, 8, 9, 0, 0, 0x18));
+    placeOp(h.bus, h.cop0.ptr, 0x8000000C, encR(0x00, 0, 0, 10, 0, 0x10));
+    placeOp(h.bus, h.cop0.ptr, 0x80000010, encR(0x00, 0, 0, 11, 0, 0x12));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 8);
+    const hi: u64 = gprRead(h.regs.ptr, 10) as u64;
+    const lo: u64 = gprRead(h.regs.ptr, 11) as u64;
     freeHarness(h);
     return (hi << 32) | lo;
 }
 
 fn tDivu() u32 {
     var h: Harness = allocHarness();
-    placeOp(h.bus, h.cop0, 0x80000000, encI(0x09, 0, 8, 100));
-    placeOp(h.bus, h.cop0, 0x80000004, encI(0x09, 0, 9, 7));
-    placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 0, 0, 0x1B));
-    placeOp(h.bus, h.cop0, 0x8000000C, encR(0x00, 0, 0, 10, 0, 0x12));
-    placeOp(h.bus, h.cop0, 0x80000010, encR(0x00, 0, 0, 11, 0, 0x10));
-    run(h.cpu, h.bus, h.regs, h.cop0, 8);
-    const q: u32 = gprRead(h.regs, 10);
-    const r: u32 = gprRead(h.regs, 11);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encI(0x09, 0, 8, 100));
+    placeOp(h.bus, h.cop0.ptr, 0x80000004, encI(0x09, 0, 9, 7));
+    placeOp(h.bus, h.cop0.ptr, 0x80000008, encR(0x00, 8, 9, 0, 0, 0x1B));
+    placeOp(h.bus, h.cop0.ptr, 0x8000000C, encR(0x00, 0, 0, 10, 0, 0x12));
+    placeOp(h.bus, h.cop0.ptr, 0x80000010, encR(0x00, 0, 0, 11, 0, 0x10));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 8);
+    const q: u32 = gprRead(h.regs.ptr, 10);
+    const r: u32 = gprRead(h.regs.ptr, 11);
     freeHarness(h);
     return (q << 16) | r;
 }
 
 fn tSumLoop() u32 {
     var h: Harness = allocHarness();
-    placeOp(h.bus, h.cop0, 0x80000000, encI(0x09, 0, 8, 0));
-    placeOp(h.bus, h.cop0, 0x80000004, encI(0x09, 0, 9, 5));
-    placeOp(h.bus, h.cop0, 0x80000008, encR(0x00, 8, 9, 8, 0, 0x21));
-    placeOp(h.bus, h.cop0, 0x8000000C, encI(0x09, 9, 9, 0xFFFF));
-    placeOp(h.bus, h.cop0, 0x80000010, encI(0x05, 9, 0, 0xFFFD));
-    placeOp(h.bus, h.cop0, 0x80000014, encI(0x09, 0, 0, 0));
-    run(h.cpu, h.bus, h.regs, h.cop0, 64);
-    const v: u32 = gprRead(h.regs, 8);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encI(0x09, 0, 8, 0));
+    placeOp(h.bus, h.cop0.ptr, 0x80000004, encI(0x09, 0, 9, 5));
+    placeOp(h.bus, h.cop0.ptr, 0x80000008, encR(0x00, 8, 9, 8, 0, 0x21));
+    placeOp(h.bus, h.cop0.ptr, 0x8000000C, encI(0x09, 9, 9, 0xFFFF));
+    placeOp(h.bus, h.cop0.ptr, 0x80000010, encI(0x05, 9, 0, 0xFFFD));
+    placeOp(h.bus, h.cop0.ptr, 0x80000014, encI(0x09, 0, 0, 0));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 64);
+    const v: u32 = gprRead(h.regs.ptr, 8);
     freeHarness(h);
     return v;
 }
 
 fn tCop0Roundtrip() u32 {
     var h: Harness = allocHarness();
-    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0F, 0, 8, 0xDEAD));
-    placeOp(h.bus, h.cop0, 0x80000004, encR(0x10, 4, 8, 12, 0, 0));
-    placeOp(h.bus, h.cop0, 0x80000008, encR(0x10, 0, 9, 12, 0, 0));
-    placeOp(h.bus, h.cop0, 0x8000000C, encI(0x09, 0, 0, 0));
-    run(h.cpu, h.bus, h.regs, h.cop0, 8);
-    const v: u32 = gprRead(h.regs, 9);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encI(0x0F, 0, 8, 0xDEAD));
+    placeOp(h.bus, h.cop0.ptr, 0x80000004, encR(0x10, 4, 8, 12, 0, 0));
+    placeOp(h.bus, h.cop0.ptr, 0x80000008, encR(0x10, 0, 9, 12, 0, 0));
+    placeOp(h.bus, h.cop0.ptr, 0x8000000C, encI(0x09, 0, 0, 0));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 8);
+    const v: u32 = gprRead(h.regs.ptr, 9);
     freeHarness(h);
     return v;
 }
 
 fn tSyscallVector() u32 {
     var h: Harness = allocHarness();
-    cop0Write(h.cop0, C0_SR, SR_BEV);
-    placeOp(h.bus, h.cop0, 0x80000000, encR(0x00, 0, 0, 0, 0, 0x0C));
-    run(h.cpu, h.bus, h.regs, h.cop0, 1);
+    cop0Write(h.cop0.ptr, C0_SR, SR_BEV);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encR(0x00, 0, 0, 0, 0, 0x0C));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 1);
     const pc: u32 = h.cpu.pc;
     freeHarness(h);
     return pc;
@@ -323,36 +318,36 @@ fn tSyscallVector() u32 {
 
 fn tLoadDelay() u32 {
     var h: Harness = allocHarness();
-    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0F, 0, 29, 0x8000));
-    placeOp(h.bus, h.cop0, 0x80000004, encI(0x0D, 29, 29, 0x0100));
-    placeOp(h.bus, h.cop0, 0x80000008, encI(0x0D, 0, 9, 42));
-    placeOp(h.bus, h.cop0, 0x8000000C, encI(0x2B, 29, 9, 0));
-    placeOp(h.bus, h.cop0, 0x80000010, encI(0x23, 29, 8, 0));
-    placeOp(h.bus, h.cop0, 0x80000014, encI(0x0D, 8, 10, 0));
-    placeOp(h.bus, h.cop0, 0x80000018, encI(0x0D, 8, 11, 0));
-    run(h.cpu, h.bus, h.regs, h.cop0, 16);
-    const t2: u32 = gprRead(h.regs, 10);
-    const t3: u32 = gprRead(h.regs, 11);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encI(0x0F, 0, 29, 0x8000));
+    placeOp(h.bus, h.cop0.ptr, 0x80000004, encI(0x0D, 29, 29, 0x0100));
+    placeOp(h.bus, h.cop0.ptr, 0x80000008, encI(0x0D, 0, 9, 42));
+    placeOp(h.bus, h.cop0.ptr, 0x8000000C, encI(0x2B, 29, 9, 0));
+    placeOp(h.bus, h.cop0.ptr, 0x80000010, encI(0x23, 29, 8, 0));
+    placeOp(h.bus, h.cop0.ptr, 0x80000014, encI(0x0D, 8, 10, 0));
+    placeOp(h.bus, h.cop0.ptr, 0x80000018, encI(0x0D, 8, 11, 0));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 16);
+    const t2: u32 = gprRead(h.regs.ptr, 10);
+    const t3: u32 = gprRead(h.regs.ptr, 11);
     freeHarness(h);
     return (t2 << 16) | t3;
 }
 
 fn tLwlLwr() u32 {
     var h: Harness = allocHarness();
-    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0F, 0, 8, 0x1122));
-    placeOp(h.bus, h.cop0, 0x80000004, encI(0x0D, 8, 8, 0x3344));
-    placeOp(h.bus, h.cop0, 0x80000008, encI(0x0F, 0, 9, 0xAABB));
-    placeOp(h.bus, h.cop0, 0x8000000C, encI(0x0D, 9, 9, 0xCCDD));
-    placeOp(h.bus, h.cop0, 0x80000010, encI(0x0F, 0, 29, 0x8000));
-    placeOp(h.bus, h.cop0, 0x80000014, encI(0x0D, 29, 29, 0x0100));
-    placeOp(h.bus, h.cop0, 0x80000018, encI(0x2B, 29, 8, 0));
-    placeOp(h.bus, h.cop0, 0x8000001C, encI(0x2B, 29, 9, 4));
-    placeOp(h.bus, h.cop0, 0x80000020, encI(0x0D, 0, 10, 0));
-    placeOp(h.bus, h.cop0, 0x80000024, encI(0x22, 29, 10, 6));
-    placeOp(h.bus, h.cop0, 0x80000028, encI(0x26, 29, 10, 3));
-    placeOp(h.bus, h.cop0, 0x8000002C, encI(0x09, 0, 0, 0));
-    run(h.cpu, h.bus, h.regs, h.cop0, 20);
-    const v: u32 = gprRead(h.regs, 10);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encI(0x0F, 0, 8, 0x1122));
+    placeOp(h.bus, h.cop0.ptr, 0x80000004, encI(0x0D, 8, 8, 0x3344));
+    placeOp(h.bus, h.cop0.ptr, 0x80000008, encI(0x0F, 0, 9, 0xAABB));
+    placeOp(h.bus, h.cop0.ptr, 0x8000000C, encI(0x0D, 9, 9, 0xCCDD));
+    placeOp(h.bus, h.cop0.ptr, 0x80000010, encI(0x0F, 0, 29, 0x8000));
+    placeOp(h.bus, h.cop0.ptr, 0x80000014, encI(0x0D, 29, 29, 0x0100));
+    placeOp(h.bus, h.cop0.ptr, 0x80000018, encI(0x2B, 29, 8, 0));
+    placeOp(h.bus, h.cop0.ptr, 0x8000001C, encI(0x2B, 29, 9, 4));
+    placeOp(h.bus, h.cop0.ptr, 0x80000020, encI(0x0D, 0, 10, 0));
+    placeOp(h.bus, h.cop0.ptr, 0x80000024, encI(0x22, 29, 10, 6));
+    placeOp(h.bus, h.cop0.ptr, 0x80000028, encI(0x26, 29, 10, 3));
+    placeOp(h.bus, h.cop0.ptr, 0x8000002C, encI(0x09, 0, 0, 0));
+    run(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr, 20);
+    const v: u32 = gprRead(h.regs.ptr, 10);
     freeHarness(h);
     return v;
 }
@@ -394,47 +389,42 @@ fn gteSetIdentity(g: *mut[] u32) {
 }
 
 fn tGteRtpsMac() u32 {
-    var g: *mut[] u32 = gteAlloc();
-    gteSetIdentity(g);
-    gteDataWrite(g, 0, (200 << 16) | 100);    // V0 = (100, 200, z)
-    gteDataWrite(g, 1, 300);                   // V0.z = 300
-    gteExec(g, 0x4A080001);                    // RTPS, sf=12
+    var g: Vec(u32) = gteAlloc();
+    gteSetIdentity(g.ptr);
+    gteDataWrite(g.ptr, 0, (200 << 16) | 100);    // V0 = (100, 200, z)
+    gteDataWrite(g.ptr, 1, 300);                   // V0.z = 300
+    gteExec(g.ptr, 0x4A080001);                    // RTPS, sf=12
     // MAC1 = ((TR<<12) + 4096*100) >> 12 = 100 (pre-fix it was 409600).
-    const mac1: u32 = gteDataRead(g, 25);
-    gteFree(g);
+    const mac1: u32 = gteDataRead(g.ptr, 25);
     return mac1;
 }
 
 fn tGteRtpsIr() u32 {
-    var g: *mut[] u32 = gteAlloc();
-    gteSetIdentity(g);
-    gteDataWrite(g, 0, (200 << 16) | 100);
-    gteDataWrite(g, 1, 300);
-    gteExec(g, 0x4A080001);
-    const ir3: u32 = gteDataRead(g, 11);       // clamp(MAC3=300) = 300
-    gteFree(g);
+    var g: Vec(u32) = gteAlloc();
+    gteSetIdentity(g.ptr);
+    gteDataWrite(g.ptr, 0, (200 << 16) | 100);
+    gteDataWrite(g.ptr, 1, 300);
+    gteExec(g.ptr, 0x4A080001);
+    const ir3: u32 = gteDataRead(g.ptr, 11);       // clamp(MAC3=300) = 300
     return ir3;
 }
 
 fn tGteIrSext() u32 {
-    var g: *mut[] u32 = gteAlloc();
-    gteDataWrite(g, 9, 0x0000FFFF);            // IR1 = -1 (16-bit)
-    const v: u32 = gteDataRead(g, 9);          // MFC2 sign-extends → -1
-    gteFree(g);
+    var g: Vec(u32) = gteAlloc();
+    gteDataWrite(g.ptr, 9, 0x0000FFFF);            // IR1 = -1 (16-bit)
+    const v: u32 = gteDataRead(g.ptr, 9);          // MFC2 sign-extends → -1
     return v;
 }
 
 fn tGteDivide() u32 {
-    var g: *mut[] u32 = gteAlloc();
-    const q: u32 = gteDivide(g, 0x800, 0x1000); // 2048/4096 → 0x8000
-    gteFree(g);
+    var g: Vec(u32) = gteAlloc();
+    const q: u32 = gteDivide(g.ptr, 0x800, 0x1000); // 2048/4096 → 0x8000
     return q;
 }
 
 fn tGteDivideOvf() u32 {
-    var g: *mut[] u32 = gteAlloc();
-    const q: u32 = gteDivide(g, 0x2000, 0x1000); // n >= 2d → saturates
-    gteFree(g);
+    var g: Vec(u32) = gteAlloc();
+    const q: u32 = gteDivide(g.ptr, 0x2000, 0x1000); // n >= 2d → saturates
     return q;
 }
 
@@ -442,28 +432,25 @@ fn tGteDivideOvf() u32 {
 // 0x7FFFF000 with bit 31 synthesized from the 0x7F87E000 error summary.
 
 fn tGteSqrFlag() u32 {
-    var g: *mut[] u32 = gteAlloc();
-    gteDataWrite(g, 9, 0x7FFF);            // IR1 = 32767
-    gteExec(g, 0x4A080028);                // SQR, sf=12 → MAC1=262143, IR1 saturates
-    const f: u32 = gteCtrlRead(g, 31);     // bit 24 (IR1 sat) + bit 31 summary
-    gteFree(g);
+    var g: Vec(u32) = gteAlloc();
+    gteDataWrite(g.ptr, 9, 0x7FFF);            // IR1 = 32767
+    gteExec(g.ptr, 0x4A080028);                // SQR, sf=12 → MAC1=262143, IR1 saturates
+    const f: u32 = gteCtrlRead(g.ptr, 31);     // bit 24 (IR1 sat) + bit 31 summary
     return f;
 }
 
 fn tGteDivideFlag() u32 {
-    var g: *mut[] u32 = gteAlloc();
-    const q: u32 = gteDivide(g, 0x2000, 0x1000);  // n>=2d → bit 17 (divide ovf)
-    const f: u32 = gteCtrlRead(g, 31);            // bit 17 + bit 31 summary
-    gteFree(g);
+    var g: Vec(u32) = gteAlloc();
+    const q: u32 = gteDivide(g.ptr, 0x2000, 0x1000);  // n>=2d → bit 17 (divide ovf)
+    const f: u32 = gteCtrlRead(g.ptr, 31);            // bit 17 + bit 31 summary
     return f;
 }
 
 fn tGteNoFlag() u32 {
-    var g: *mut[] u32 = gteAlloc();
-    gteDataWrite(g, 9, 100);               // IR1 = 100
-    gteExec(g, 0x4A080028);                // SQR sf=12 → MAC1=2, no saturation
-    const f: u32 = gteCtrlRead(g, 31);     // FLAG must be clean
-    gteFree(g);
+    var g: Vec(u32) = gteAlloc();
+    gteDataWrite(g.ptr, 9, 100);               // IR1 = 100
+    gteExec(g.ptr, 0x4A080028);                // SQR sf=12 → MAC1=2, no saturation
+    const f: u32 = gteCtrlRead(g.ptr, 31);     // FLAG must be clean
     return f;
 }
 
@@ -473,13 +460,12 @@ fn tGteNoFlag() u32 {
 // old plain IR clamp keyed bit 22 off the unshifted 0x100000 and wrongly
 // set it (FLAG = 0x400000; bit 22 is excluded from the bit-31 summary).
 fn tGteRtpsClampIrZ() u32 {
-    var g: *mut[] u32 = gteAlloc();
-    gteSetIdentity(g);
-    gteDataWrite(g, 0, 0);                 // V0 = (0, 0, z)
-    gteDataWrite(g, 1, 256);               // V0.z = 256
-    gteExec(g, 0x4A000001);                // RTPS, sf=0
-    const f: u32 = gteCtrlRead(g, 31);
-    gteFree(g);
+    var g: Vec(u32) = gteAlloc();
+    gteSetIdentity(g.ptr);
+    gteDataWrite(g.ptr, 0, 0);                 // V0 = (0, 0, z)
+    gteDataWrite(g.ptr, 1, 256);               // V0.z = 256
+    gteExec(g.ptr, 0x4A000001);                // RTPS, sf=0
+    const f: u32 = gteCtrlRead(g.ptr, 31);
     return f;
 }
 
@@ -488,15 +474,14 @@ fn tGteRtpsClampIrZ() u32 {
 // overflow) — even though the full MAC1 sum (RT12=-0x8000 pulls it back)
 // stays in 44-bit range, which is all the old single clamp_mac saw.
 fn tGteMvmvaNestedOvf() u32 {
-    var g: *mut[] u32 = gteAlloc();
-    gteCtrlWrite(g, 5, 0x7FFFFFFF);        // TRX = max
-    gteCtrlWrite(g, 0, 0x80007FFF);        // RT11 = 0x7FFF, RT12 = -0x8000
-    gteCtrlWrite(g, 1, 0);                  // RT13 = 0
-    gteDataWrite(g, 0, 0x7FFF7FFF);        // V0 = (0x7FFF, 0x7FFF)
-    gteDataWrite(g, 1, 0);                  // V0.z = 0
-    gteExec(g, 0x4A080012);                // MVMVA: rot, V0, TR, sf=12, lm=0
-    const f: u32 = gteCtrlRead(g, 31) & 0x40000000;
-    gteFree(g);
+    var g: Vec(u32) = gteAlloc();
+    gteCtrlWrite(g.ptr, 5, 0x7FFFFFFF);        // TRX = max
+    gteCtrlWrite(g.ptr, 0, 0x80007FFF);        // RT11 = 0x7FFF, RT12 = -0x8000
+    gteCtrlWrite(g.ptr, 1, 0);                  // RT13 = 0
+    gteDataWrite(g.ptr, 0, 0x7FFF7FFF);        // V0 = (0x7FFF, 0x7FFF)
+    gteDataWrite(g.ptr, 1, 0);                  // V0.z = 0
+    gteExec(g.ptr, 0x4A080012);                // MVMVA: rot, V0, TR, sf=12, lm=0
+    const f: u32 = gteCtrlRead(g.ptr, 31) & 0x40000000;
     return f;
 }
 
@@ -545,48 +530,48 @@ const SCANLINES_TOTAL:  u32 = 263;
 // Mirror main.jam's per-cycle peripheral tick (post-Phase-3). Tests
 // should run the same scheduler as production so they catch real
 // regressions.
-fn emuRunOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
+fn emuRunOneFrame(c: mut Cpu, bus: Bus, regs: Vec(u32), cop0: Vec(u32)) {
     var line: u32 = 0;
     var lineCyc: u32 = 0;
     while (line < SCANLINES_TOTAL) {
-        biosHook(c, bus, regs);
+        biosHook(c, bus, regs.ptr);
         const before: u64 = c.cycles;
-        step(c, bus, regs, cop0);
+        step(c, bus, regs.ptr, cop0.ptr);
         const delta: u32 = (c.cycles - before) as u32;
-        bus.timer.updateCyc(bus.irq.typed(), cop0, delta);
-        dmaUpdate(bus.dma, bus.irq.typed(), cop0);
-        bus.cdrom.update(bus.disc, bus.irq.typed(), cop0, delta);
-        padUpdate(bus.pad, bus.irq.typed(), cop0, delta);
-        bus.sio1.update(bus.irq.typed(), cop0, delta);
-        spuUpdate(bus.spu, bus.spuram, bus.irq.typed(), cop0, delta);
+        bus.timer.updateCyc(bus.irq.ptr, cop0.ptr, delta);
+        dmaUpdate(bus.dma.ptr, bus.irq.ptr, cop0.ptr);
+        bus.cdrom.update(bus.disc, bus.irq.ptr, cop0.ptr, delta);
+        padUpdate(bus.pad.ptr, bus.irq.ptr, cop0.ptr, delta);
+        bus.sio1.update(bus.irq.ptr, cop0.ptr, delta);
+        spuUpdate(bus.spu.ptr, bus.spuram.ptr, bus.irq.ptr, cop0.ptr, delta);
         lineCyc = lineCyc + delta;
         if (lineCyc >= CYC_PER_SCANLINE) {
             lineCyc = lineCyc - CYC_PER_SCANLINE;
-            bus.timer.hblankBegin(bus.irq.typed(), cop0);
+            bus.timer.hblankBegin(bus.irq.ptr, cop0.ptr);
             bus.timer.hblankEnd();
             if (line == SCANLINES_VDRAW) {
-                bus.timer.vblankBegin(bus.irq.typed(), cop0);
-                irqRaise(bus.irq.typed(), cop0, IC_VBLANK());
+                bus.timer.vblankBegin(bus.irq.ptr, cop0.ptr);
+                irqRaise(bus.irq.ptr, cop0.ptr, IC_VBLANK());
             }
             line = line + 1;
         }
     }
-    commitLoad(c, regs);
+    commitLoad(c, regs.ptr);
     bus.timer.vblankEnd();
 }
 
-fn emuRunFrames(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
+fn emuRunFrames(c: mut Cpu, bus: Bus, regs: Vec(u32), cop0: Vec(u32),
                 frames: u32) {
     var i: u32 = 0;
     while (i < frames) {
-        emuRunOneFrame(c, bus, regs, cop0);
+        emuRunOneFrame(c, bus, regs.ptr, cop0.ptr);
         i = i + 1;
     }
 }
 
-fn emuBoot(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) i32 {
-    cop0Write(cop0, C0_SR,   0x10900000);
-    cop0Write(cop0, C0_PRID, 0x00000002);
+fn emuBoot(c: mut Cpu, bus: Bus, regs: Vec(u32), cop0: Vec(u32)) i32 {
+    cop0Write(cop0.ptr, C0_SR,   0x10900000);
+    cop0Write(cop0.ptr, C0_PRID, 0x00000002);
     return emuLoadBios(bus);
 }
 
@@ -599,18 +584,15 @@ fn emuPcInRamOrScratchpad(pc: u32) bool {
 }
 
 tfn emuBiosShellBoots() {
-    var regs: *mut[] u32 = allocRegFile(32);
-    var cop0: *mut[] u32 = allocRegFile(16);
+    var regs: Vec(u32) = allocRegFile(32);
+    var cop0: Vec(u32) = allocRegFile(16);
     var bus: Bus = allocBus();
     var c: Cpu = freshCpu();
-    if (emuBoot(c, bus, regs, cop0) == 0) {
-        freeRegFile(regs); freeRegFile(cop0); freeBus(bus);
+    if (emuBoot(c, bus, regs.ptr, cop0.ptr) == 0) { freeBus(bus);
         return;
     }
-    emuRunFrames(c, bus, regs, cop0, 60);
+    emuRunFrames(c, bus, regs.ptr, cop0.ptr, 60);
     assert(emuPcInRamOrScratchpad(c.pc), true);
-    freeRegFile(regs);
-    freeRegFile(cop0);
     freeBus(bus);
 }
 
@@ -621,23 +603,20 @@ tfn emuBiosShellBoots() {
 tfn emuDiscBootsExec() {
     var diskPath: []u8 = "game.bin";
     if (!fileExists(diskPath)) { return; }
-    var regs: *mut[] u32 = allocRegFile(32);
-    var cop0: *mut[] u32 = allocRegFile(16);
+    var regs: Vec(u32) = allocRegFile(32);
+    var cop0: Vec(u32) = allocRegFile(16);
     var bus: Bus = allocBus();
     var c: Cpu = freshCpu();
-    if (emuBoot(c, bus, regs, cop0) == 0) {
-        freeRegFile(regs); freeRegFile(cop0); freeBus(bus);
+    if (emuBoot(c, bus, regs.ptr, cop0.ptr) == 0) { freeBus(bus);
         return;
     }
     discOpen(bus.disc, diskPath);
-    emuRunFrames(c, bus, regs, cop0, 120);
+    emuRunFrames(c, bus, regs.ptr, cop0.ptr, 120);
     // Bare minimum: BIOS handed control out of ROM (0xBFC*) into RAM
     // or scratchpad. Stricter "PC inside game text segment" check is
     // a TODO — currently fails for the Harvest Moon SIO0-WaitEvent
     // stall where PC stays in BIOS scratchpad at 0x00001EB0.
     assert(emuPcInRamOrScratchpad(c.pc), true);
-    freeRegFile(regs);
-    freeRegFile(cop0);
     freeBus(bus);
 }
 
@@ -664,8 +643,8 @@ fn tGteCycDflt() u32 { return gteOpCycles(0x4A000000); }   // non-math → 2
 // A plain instruction fetched from cached RAM costs 2 (0 fetch + 2 base).
 fn tCycRam() u32 {
     var h: Harness = allocHarness();             // pc = 0x80000000 (KSEG0)
-    placeOp(h.bus, h.cop0, 0x80000000, encI(0x0D, 0, 8, 0x1234));  // ORI
-    step(h.cpu, h.bus, h.regs, h.cop0);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, encI(0x0D, 0, 8, 0x1234));  // ORI
+    step(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr);
     const v: u32 = h.cpu.cycles as u32;
     freeHarness(h);
     return v;
@@ -675,12 +654,12 @@ fn tCycRam() u32 {
 // base is charged before dispatch, so the cost is independent of what
 // the (zeroed) BIOS actually decodes to, as long as it isn't a GTE op.
 fn tCycBios() u32 {
-    var regs: *mut[] u32 = allocRegFile(32);
-    var cop0: *mut[] u32 = allocRegFile(16);
+    var regs: Vec(u32) = allocRegFile(32);
+    var cop0: Vec(u32) = allocRegFile(16);
     var bus: Bus = allocBus();
     var cpu: Cpu = freshCpuAt(0xBFC00000);       // KSEG1 BIOS entry
     var h: Harness = Harness { cpu: cpu, regs: regs, cop0: cop0, bus: bus };
-    step(h.cpu, h.bus, h.regs, h.cop0);
+    step(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr);
     const v: u32 = h.cpu.cycles as u32;
     freeHarness(h);
     return v;
@@ -692,9 +671,9 @@ fn tCycGteRtps() u32 {
     // Enable COP2 (SR.CU2, bit 30 of C0_SR=12) — dispatch raises a
     // coprocessor-unusable exception for COP2 ops otherwise, and the GTE
     // cycle cost would never be charged.
-    cop0Write(h.cop0, 12, 0x40000000);
-    placeOp(h.bus, h.cop0, 0x80000000, 0x4A000001);   // RTPS (COP2 imm)
-    step(h.cpu, h.bus, h.regs, h.cop0);
+    cop0Write(h.cop0.ptr, 12, 0x40000000);
+    placeOp(h.bus, h.cop0.ptr, 0x80000000, 0x4A000001);   // RTPS (COP2 imm)
+    step(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr);
     const v: u32 = h.cpu.cycles as u32;
     freeHarness(h);
     return v;
