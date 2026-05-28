@@ -22,8 +22,6 @@
 const { irqRaise, IC_JOY } = import("irq");
 const { Mcd } = import("mcd");
 
-pub extern fn fflush(stream: u64) i32;
-
 const { Vec } = import("std/collections");
 
 const PAD_STATE_SIZE: u32 = 32;

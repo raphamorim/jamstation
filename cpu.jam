@@ -40,10 +40,8 @@ const { Sio1 } = import("sio1");
 const { Mdec } = import("mdec");
 const { Disc } = import("disc");
 
-pub extern fn putchar(c: i32) i32;
-
 const { Vec } = import("std/collections");
-pub extern fn fflush(stream: u64) i32;
+const { print } = import("std/fmt");
 
 const Cpu = struct {
     pc: u32,
@@ -1237,13 +1235,18 @@ pub fn run(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
 
 // ---------- BIOS A/B-table hooks ---------------------------------------
 
-// Emit one BIOS console byte. Falls back to a per-newline `fflush(NULL)`
-// so the boot log shows up even when stdout is redirected to a file
-// (which makes libc switch from line-buffered to fully-buffered, hiding
-// every banner char until the buffer fills or the process exits cleanly).
+// Emit one BIOS console byte. std/fmt.print's `{b}` interpolation on a
+// `[]u8` slice dispatches to a raw byte-write (same `@emitWriteBytes`
+// path the literal-string `print("...")` form uses, write(1, ...) under
+// the hood — unbuffered, so no flushing needed even when stdout is
+// redirected to a file). The fixed-size buf must go through asMutPtr()
+// before slicing because jam's `[..]` operator requires a many-item
+// pointer base, not a fixed-size array.
 pub fn biosPutc(ch: u32) {
-    putchar((ch & 0xFF) as i32);
-    if ((ch & 0xFF) == 0x0A) { fflush(0); }
+    var buf: [1]u8 = [0; 1];
+    buf[0] = (ch & 0xFF) as u8;
+    var b: []u8 = buf.asMutPtr()[0..1];
+    print("{b}");
 }
 
 pub fn biosHook(c: mut Cpu, bus: Bus, regs: *mut[] u32) {

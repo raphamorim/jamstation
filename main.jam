@@ -50,12 +50,10 @@ const { File, exists } = import("std/fs");
 const { Args, args, next, exit } = import("std").process;
 const { print } = import("std/fmt");
 
-extern fn write(fd: i32, buf: *const[] u8, count: u64) i64;
-extern fn putchar(c: i32) i32;
-// File I/O (fopen/fread/fwrite/fclose/fseek/access) comes from std/fs
-// (imported above) — loadExe/dumpVramPpm/fileExists resolve those there.
-// fflush stays: it flushes stdout buffers, not a file.
-extern fn fflush(stream: u64) i32;
+// File I/O comes from std/fs (loadExe / dumpVramPpm / fileExists). All
+// console output routes through std/fmt.print, which lowers to a direct
+// unbuffered write(1, ...) via the `@emitWriteBytes` intrinsic — no
+// libc stdio buffering, so no fflush needed.
 
 // SDL2 externs need to be re-declared here so the codegen for sdl.jam's
 // pub wrappers (which lives in this module's compilation context) can
@@ -88,7 +86,6 @@ extern fn SDL_PauseAudioDevice(dev: u32, pause_on: i32);
 extern fn SDL_QueueAudio(dev: u32, data: *const[] u8, len: u32) i32;
 extern fn SDL_GetQueuedAudioSize(dev: u32) u32;
 
-const STDOUT: i32 = 1;
 
 fn fileExists(path: []u8) bool {
     return exists(path);
@@ -190,8 +187,7 @@ fn loadExe(path: []u8, bus: Bus, regs: *mut[] u32, c: mut Cpu) {
             const hdrBytes: u64 = f.read(hp[0..0x800]);
             if (hdrBytes < 0x800) {
                 f.close();
-                var msg: []u8 = "loadExe: header read failed\n";
-                write(STDOUT, msg.ptr, msg.len);
+                print("loadExe: header read failed\n");
                 return;
             }
 
@@ -227,8 +223,7 @@ fn loadExe(path: []u8, bus: Bus, regs: *mut[] u32, c: mut Cpu) {
             print("Loaded EXE: {fileSz} bytes\n");
         }
         None {
-            var msg: []u8 = "loadExe: cannot open file\n";
-            write(STDOUT, msg.ptr, msg.len);
+            print("loadExe: cannot open file\n");
         }
     }
 }
@@ -445,12 +440,6 @@ fn dumpVramPpm(path: []u8, vram: *mut[] u8) {
 
 // ---------- main --------------------------------------------------------
 
-// Force printf to flush immediately so progress messages survive a
-// downstream crash. `fflush(NULL)` flushes every open stream.
-fn flushAll() {
-    fflush(0);
-}
-
 // True if NUL-terminated `p` ends with ".exe" / ".EXE". Mirrors
 // disc.jam's pathEndsWithCue so an EXE passed as argv[2] is routed to
 // the sideload path instead of discOpen.
@@ -483,8 +472,7 @@ fn main() {
     // psxe's psx_mcd_init / psx_mcd_destroy lifecycle.
     var mcdPath: []u8 = "./slot1.mcd";
     if (mcdRamLoad(bus.mcdRam.ptr, mcdPath)) {
-        var loadMsg: []u8 = "Loaded memcard: ./slot1.mcd\n";
-        write(STDOUT, loadMsg.ptr, loadMsg.len);
+        print("Loaded memcard: ./slot1.mcd\n");
     }
 
     // Match psxe's initial COP0 state. The 0x10900000 value seeds COP0
@@ -514,19 +502,15 @@ fn main() {
     // A BIOS image is required — there is no default. Bail with a usage
     // message instead of silently booting to a black screen.
     if (!hasBios) {
-        var msg: []u8 = "error: no BIOS image given\nusage: jamstation <BIOS_PATH> [GAME_PATH]\n";
-        write(STDOUT, msg.ptr, msg.len);
-        flushAll();
+        print("error: no BIOS image given\nusage: jamstation <BIOS_PATH> [GAME_PATH]\n");
         exit(1);
     }
     if (!fileExists(biosPath)) {
         print("error: BIOS file not found: {biosPath}\n");
-        flushAll();
         exit(1);
     }
     const got: u64 = loadBios(biosPath, bus);
     print("Loaded BIOS: {got} bytes from {biosPath}\n");
-    flushAll();
 
     // EXE side-load. If `./demo.exe` exists we drop it into RAM and jump
     // straight to its entry point (skipping the BIOS boot animation —
@@ -550,13 +534,11 @@ fn main() {
         if (pathEndsWithExe(gameArg)) {
             gamePath = gameArg;
             pendingGameExe = true;
-            var msg: []u8 = "EXE arg — booting BIOS first, will side-load at PC=80030000\n";
-            write(STDOUT, msg.ptr, msg.len);
+            print("EXE arg — booting BIOS first, will side-load at PC=80030000\n");
         } else if (discOpen(bus.disc.ptrMut(), gameArg) != 0) {
             bus.cdrom.attachDisc(bus.disc.ptrMut());
         } else {
-            var msg: []u8 = "Could not open game image from arg — running BIOS only\n";
-            write(STDOUT, msg.ptr, msg.len);
+            print("Could not open game image from arg — running BIOS only\n");
         }
     } else {
         if (fileExists(cuePath)) {
@@ -570,14 +552,11 @@ fn main() {
         }
         if (fileExists(demoPath)) {
             loadExe(demoPath, bus, regs.ptr, c);
-            flushAll();
         } else if (fileExists(gamePath)) {
             pendingGameExe = true;
-            var msg: []u8 = "game.exe found — booting BIOS first, will side-load at PC=80030000\n";
-            write(STDOUT, msg.ptr, msg.len);
+            print("game.exe found — booting BIOS first, will side-load at PC=80030000\n");
         } else {
-            var msg: []u8 = "No game arg / demo.exe — running from BIOS reset vector only\n";
-            write(STDOUT, msg.ptr, msg.len);
+            print("No game arg / demo.exe — running from BIOS reset vector only\n");
         }
     }
 
@@ -585,8 +564,7 @@ fn main() {
     // texture, which matches the PSX's natural framebuffer format. A
     // future GPU implementation pokes pixels into VRAM; until then this
     // is a debug pattern.
-    var preMsg: []u8 = "Initializing SDL2...\n";
-    write(STDOUT, preMsg.ptr, preMsg.len);
+    print("Initializing SDL2...\n");
     var title: []u8 = "jamstation";
     // Set the JAM_PSONE_FULL_VRAM env var (any non-empty value) to
     // see the whole 1024×512 VRAM in the window instead of the
@@ -607,8 +585,7 @@ fn main() {
     if (fullVram) {
         sdlW = VRAM_WIDTH;
         sdlH = VRAM_HEIGHT;
-        var fmsg: []u8 = "JAM_PSONE_FULL_VRAM set — showing full VRAM\n";
-        write(STDOUT, fmsg.ptr, fmsg.len);
+        print("JAM_PSONE_FULL_VRAM set — showing full VRAM\n");
     }
     var sdl: Sdl = sdlInit(title, sdlW, sdlH);
     // Audio device — queue mode. Since the SPU is now advanced CPU-
@@ -621,19 +598,16 @@ fn main() {
     const cbAddr: u64 = 0 as u64;
     var audioDev: u32 = sdlAudioOpen(1024, cbAddr, 0 as u64);
     if (audioDev == 0) {
-        var afmt: []u8 = "WARN: SDL audio device failed to open\n";
-        write(STDOUT, afmt.ptr, afmt.len);
+        print("WARN: SDL audio device failed to open\n");
     } else {
         print("Audio device opened (id={audioDev}, 44.1kHz S16 stereo, queue mode)\n");
     }
-    var postMsg: []u8 = "SDL2 ready.\n";
-    write(STDOUT, postMsg.ptr, postMsg.len);
+    print("SDL2 ready.\n");
     // VRAM was already zero-filled when the Bus was allocated; the BIOS
     // renders into it within the first frame, so the brief black flash
     // before its first GP0 commit is fine.
 
-    var msg: []u8 = "Running — Esc or close to quit\n";
-    write(STDOUT, msg.ptr, msg.len);
+    print("Running — Esc or close to quit\n");
 
     // Active-low button mask the SDL pump updates from keyboard events.
     // 0xFFFF = no buttons pressed; sdlPump clears bits on KEYDOWN and
@@ -672,19 +646,16 @@ fn main() {
             loadExe(gamePath, bus, regs.ptr, c);
             pendingGameExe = false;
             idleFrames = 0;
-            flushAll();
         }
         if (pendingGameExe) {
             const curPoly: u32 = bus.gpu.familyCount(1);
             if (curPoly == lastPoly && curPoly >= MIN_POLY_DRAWN) {
                 idleFrames = idleFrames + 1;
                 if (idleFrames >= IDLE_TRIGGER) {
-                    var msg: []u8 = "BIOS shell idle — sideloading game.exe fallback\n";
-                    write(STDOUT, msg.ptr, msg.len);
+                    print("BIOS shell idle — sideloading game.exe fallback\n");
                     loadExe(gamePath, bus, regs.ptr, c);
                     pendingGameExe = false;
                     idleFrames = 0;
-                    flushAll();
                 }
             } else {
                 idleFrames = 0;

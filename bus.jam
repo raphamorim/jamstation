@@ -31,7 +31,6 @@ const { Mdec, mdecInputAlloc, mdecOutputAlloc } = import("mdec");
 const { Sio1 } = import("sio1");
 const { Mcd, mcdRamAlloc } = import("mcd");
 
-pub extern fn fflush(stream: u64) i32;
 
 // The Bus struct holds every piece of state we route through the
 // memory bus: raw buffers (RAM, BIOS, scratchpad, flat-IO fallback,
