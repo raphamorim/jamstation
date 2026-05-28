@@ -18,7 +18,7 @@
 // real discs prefix the data with 2 seconds (150 sectors) of pregap
 // that's not part of the image file.
 
-const { cueAlloc, cueFree, cueParse, cueRead, cueQuery,
+const { Cue, cueAlloc, cueReset, cueParse, cueRead, cueQuery,
         cueGetTrackCount, cueGetTrackLba, cueGetTrackNumber } = import("cue");
 
 const { Box } = import("std/box");
@@ -35,7 +35,13 @@ pub const Disc = struct {
     isCue: u8,         // 1 if cue-loaded (cuePtr is valid)
     pad1: u8,
     pad2: u8,
-    cuePtr: *mut[] u8, // opaque *mut[] Cue stored as bytes for struct-mirror compat
+    // Always-allocated Box(Cue). For non-cue discs it sits empty
+    // (fileCount=0). For cue discs, cueParse writes into it in place.
+    // Auto-drop chain: Box(Disc).drop → @dropInPlace → field walk →
+    // Box(Cue).drop → @dropInPlace on Cue → Cue.cfn drop closes files
+    // → field walk drops each Vec backing. Holding the Box here (vs a
+    // raw `*mut[] u8`) is what makes the cleanup chain self-sufficient.
+    cuePtr: Box(Cue),
 };
 
 // Owning heap-allocated Disc. Bus stores it as a `Box(Disc)` and the
@@ -50,17 +56,19 @@ pub fn discAlloc() Box(Disc) {
         isCue:   0,
         pad1:    0,
         pad2:    0,
-        cuePtr:  0 as *mut[] u8,
+        cuePtr:  cueAlloc(),
     });
 }
 
-// File-handle / cue-buffer cleanup that the auto-drop can't do on its own.
-// Box's drop frees the Disc's backing memory; this hook closes any open
-// resources the Disc was holding.
+// Reset open-file resources before either reopening this Disc with a new
+// image or letting the owning Bus go out of scope. For a cue disc we
+// invoke cueReset which closes every per-cue-track file handle and
+// zeros the file/track counters — the Cue's Vec backings stay live
+// (Box(Cue).drop frees them on scope exit). For a raw .bin we close
+// the single std.fs.File handle the Disc holds directly.
 pub fn discClose(d: *mut[] Disc) {
     if (d[0].isCue != 0) {
-        cueFree(d[0].cuePtr);
-        d[0].cuePtr = 0 as *mut[] u8;
+        cueReset(d[0].cuePtr.ptrMut());
         d[0].isCue = 0;
     } else if (d[0].loaded != 0) {
         d[0].file.close();
@@ -91,15 +99,19 @@ pub fn pathEndsWithCue(p: []u8) bool {
 // single-track Mode2/2352 .bin.
 pub fn discOpen(d: *mut[] Disc, path: []u8) i32 {
     if (pathEndsWithCue(path)) {
-        var c: *mut[] u8 = cueAlloc();
-        if (cueParse(c, path) != 0) {
-            cueFree(c);
+        // Reuse the always-allocated Box(Cue) at d[0].cuePtr — cueParse
+        // populates it in place, so we don't have to deal with assigning
+        // a new Box over the old one (jam doesn't auto-drop on field
+        // overwrite). On parse failure, cueReset clears whatever
+        // partial state landed before the failure.
+        var raw: *mut[] u8 = d[0].cuePtr.ptrMut() as *mut[] u8;
+        if (cueParse(raw, path) != 0) {
+            cueReset(d[0].cuePtr.ptrMut());
             return 0;
         }
-        d[0].cuePtr = c;
         d[0].isCue = 1;
         d[0].loaded = 1;
-        const tracks: u32 = cueGetTrackCount(c);
+        const tracks: u32 = cueGetTrackCount(raw);
         print("Opened CUE: {path} ({tracks} tracks)\n");
         return 1;
     }
@@ -131,7 +143,7 @@ pub fn fillPregapSector(buf: *mut[] u8) {
 pub fn discRead(d: *mut[] Disc, lba: u32, buf: *mut[] u8) i32 {
     if (d[0].loaded == 0) { return 0; }
     if (d[0].isCue != 0) {
-        return cueRead(d[0].cuePtr, lba, buf);
+        return cueRead(d[0].cuePtr.ptrMut() as *mut[] u8, lba, buf);
     }
     if (lba < LEAD_IN_SECTORS) {
         fillPregapSector(buf);
@@ -156,26 +168,26 @@ pub fn discLoaded(d: *mut[] Disc) i32 {
 
 pub fn discTrackCount(d: *mut[] Disc) u32 {
     if (d[0].loaded == 0) { return 0; }
-    if (d[0].isCue != 0) { return cueGetTrackCount(d[0].cuePtr); }
+    if (d[0].isCue != 0) { return cueGetTrackCount(d[0].cuePtr.ptrMut() as *mut[] u8); }
     return 1;
 }
 
 // Absolute start LBA of `track` (track 0 = lead-out / total). Returns
 // 0xFFFFFFFF for a track past the end (cue's TS_FAR sentinel).
 pub fn discTrackLba(d: *mut[] Disc, track: u32) u32 {
-    if (d[0].isCue != 0) { return cueGetTrackLba(d[0].cuePtr, track); }
+    if (d[0].isCue != 0) { return cueGetTrackLba(d[0].cuePtr.ptrMut() as *mut[] u8, track); }
     if (track > 1) { return 0xFFFFFFFF; }
     return LEAD_IN_SECTORS;
 }
 
 pub fn discTrackNumber(d: *mut[] Disc, lba: u32) u32 {
-    if (d[0].isCue != 0) { return cueGetTrackNumber(d[0].cuePtr, lba); }
+    if (d[0].isCue != 0) { return cueGetTrackNumber(d[0].cuePtr.ptrMut() as *mut[] u8, lba); }
     return 1;
 }
 
 // Track state at `lba`: 0=DATA, 1=AUDIO, 2=PREGAP, 3=FAR (matches cueQuery).
 pub fn discQuery(d: *mut[] Disc, lba: u32) u32 {
-    if (d[0].isCue != 0) { return cueQuery(d[0].cuePtr, lba); }
+    if (d[0].isCue != 0) { return cueQuery(d[0].cuePtr.ptrMut() as *mut[] u8, lba); }
     if (lba < LEAD_IN_SECTORS) { return 2; }    // pregap
     return 0;                                    // data
 }

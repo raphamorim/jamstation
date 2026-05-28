@@ -18,17 +18,10 @@
 // than 99 tracks anyway. Each track stores absolute LBA start/end so the
 // disc-read path can look up by LBA.
 
-// Internal to cue.jam — the Cue struct is heap-allocated with a custom
-// layout that doesn't fit the Box(T) / Vec(T) machinery cleanly (its
-// inner Vec fields would still need explicit cleanup because they live
-// inside heap bytes, not a stack-tracked container). Keeping the libc
-// allocator extern-private here means no other jamstation module sees
-// these symbols — defining-module resolution scopes them locally.
-extern fn malloc(size: u64) *mut[] u8;
-extern fn free(ptr: *mut[] u8);
-extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 // All file I/O goes through std.fs — no raw libc file ABI in this module.
 const { File, exists, canonicalize } = import("std/fs");
+const { Vec } = import("std/collections");
+const { Box } = import("std/box");
 
 // Track-mode enum (psxe cue.h subset we actually use).
 pub const TRACK_MODE_UNKNOWN: u32 = 0;
@@ -67,19 +60,40 @@ pub const CueTrack = struct {
 };
 
 pub const Cue = struct {
-    files:     *mut[] CueFile,
-    tracks:    *mut[] CueTrack,
+    // Vec instead of raw `*mut[] T` so each backing buffer auto-drops
+    // when the enclosing Box(Cue) is destroyed (Box.drop → @dropInPlace
+    // → field walk → Vec.drop). Cue's own `cfn drop` is the iterate-and-
+    // close-files cleanup that Vec can't synthesize for a File handle.
+    files:     Vec(CueFile),
+    tracks:    Vec(CueTrack),
     fileCount: u32,
     trackCount: u32,
     // Concatenated path strings, NUL-terminated; pathLo/pathHi index into here.
-    pathBuf:   *mut[] u8,
+    pathBuf:   Vec(u8),
     pathBufLen: u32,
     pathBufCap: u32,
     // Parser scratch state (psxe-style readByte loop).
     file:      File,
     cur:       u32,         // current character (sentinel-extended)
-    rootPath:  *mut[] u8,   // directory of the .cue, used to resolve BIN paths
+    rootPath:  Vec(u8),     // directory of the .cue, used to resolve BIN paths
     rootLen:   u32,
+
+    // Close every open per-file handle before the Vec backings get
+    // freed by the auto-drop. The Vec drop itself doesn't know how to
+    // close a File — that's our responsibility. The user-side cleanup
+    // path is `cueClose(c)`; this `cfn drop` is the safety net for any
+    // path that bypasses cueClose (e.g. test teardown).
+    cfn drop(self: mut Self) {
+        var i: u32 = 0;
+        while (i < self.fileCount) {
+            if (self.files.ptr[i].sectors != 0) {
+                var f: File = self.files.ptr[i].file;
+                f.close();
+                self.files.ptr[i].sectors = 0;
+            }
+            i = i + 1;
+        }
+    }
 };
 
 // ---------- helpers ----------------------------------------------------
@@ -190,36 +204,56 @@ pub fn kwId(buf: *mut[] u8) u32 {
 
 // ---------- allocator -------------------------------------------------
 
-pub fn cueAlloc() *mut[] u8 {
-    var raw: *mut[] u8 = malloc(96);
-    memset(raw, 0, 96);
-    var c: *mut[] Cue = raw as *mut[] Cue;
-    c[0].files  = (malloc((MAX_FILES  as u64) * 48) as *mut[] CueFile);
-    c[0].tracks = (malloc((MAX_TRACKS as u64) * 36) as *mut[] CueTrack);
-    memset(c[0].files  as *mut[] u8, 0, (MAX_FILES  as u64) * 48);
-    memset(c[0].tracks as *mut[] u8, 0, (MAX_TRACKS as u64) * 36);
-    c[0].pathBufCap = 4096;
-    c[0].pathBuf = malloc(c[0].pathBufCap as u64);
-    memset(c[0].pathBuf, 0, c[0].pathBufCap as u64);
-    c[0].rootPath = malloc(512);
-    memset(c[0].rootPath, 0, 512);
-    return raw;
-}
-
-pub fn cueFree(raw: *mut[] u8) {
-    var c: *mut[] Cue = raw as *mut[] Cue;
+// Allocate a Box(Cue) with each inner Vec sized to its MAX_/cap. The
+// Vecs are filled-with-zero so the existing index-based writes by
+// cueParse (`c.files.ptr[fi].sectors = ...`) land on valid slots —
+// matches the old memset-after-malloc semantics. When the owning Bus
+// goes out of scope, Box(Disc).drop → @dropInPlace → Disc.cuePtr Box
+// drop → @dropInPlace on Cue → Cue's cfn drop closes open files →
+// Cue's field-walk drops each Vec → libc free.
+// Close every open per-cue-file handle and zero the counters so the
+// same Box(Cue) can be repopulated by a fresh cueParse. The Vec backings
+// stay live — only the user-visible "we have N tracks/files loaded"
+// state is reset. Called from discClose AND from discOpen's parse-
+// failure path so partial state never leaks into a subsequent open.
+pub fn cueReset(c: *mut[] Cue) {
     var i: u32 = 0;
     while (i < c[0].fileCount) {
-        if (c[0].files[i].sectors != 0) {
-            c[0].files[i].file.close();
+        if (c[0].files.ptr[i].sectors != 0) {
+            var f: File = c[0].files.ptr[i].file;
+            f.close();
+            c[0].files.ptr[i].sectors = 0;
         }
         i = i + 1;
     }
-    free(c[0].files as *mut[] u8);
-    free(c[0].tracks as *mut[] u8);
-    free(c[0].pathBuf);
-    free(c[0].rootPath);
-    free(raw);
+    c[0].fileCount = 0;
+    c[0].trackCount = 0;
+    c[0].pathBufLen = 0;
+    c[0].rootLen = 0;
+}
+
+pub fn cueAlloc() Box(Cue) {
+    return Box(Cue).init(Cue {
+        files:      Vec(CueFile).filled(
+                        CueFile { file: File { handle: 0 as *mut[] u8 },
+                                  sectors: 0, startLba: 0,
+                                  pathLo: 0, pathHi: 0 },
+                        MAX_FILES),
+        tracks:     Vec(CueTrack).filled(
+                        CueTrack { number: 0, mode: 0, pregap: 0,
+                                   startLba: 0, endLba: 0,
+                                   index0: -1, index1: -1, fileIdx: 0 },
+                        MAX_TRACKS),
+        fileCount:  0,
+        trackCount: 0,
+        pathBuf:    Vec(u8).filled(0, 4096),
+        pathBufLen: 0,
+        pathBufCap: 4096,
+        file:       File { handle: 0 as *mut[] u8 },
+        cur:        0,
+        rootPath:   Vec(u8).filled(0, 512),
+        rootLen:    0,
+    });
 }
 
 // Append a NUL-terminated string into pathBuf, returning the start offset.
@@ -229,10 +263,10 @@ pub fn pathBufAppend(raw: *mut[] u8, src: *mut[] u8, len: u32) u32 {
     if (off + len + 1 >= c[0].pathBufCap) { return 0; }
     var i: u32 = 0;
     while (i < len) {
-        c[0].pathBuf[off + i] = src[i];
+        c[0].pathBuf.ptr[off + i] = src[i];
         i = i + 1;
     }
-    c[0].pathBuf[off + len] = 0;
+    c[0].pathBuf.ptr[off + len] = 0;
     c[0].pathBufLen = off + len + 1;
     return off;
 }
@@ -247,7 +281,7 @@ pub fn cueComputeRanges(raw: *mut[] u8) {
     var lba: u32 = 150;
     var fi: u32 = 0;
     while (fi < c[0].fileCount) {
-        c[0].files[fi].startLba = lba;
+        c[0].files.ptr[fi].startLba = lba;
         // Find tracks for this file and assign ranges.
         // Single-track file: track spans the whole file.
         // Multi-track file: each track ends where the next begins.
@@ -255,7 +289,7 @@ pub fn cueComputeRanges(raw: *mut[] u8) {
         var lastTrack: u32 = 0;
         var ti: u32 = 0;
         while (ti < c[0].trackCount) {
-            if (c[0].tracks[ti].fileIdx == fi) {
+            if (c[0].tracks.ptr[ti].fileIdx == fi) {
                 if (firstTrack == MAX_TRACKS) { firstTrack = ti; }
                 lastTrack = ti;
             }
@@ -266,32 +300,32 @@ pub fn cueComputeRanges(raw: *mut[] u8) {
             fi = fi + 1;
             continue;
         }
-        const fileSectors: u32 = c[0].files[fi].sectors;
+        const fileSectors: u32 = c[0].files.ptr[fi].sectors;
         if (firstTrack == lastTrack) {
             // Single track: pregap from INDEX 01 if present, then full file.
             var pregap: u32 = 0;
-            if (c[0].tracks[firstTrack].index0 != -1 &&
-                c[0].tracks[firstTrack].index1 != -1) {
-                pregap = c[0].tracks[firstTrack].index1 as u32;
+            if (c[0].tracks.ptr[firstTrack].index0 != -1 &&
+                c[0].tracks.ptr[firstTrack].index1 != -1) {
+                pregap = c[0].tracks.ptr[firstTrack].index1 as u32;
             }
-            c[0].tracks[firstTrack].pregap = pregap;
-            c[0].tracks[firstTrack].startLba = lba + pregap;
-            c[0].tracks[firstTrack].endLba = c[0].tracks[firstTrack].startLba + fileSectors;
-            lba = c[0].tracks[firstTrack].endLba;
+            c[0].tracks.ptr[firstTrack].pregap = pregap;
+            c[0].tracks.ptr[firstTrack].startLba = lba + pregap;
+            c[0].tracks.ptr[firstTrack].endLba = c[0].tracks.ptr[firstTrack].startLba + fileSectors;
+            lba = c[0].tracks.ptr[firstTrack].endLba;
         } else {
             // Multi-track: each track's start is index1 + 150; ends at next.
             ti = firstTrack;
             while (ti <= lastTrack) {
-                c[0].tracks[ti].startLba = (c[0].tracks[ti].index1 as u32) + 150;
+                c[0].tracks.ptr[ti].startLba = (c[0].tracks.ptr[ti].index1 as u32) + 150;
                 if (ti == lastTrack) {
-                    c[0].tracks[ti].endLba = lba + fileSectors;
+                    c[0].tracks.ptr[ti].endLba = lba + fileSectors;
                 } else {
-                    c[0].tracks[ti].endLba =
-                        ((c[0].tracks[ti + 1].index1 as u32) + 150) - 1;
+                    c[0].tracks.ptr[ti].endLba =
+                        ((c[0].tracks.ptr[ti + 1].index1 as u32) + 150) - 1;
                 }
                 ti = ti + 1;
             }
-            lba = c[0].tracks[lastTrack].endLba;
+            lba = c[0].tracks.ptr[lastTrack].endLba;
         }
         fi = fi + 1;
     }
@@ -307,22 +341,22 @@ pub fn cueGetTrackCount(raw: *mut[] u8) u32 {
 pub fn cueGetTrackLba(raw: *mut[] u8, track: u32) u32 {
     var c: *mut[] Cue = raw as *mut[] Cue;
     if (track == 0) {
-        return c[0].tracks[c[0].trackCount - 1].endLba;
+        return c[0].tracks.ptr[c[0].trackCount - 1].endLba;
     }
     if (track > c[0].trackCount) { return 0xFFFFFFFF; }
-    return c[0].tracks[track - 1].startLba;
+    return c[0].tracks.ptr[track - 1].startLba;
 }
 
 pub fn cueGetTrackNumber(raw: *mut[] u8, lba: u32) u32 {
     var c: *mut[] Cue = raw as *mut[] Cue;
     var i: u32 = 0;
     while (i < c[0].trackCount) {
-        if (lba >= c[0].tracks[i].startLba && lba < c[0].tracks[i].endLba) {
-            return c[0].tracks[i].number;
+        if (lba >= c[0].tracks.ptr[i].startLba && lba < c[0].tracks.ptr[i].endLba) {
+            return c[0].tracks.ptr[i].number;
         }
         i = i + 1;
     }
-    if (c[0].trackCount > 0) { return c[0].tracks[c[0].trackCount - 1].number; }
+    if (c[0].trackCount > 0) { return c[0].tracks.ptr[c[0].trackCount - 1].number; }
     return 1;
 }
 
@@ -332,7 +366,7 @@ pub fn cueFindTrack(raw: *mut[] u8, lba: u32) u32 {
     var c: *mut[] Cue = raw as *mut[] Cue;
     var i: u32 = 0;
     while (i < c[0].trackCount) {
-        if (lba >= c[0].tracks[i].startLba && lba < c[0].tracks[i].endLba) {
+        if (lba >= c[0].tracks.ptr[i].startLba && lba < c[0].tracks.ptr[i].endLba) {
             return i;
         }
         i = i + 1;
@@ -358,20 +392,20 @@ pub fn cueRead(raw: *mut[] u8, lba: u32, buf: *mut[] u8) i32 {
     const ti: u32 = cueFindTrack(raw, lba);
     if (ti == c[0].trackCount) {
         // Past last track — could be pregap or far past end.
-        if (c[0].trackCount > 0 && lba >= c[0].tracks[c[0].trackCount - 1].endLba) {
+        if (c[0].trackCount > 0 && lba >= c[0].tracks.ptr[c[0].trackCount - 1].endLba) {
             return 0;
         }
         // Pregap: psxe cue.c:535-536 fills zero + sync at bytes [1..10].
         fillPregap(buf);
         return 1;
     }
-    const fi: u32 = c[0].tracks[ti].fileIdx;
-    const off: i64 = ((lba - c[0].files[fi].startLba) as i64) * (SECTOR as i64);
+    const fi: u32 = c[0].tracks.ptr[ti].fileIdx;
+    const off: i64 = ((lba - c[0].files.ptr[fi].startLba) as i64) * (SECTOR as i64);
     if (off < 0) {
         fillPregap(buf);
         return 1;
     }
-    var tf: File = c[0].files[fi].file;
+    var tf: File = c[0].files.ptr[fi].file;
     tf.seek(off, 0);
     const got: u64 = tf.read(buf[0..SECTOR]);
     if (got != SECTOR as u64) { return 0; }
@@ -383,12 +417,12 @@ pub fn cueRead(raw: *mut[] u8, lba: u32, buf: *mut[] u8) i32 {
 pub fn cueQuery(raw: *mut[] u8, lba: u32) u32 {
     var c: *mut[] Cue = raw as *mut[] Cue;
     if (c[0].trackCount > 0 &&
-        lba >= c[0].tracks[c[0].trackCount - 1].endLba) {
+        lba >= c[0].tracks.ptr[c[0].trackCount - 1].endLba) {
         return 3;
     }
     const ti: u32 = cueFindTrack(raw, lba);
     if (ti == c[0].trackCount) { return 2; }
-    if (c[0].tracks[ti].mode == TRACK_MODE_AUDIO) { return 1; }
+    if (c[0].tracks.ptr[ti].mode == TRACK_MODE_AUDIO) { return 1; }
     return 0;
 }
 
@@ -433,10 +467,10 @@ pub fn cueParse(raw: *mut[] u8, path: []u8) i32 {
     }
     var ri: u32 = 0;
     while (ri < lastSlash) {
-        c[0].rootPath[ri] = resolved[ri];
+        c[0].rootPath.ptr[ri] = resolved[ri];
         ri = ri + 1;
     }
-    c[0].rootPath[lastSlash] = 0;
+    c[0].rootPath.ptr[lastSlash] = 0;
     c[0].rootLen = lastSlash;
 
     skipWs(raw);
@@ -482,7 +516,7 @@ pub fn cueParseFile(raw: *mut[] u8) {
     var ni: u32 = 0;
     // Prefix with the .cue's directory.
     while (ni < c[0].rootLen) {
-        nameBuf[ni] = c[0].rootPath[ni];
+        nameBuf[ni] = c[0].rootPath.ptr[ni];
         ni = ni + 1;
     }
     while (c[0].cur != 0x22 && !c[0].file.eof() && ni < 510) {
@@ -506,8 +540,8 @@ pub fn cueParseFile(raw: *mut[] u8) {
         Some(f) {
             const sz: u64 = f.size();
             const fi: u32 = c[0].fileCount;
-            c[0].files[fi].file = f;
-            c[0].files[fi].sectors = (sz as u32) / SECTOR;
+            c[0].files.ptr[fi].file = f;
+            c[0].files.ptr[fi].sectors = (sz as u32) / SECTOR;
             c[0].fileCount = fi + 1;
         }
         None { return; }
@@ -533,12 +567,12 @@ pub fn cueParseTrack(raw: *mut[] u8) {
     else if (kw == 12) { mode = TRACK_MODE_AUDIO; }
     if (c[0].trackCount >= MAX_TRACKS) { return; }
     const ti: u32 = c[0].trackCount;
-    c[0].tracks[ti].number = num;
-    c[0].tracks[ti].mode = mode;
-    c[0].tracks[ti].pregap = 0;
-    c[0].tracks[ti].index0 = -1;
-    c[0].tracks[ti].index1 = -1;
-    c[0].tracks[ti].fileIdx = c[0].fileCount - 1;
+    c[0].tracks.ptr[ti].number = num;
+    c[0].tracks.ptr[ti].mode = mode;
+    c[0].tracks.ptr[ti].pregap = 0;
+    c[0].tracks.ptr[ti].index0 = -1;
+    c[0].tracks.ptr[ti].index1 = -1;
+    c[0].tracks.ptr[ti].fileIdx = c[0].fileCount - 1;
     c[0].trackCount = ti + 1;
 }
 
@@ -552,6 +586,6 @@ pub fn cueParseIndex(raw: *mut[] u8) {
     skipWs(raw);
     const msf: u32 = parseMsf(raw);
     const ti: u32 = c[0].trackCount - 1;
-    if (i == 0) { c[0].tracks[ti].index0 = msf as i32; }
-    if (i == 1) { c[0].tracks[ti].index1 = msf as i32; }
+    if (i == 0) { c[0].tracks.ptr[ti].index0 = msf as i32; }
+    if (i == 1) { c[0].tracks.ptr[ti].index1 = msf as i32; }
 }

@@ -23,7 +23,7 @@ const { Cdrom } = import("cdrom");
 const { Disc, discAlloc, discOpen } = import("disc");
 const { dmaAlloc, dmaTickSpu, dmaUpdate } = import("dma");
 const { padAlloc, padUpdate, padSetButtons } = import("pad");
-const { spuAlloc, spuRamAlloc, psone_audio_cb, setU64, spuStepAdsrCpu,
+const { spuAlloc, spuRamAlloc, setU64, spuStepAdsrCpu,
         spuGetSample } = import("spu");
 const { Sio1 } = import("sio1");
 const { Mdec } = import("mdec");
@@ -692,8 +692,9 @@ fn main() {
             }
         }
         runOneFrame(c, bus, regs.ptr, cop0.ptr, audioDev);
-        // Audio: nothing to do on the main thread anymore. SDL's audio
-        // thread is pulling samples from psone_audio_cb at 44.1 kHz.
+        // Audio: runOneFrame fed the per-frame sample batch to SDL via
+        // SDL_QueueAudio. SDL drains the queue at the host's 44.1 kHz
+        // pull rate; no callback path active.
         var vram: *mut[] u8 = busVramPtr(bus);
         // Read the current display origin out of the GPU state buffer
         // (g[63] disp_x, g[64] disp_y — set by GP1 0x05). The BIOS
