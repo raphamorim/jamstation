@@ -7,6 +7,7 @@
 const { assert } = import("test");
 
 const {
+    Bus,
     allocBus, freeBus,
     busWrite32
 } = import("bus");
@@ -34,6 +35,7 @@ const { padAlloc, padUpdate } = import("pad");
 const { spuAlloc, spuRamAlloc, spuUpdate } = import("spu");
 const { Sio1 } = import("sio1");
 const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
+const { Buf } = import("std/buf");
 const { Timer } = import("timer");
 const { Mcd } = import("mcd");
 const { Mdec } = import("mdec");
@@ -56,30 +58,6 @@ const Disc = struct {
     cuePtr: *mut[] u8,
 };
 
-const Bus = struct {
-    ram:  *mut[] u8,
-    bios: *mut[] u8,
-    spad: *mut[] u8,
-    io:   *mut[] u8,
-    vram: *mut[] u8,
-    gpu:   Gpu,
-    dma:   *mut[] u32,
-    irq:   *mut[] u32,
-    timer: Timer,
-    gte:   *mut[] u32,
-    cdrom: Cdrom,
-    disc:  *mut[] Disc,
-    pad:   *mut[] u8,
-    spu:     *mut[] u8,
-    spuram:  *mut[] u8,
-    mdec:    Mdec,
-    mdecIn:  *mut[] u8,
-    mdecOut: *mut[] u8,
-    sio1:    Sio1,
-    mcd:     Mcd,
-    mcdRam:  *mut[] u8,
-    biosLoaded: u8,
-};
 
 const Cpu = struct {
     pc: u32,
@@ -575,20 +553,20 @@ fn emuRunOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         const before: u64 = c.cycles;
         step(c, bus, regs, cop0);
         const delta: u32 = (c.cycles - before) as u32;
-        bus.timer.updateCyc(bus.irq, cop0, delta);
-        dmaUpdate(bus.dma, bus.irq, cop0);
-        bus.cdrom.update(bus.disc, bus.irq, cop0, delta);
-        padUpdate(bus.pad, bus.irq, cop0, delta);
-        bus.sio1.update(bus.irq, cop0, delta);
-        spuUpdate(bus.spu, bus.spuram, bus.irq, cop0, delta);
+        bus.timer.updateCyc(bus.irq.typed(), cop0, delta);
+        dmaUpdate(bus.dma, bus.irq.typed(), cop0);
+        bus.cdrom.update(bus.disc, bus.irq.typed(), cop0, delta);
+        padUpdate(bus.pad, bus.irq.typed(), cop0, delta);
+        bus.sio1.update(bus.irq.typed(), cop0, delta);
+        spuUpdate(bus.spu, bus.spuram, bus.irq.typed(), cop0, delta);
         lineCyc = lineCyc + delta;
         if (lineCyc >= CYC_PER_SCANLINE) {
             lineCyc = lineCyc - CYC_PER_SCANLINE;
-            bus.timer.hblankBegin(bus.irq, cop0);
+            bus.timer.hblankBegin(bus.irq.typed(), cop0);
             bus.timer.hblankEnd();
             if (line == SCANLINES_VDRAW) {
-                bus.timer.vblankBegin(bus.irq, cop0);
-                irqRaise(bus.irq, cop0, IC_VBLANK());
+                bus.timer.vblankBegin(bus.irq.typed(), cop0);
+                irqRaise(bus.irq.typed(), cop0, IC_VBLANK());
             }
             line = line + 1;
         }

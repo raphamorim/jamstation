@@ -13,6 +13,8 @@
 
 const { Gpu } = import("gpu");
 const { irqRaise, IC_DMA } = import("irq");
+const { Buf } = import("std/buf");
+const { Bus } = import("bus");
 const { Cdrom } = import("cdrom");
 const { Mdec } = import("mdec");
 const { spuWrite16, spuRead16 } = import("spu");
@@ -35,30 +37,6 @@ const Disc = struct {
     cuePtr: *mut[] u8,
 };
 
-const Bus = struct {
-    ram:  *mut[] u8,
-    bios: *mut[] u8,
-    spad: *mut[] u8,
-    io:   *mut[] u8,
-    vram: *mut[] u8,
-    gpu:   Gpu,
-    dma:   *mut[] u32,
-    irq:   *mut[] u32,
-    timer: *mut[] u32,
-    gte:   *mut[] u32,
-    cdrom: Cdrom,
-    disc:  *mut[] Disc,
-    pad:   *mut[] u8,
-    spu:     *mut[] u8,
-    spuram:  *mut[] u8,
-    mdec:    Mdec,
-    mdecIn:  *mut[] u8,
-    mdecOut: *mut[] u8,
-    sio1:    *mut[] u8,
-    mcd:     *mut[] u8,
-    mcdRam:  *mut[] u8,
-    biosLoaded: u8,
-};
 
 // d[0..20] = 7 channels × 3 regs (MADR/BCR/CHCR)
 // d[21]    = DPCR

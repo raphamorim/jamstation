@@ -29,6 +29,8 @@ const { busRead32, busRead16, busRead8,
 const { Gpu } = import("gpu");
 const { dmaAlloc } = import("dma");
 const { irqAlloc } = import("irq");
+const { Buf } = import("std/buf");
+const { Bus } = import("bus");
 const { Timer } = import("timer");
 const { gteAlloc, gteDataRead, gteDataWrite,
         gteCtrlRead, gteCtrlWrite, gteExec, gteOpCycles } = import("gte");
@@ -50,31 +52,6 @@ const Disc = struct {
     pad1: u8,
     pad2: u8,
     cuePtr: *mut[] u8,
-};
-
-const Bus = struct {
-    ram:  *mut[] u8,
-    bios: *mut[] u8,
-    spad: *mut[] u8,
-    io:   *mut[] u8,
-    vram: *mut[] u8,
-    gpu:   Gpu,
-    dma:   *mut[] u32,
-    irq:   *mut[] u32,
-    timer: Timer,
-    gte:   *mut[] u32,
-    cdrom: Cdrom,
-    disc:  *mut[] Disc,
-    pad:   *mut[] u8,
-    spu:     *mut[] u8,
-    spuram:  *mut[] u8,
-    mdec:    Mdec,
-    mdecIn:  *mut[] u8,
-    mdecOut: *mut[] u8,
-    sio1:    Sio1,
-    mcd:     Mcd,
-    mcdRam:  *mut[] u8,
-    biosLoaded: u8,
 };
 
 const Cpu = struct {

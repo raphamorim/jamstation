@@ -12,9 +12,7 @@
 //   [0] I_STAT
 //   [1] I_MASK
 
-pub extern fn malloc(size: u64) *mut[] u8;
-pub extern fn free(ptr: *mut[] u8);
-pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+const { Buf } = import("std/buf");
 
 // IRQ line bits (psxe ic.h: IC_VBLANK = 0x001, etc.).
 pub fn IC_VBLANK() u32 { return 0x001; }
@@ -35,18 +33,11 @@ pub fn IC_LP_PIO() u32 { return 0x400; }
 const CAUSE_IP2: u32 = 0x00000400;
 const C0_CAUSE: u32 = 13;
 
-pub fn irqAlloc() *mut[] u32 {
-    // 8 bytes for stat/mask + 11 × 4 bytes for per-source fire counters
-    // (ic[2..12]) + slack. Used by main.jam to print which interrupt
-    // sources are firing during a hang.
-    var raw: *mut[] u8 = malloc(64);
-    memset(raw, 0, 64);
-    return raw as *mut[] u32;
-}
-
-pub fn irqFree(ic: *mut[] u32) {
-    free(ic as *mut[] u8);
-}
+// 16 u32 slots: [0]=I_STAT, [1]=I_MASK, [2..12]=per-source fire counters
+// (used by main.jam to print which interrupt sources are firing during a
+// hang), plus slack. The Buf owns the allocation — its drop frees on
+// scope exit, no irqFree helper needed.
+pub fn irqAlloc() Buf(u32) { return Buf(u32).zeroed(16); }
 
 pub fn irqStat(ic: *mut[] u32) u32 { return ic[0]; }
 pub fn irqMask(ic: *mut[] u32) u32 { return ic[1]; }
