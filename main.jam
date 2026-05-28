@@ -47,11 +47,11 @@ const {
 const { Vec } = import("std").collections;
 const { File, exists } = import("std/fs");
 const { Args, args, next, exit } = import("std").process;
+const { print } = import("std/fmt");
 
 extern fn malloc(size: u64) *mut[] u8;
 extern fn free(ptr: *mut[] u8);
 extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
-extern fn printf(format: *const[] u8, ...) i32;
 extern fn write(fd: i32, buf: *const[] u8, count: u64) i64;
 extern fn putchar(c: i32) i32;
 // File I/O (fopen/fread/fwrite/fclose/fseek/access) comes from std/fs
@@ -137,9 +137,6 @@ const Cpu = struct {
     savedPc: u32,
     hi: u32,
     lo: u32,
-    traceFp:   u64,
-    traceInit: u32,
-    traceN:    u64,
     loadD: u32,
     loadV: u32,
     branch: u8,
@@ -263,9 +260,7 @@ fn loadExe(path: []u8, bus: Bus, regs: *mut[] u32, c: mut Cpu) {
                 gprWrite(regs, 30, sp);
             }
 
-            var fmt: []u8 = "Loaded EXE: PC=%08X SP=%08X GP=%08X size=%u dest=%08X\n";
-            printf(fmt.ptr, c.pc, gprRead(regs, 29), gprRead(regs, 28),
-                   fileSz, ramDest);
+            print("Loaded EXE: {fileSz} bytes\n");
         }
         None {
             var msg: []u8 = "loadExe: cannot open file\n";
@@ -450,8 +445,7 @@ fn dumpVramPpm(path: []u8, vram: *mut[] u8) {
                 y = y + 1;
             }
             f.close();
-            var msg: []u8 = "Wrote VRAM dump: %.*s\n";
-            printf(msg.ptr, path.len as i32, path.ptr);
+            print("Wrote VRAM dump: {path}\n");
         }
         None { }
     }
@@ -534,14 +528,12 @@ fn main() {
         exit(1);
     }
     if (!fileExists(biosPath)) {
-        var fmt: []u8 = "error: BIOS file not found: %.*s\n";
-        printf(fmt.ptr, biosPath.len as i32, biosPath.ptr);
+        print("error: BIOS file not found: {biosPath}\n");
         flushAll();
         exit(1);
     }
     const got: u64 = loadBios(biosPath, bus);
-    var biosFmt: []u8 = "Loaded BIOS: %llu bytes from %.*s\n";
-    printf(biosFmt.ptr, got, biosPath.len as i32, biosPath.ptr);
+    print("Loaded BIOS: {got} bytes from {biosPath}\n");
     flushAll();
 
     // EXE side-load. If `./demo.exe` exists we drop it into RAM and jump
@@ -644,8 +636,7 @@ fn main() {
         var afmt: []u8 = "WARN: SDL audio device failed to open\n";
         write(STDOUT, afmt.ptr, afmt.len);
     } else {
-        var aok: []u8 = "Audio device opened (id=%u, 44.1kHz S16 stereo, callback mode)\n";
-        printf(aok.ptr, audioDev);
+        print("Audio device opened (id={audioDev}, 44.1kHz S16 stereo, callback mode)\n");
     }
     var postMsg: []u8 = "SDL2 ready. Priming VRAM...\n";
     write(STDOUT, postMsg.ptr, postMsg.len);
@@ -747,21 +738,6 @@ fn main() {
         // FMV-debug probe: periodic GP0 family histogram. Once every
         // 300 frames (~5s at 60Hz) dump g[72..79] so we can see if/when
         // family 5 (CPU→VRAM, the FMV upload signature) starts firing.
-        if ((frames % 300) == 0) {
-            var gpuState: *mut[] u32 = bus.gpu.bufPtr();
-            var fmt: []u8 = "[%u] GP0 families: misc=%u poly=%u line=%u rect=%u blit=%u cpu2vram=%u vram2cpu=%u drawset=%u\n";
-            printf(fmt.ptr, frames,
-                gpuState[72], gpuState[73], gpuState[74], gpuState[75],
-                gpuState[76], gpuState[77], gpuState[78], gpuState[79]);
-            const cdinfo: u32 = bus.cdrom.dbgInfo();
-            var cdfmt: []u8 = "      cd: lba=%u state=%02x readOngoing=%u mode=%02x ifr=%02x dispmode=%06x 24bpp=%u\n";
-            printf(cdfmt.ptr, bus.cdrom.dbgLba(),
-                cdinfo & 0xFF, (cdinfo >> 8) & 0xFF,
-                (cdinfo >> 16) & 0xFF, (cdinfo >> 24) & 0xFF,
-                gpuState[47], (gpuState[47] >> 4) & 1);
-            flushAll();
-        }
-
         // Bail after a long-but-finite session if no quit event comes —
         // protects users from a runaway window when there's no controller
         // input wired up yet.
@@ -771,21 +747,6 @@ fn main() {
     // Persist memcard slot 1 to disk before freeing the bus. psxe does
     // the equivalent in psx_mcd_destroy.
     mcdRamSave(bus.mcdRam, mcdPath);
-
-    // FMV-debug probe: dump GP0 command-family histogram. g[72..79]
-    // counts how many GP0 cmds of each family fired during the run.
-    // Family index = top 3 bits of the cmd byte:
-    //   0 = misc (nop/cache/fill)         4 = blit (vram2vram only here)
-    //   1 = polygon                       5 = CPU→VRAM (image load)
-    //   2 = line                          6 = VRAM→CPU
-    //   3 = rectangle                     7 = drawing settings (E1..E6)
-    // For an FMV intro we expect family 5 (CPU→VRAM) > 0 if MDEC
-    // output is being uploaded. If it's 0 the bug is upstream
-    // (CD-ROM streaming / MDEC pipeline never feeds the GPU).
-    var gpuState: *mut[] u32 = bus.gpu.bufPtr();
-    var fmt: []u8 = "GP0 families: misc=%u poly=%u line=%u rect=%u blit=%u cpu2vram=%u vram2cpu=%u drawset=%u\n";
-    printf(fmt.ptr, gpuState[72], gpuState[73], gpuState[74], gpuState[75],
-                    gpuState[76], gpuState[77], gpuState[78], gpuState[79]);
 
     sdlAudioClose(audioDev);
     free(audioCtx);

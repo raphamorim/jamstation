@@ -35,8 +35,6 @@ const {
 } = import("xa");
 const { spuPushCdSample } = import("spu");
 
-// TEMP FMV-debug: command/response trace.
-pub extern fn printf(format: *const[] u8, ...) i32;
 
 // Disc struct redeclaration (same shape as disc.jam).
 const Disc = struct {
@@ -364,11 +362,6 @@ pub const Cdrom = struct {
                           ic: *mut[] u32, cop0: *mut[] u32) {
         const cmd: u32 = self.pendingCmd as u32;
         self.busy = 0;
-
-        var dbgf: []u8 = "[CDcmd] cmd=%02x pcnt=%u pendingLba=%u lba=%u state=%02x mode=%02x\n";
-        printf(dbgf.ptr, cmd,
-            ((self.paramW as u32) - (self.paramR as u32)) & 0xFF,
-            self.pendingLba, self.lba, self.state as u32, self.mode as u32);
 
         // psxe cdrom_handle_resp1 prechecks (cdrom.c:271-447), before
         // dispatch: (1) disc-required commands with no disc → INT5(11h,80h),
@@ -701,8 +694,6 @@ pub const Cdrom = struct {
     // Seek / Pause).
     pub fn executeResp2(self: mut Self, disc: *mut[] Disc) {
         const cmd: u32 = self.pendingCmd as u32;
-        var dbgf2: []u8 = "[CDr2 ] cmd=%02x pendingLba=%u lba=%u state=%02x\n";
-        printf(dbgf2.ptr, cmd, self.pendingLba, self.lba, self.state as u32);
         if (cmd == CDL_INIT) {
             self.ifr = 2;
             self.pushResp(self.getStat());
@@ -887,15 +878,6 @@ pub const Cdrom = struct {
         }
         self.dataRidx = rIdx;
         self.dataWidx = wEnd;
-
-        if (lba >= 4805 && lba <= 4820) {
-            // TEMP: what did discReadAt load? sub=submode(0x12), the data
-            // word the game's size=504 DMA reads first is at byte rIdx+32.
-            var pf: []u8 = "[CDrd] lba=%u sub=%02x dataAt%u=%02x%02x%02x%02x\n";
-            printf(pf.ptr, lba, self.dataBuf[18] as u32, rIdx + 32,
-                self.dataBuf[rIdx + 32] as u32, self.dataBuf[rIdx + 33] as u32,
-                self.dataBuf[rIdx + 34] as u32, self.dataBuf[rIdx + 35] as u32);
-        }
 
         if ((self.mode as u32 & MODE_XA_ADPCM) != 0) {
             self.tryDecodeXa(spu);

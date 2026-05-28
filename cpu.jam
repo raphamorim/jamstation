@@ -42,17 +42,6 @@ pub extern fn free(ptr: *mut[] u8);
 pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 pub extern fn putchar(c: i32) i32;
 pub extern fn fflush(stream: u64) i32;
-// TEMP REG_TRACE: libc decls for the per-instruction psxe divergence trace.
-pub extern fn getenv(name: *const[] u8) u64;
-pub extern fn fopen(path: u64, mode: *const[] u8) u64;
-pub extern fn fprintf(stream: u64, fmt: *const[] u8, ...) i32;
-// TEMP REG_TRACE downsample/window (rebuild jam + psxe -DTRACE_* to change):
-// emit one line every TRACE_STRIDE instructions, starting at TRACE_START.
-// STRIDE=10000 downsamples the whole run to localize the diverging frame;
-// then STRIDE=1 + START=<window> detail-traces it.
-const TRACE_START:  u64 = 154843000;
-const TRACE_STRIDE: u64 = 1;
-const TRACE_END:    u64 = 154850000;
 
 const Disc = struct {
     file: *mut[] u8,
@@ -94,10 +83,6 @@ const Cpu = struct {
     savedPc: u32,
     hi: u32,
     lo: u32,
-    // TEMP REG_TRACE: per-instruction trace for psxe divergence diff.
-    traceFp:   u64,
-    traceInit: u32,
-    traceN:    u64,
     // Pending load: the R3000 has a one-slot load-delay queue — a
     // value read from memory becomes visible in the destination
     // register only after the *next* instruction commits.
@@ -174,7 +159,6 @@ pub fn freshCpu() Cpu {
     var c: Cpu = Cpu {
         pc: 0xBFC00000, nextPc: 0xBFC00004,
         savedPc: 0, hi: 0, lo: 0,
-        traceFp: 0, traceInit: 0, traceN: 0,
         loadD: 0, loadV: 0,
         branch: 0, delaySlot: 0, branchTaken: 0, halted: 0,
         cycles: 0,
@@ -575,23 +559,6 @@ pub fn iSw(c: mut Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         cop0Write(cop0, C0_BADVADDR, addr);
         raiseException(c, cop0, CAUSE_ADES);
         return;
-    }
-    // TEMP FMV probe: PC that writes the MDEC command port (0x1F801820).
-    // psxe issues all MDEC cmds (tables + 88 decodes) from pc=0x800d2ecc;
-    // see if jam reaches that PC for the decode or only the tables.
-    if ((addr & 0x1FFFFFFF) == 0x1F801820 && (t & 0x80000000) == 0) {
-        var pf: []u8 = "[MDECstore] pc=%08x op=%u val=%08x ra=%08x\n";
-        printf(pf.ptr, c.savedPc, (t >> 29) & 7, t, gprRead(regs, 31));
-        // Dump the function body around the store so we can read the
-        // decode-loop gate (disassemble manually). Same code in psxe.
-        var df: []u8 = "[DIS] %08x: %08x\n";
-        var a: u32 = 0x800d2bc0;   // decode-loop region around the 0x800d2c70 F-call
-        var k: u32 = 0;
-        while (k < 110) {
-            printf(df.ptr, a, busRead32(bus, a));
-            a = a + 4;
-            k = k + 1;
-        }
     }
     busWrite32(bus, cop0, addr, t);
 }
@@ -1251,44 +1218,7 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     // psxe `return`s after the exception so the current cycle does NOT
     // dispatch the vector's first instruction — that happens on the
     // next cycle. We do the same here; without the return, every IRQ
-    // handler runs 1 instruction ahead of psxe (divergence verified
-    // via REG_TRACE diff against Harvest Moon at L=19258536).
-
-    // TEMP REG_TRACE: emit one line per instruction matching psxe's
-    // REG_TRACE_FMT (saved_pc, opcode, r0..r31, hi, lo) so the two traces
-    // can be `cmp`d to find the first jam↔psxe divergence. Enabled by the
-    // PSX_REG_TRACE env var (a file path), same as psxe. Capped so the file
-    // stays bounded; periodic flush survives a SIGALRM kill.
-    if (c.traceInit == 0) {
-        c.traceInit = 1;
-        var evn: []u8 = "PSX_REG_TRACE";
-        const ep: u64 = getenv(evn.ptr);
-        if (ep != 0) {
-            var wmode: []u8 = "w";
-            c.traceFp = fopen(ep, wmode.ptr);
-        }
-    }
-    if (c.traceFp != 0) {
-        const ic: u64 = c.traceN;            // instruction index
-        c.traceN = ic + 1;
-        if (ic >= TRACE_START && ic < TRACE_END && ((ic - TRACE_START) % TRACE_STRIDE) == 0) {
-            const topc: u32 = busRead32(bus, c.savedPc);
-            // Leading %llu = cumulative cycle count BEFORE this instruction
-            // (jam c.cycles ↔ psxe total_cycles). Lets `cmp` of field 1
-            // pinpoint where the cycle models first disagree.
-            var tfmt: []u8 = "%llu %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n";
-            fprintf(c.traceFp, tfmt.ptr, c.cycles, c.savedPc, topc,
-                regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7],
-                regs[8], regs[9], regs[10], regs[11], regs[12], regs[13], regs[14], regs[15],
-                regs[16], regs[17], regs[18], regs[19], regs[20], regs[21], regs[22], regs[23],
-                regs[24], regs[25], regs[26], regs[27], regs[28], regs[29], regs[30], regs[31],
-                c.hi, c.lo,
-                bus.timer.dbgTimerCounter(0), bus.timer.dbgTimerCounter(1),
-                bus.timer.dbgTimerCounter(2), bus.irq[0], bus.irq[1],
-                bus.cdrom.dbgDelay(), bus.cdrom.dbgInfo(), bus.cdrom.dbgLba());
-        }
-        if ((ic & 0x3FFFFF) == 0) { fflush(c.traceFp); }
-    }
+    // handler runs 1 instruction ahead of psxe.
 
     //
     // Fetch-access cost (psxe cpu.c:302, last_cycles = bus access cycles):
@@ -1324,10 +1254,6 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     }
 
     const opc: u32 = busRead32(bus, c.pc);
-    if (opc == 0x0c034b99) {   // TEMP: jal 0x800d2e64 (MDEC-cmd helper F)
-        var jf: []u8 = "[jalF] from=%08x ra=%08x\n";
-        printf(jf.ptr, c.savedPc, gprRead(regs, 31));
-    }
 
     c.pc = c.nextPc;
     c.nextPc = c.nextPc + 4;
