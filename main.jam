@@ -43,7 +43,7 @@ const {
 
 const {
     sdlInit, sdlQuit, sdlBlit, sdlPump, sdlDelay,
-    sdlAudioOpen, sdlAudioClose
+    sdlAudioOpen, sdlAudioClose, sdlAudioPush, sdlAudioQueuedBytes
 } = import("sdl");
 const { Vec } = import("std").collections;
 const { File, exists } = import("std/fs");
@@ -276,7 +276,8 @@ const SCANLINES_TOTAL: u32 = 263;
 // frames in a GPU scratch u32 slot (slot 37); `line` lives in slot 36.
 const FloatBits = union { i: u32, f: f32 };
 
-fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
+fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
+               audioDev: u32) {
     // The scanline counter and the float GPU-cycle accumulator are
     // CONTINUOUS across frames, exactly like psxe's free-running gpu->line
     // / gpu->cycles. Persist them in GPU scratch slots 36/37 (the f32 via
@@ -290,6 +291,12 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     // SPU sample accumulator: 1 sample per 768 CPU cycles (33.8688MHz/44100).
     // Drives the ADSR envelope CPU-synchronously (slot 35, persisted).
     var spuAcc: u32 = gpuBuf[35];
+    // Per-frame audio scratch. Each stereo sample is 4 bytes (S16 L + R).
+    // ~565K CPU cycles / 768 ≈ 735 samples/frame ≈ 2940 bytes; 4096 gives
+    // 1.4× headroom for short-frame jitter without spilling. Pushed to
+    // SDL via SDL_QueueAudio at end of frame; SDL pulls at 44.1kHz.
+    var audioBuf: [4096]u8 = [0; 4096];
+    var audioLen: u32 = 0;
     var frameDone: bool = false;
     while (!frameDone) {
         biosHook(c, bus, regs);
@@ -358,7 +365,34 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         spuAcc = spuAcc + delta;
         while (spuAcc >= 768) {
             spuAcc = spuAcc - 768;
-            gpuBuf[34] = spuGetSample(bus.spu.ptr, bus.spuram.ptr, bus.irq.ptr, cop0);
+            const sample: u32 = spuGetSample(bus.spu.ptr, bus.spuram.ptr,
+                                              bus.irq.ptr, cop0);
+            // Stash the sample bytes into the per-frame audio scratch.
+            // Drop on buffer-full instead of stomping past the end —
+            // worst-case ~735 samples/frame fits comfortably in 4096
+            // bytes; the guard is belt-and-suspenders against runaway
+            // delta accumulation (e.g. after a long debugger pause).
+            if (audioLen + 4 <= 4096) {
+                var ap: *mut[] u8 = audioBuf.asMutPtr();
+                ap[audioLen]     = (sample         & 0xFF) as u8;
+                ap[audioLen + 1] = ((sample >>  8) & 0xFF) as u8;
+                ap[audioLen + 2] = ((sample >> 16) & 0xFF) as u8;
+                ap[audioLen + 3] = ((sample >> 24) & 0xFF) as u8;
+                audioLen = audioLen + 4;
+            }
+            gpuBuf[34] = sample;
+        }
+    }
+    // End-of-frame: feed the SPU samples we generated to SDL. Cap the
+    // queue depth at ~4 frames (~12 KB) so a host that emulates faster
+    // than 60 Hz doesn't grow the queue unboundedly — extra samples are
+    // dropped (host audio stays smooth, the emulator just doesn't
+    // accumulate latency). SDL drains the queue at the host's audio
+    // rate (44.1 kHz).
+    if (audioDev != 0 && audioLen > 0) {
+        const queued: u32 = sdlAudioQueuedBytes(audioDev);
+        if (queued < 12000) {
+            sdlAudioPush(audioDev, audioBuf.asMutPtr(), audioLen);
         }
     }
     // NOTE: do NOT commitLoad here — each instruction's own commitLoad
@@ -577,27 +611,20 @@ fn main() {
         write(STDOUT, fmsg.ptr, fmsg.len);
     }
     var sdl: Sdl = sdlInit(title, sdlW, sdlH);
-    // Audio device — callback mode. SDL pulls 1024 stereo samples
-    // (~23 ms at 44.1 kHz) every audio-thread iteration; psone_audio_cb
-    // services that pull by running the SPU one sample per output
-    // frame. The audio thread needs handles to spu / spuram / irq /
-    // cop0 — pack them into a 32-byte AudioCtx so we can pass a
-    // single pointer through SDL_AudioSpec.userdata. Lives on main()'s
-    // stack: it has to outlive the SDL audio thread, but main() runs
-    // until the user quits, so this is safe and avoids a heap alloc.
-    var audioCtx: [32]u8 = [0; 32];
-    var actx: *mut[] u8 = audioCtx.asMutPtr();
-    setU64(actx,  0, bus.spu.ptr    as u64);
-    setU64(actx,  8, bus.spuram.ptr as u64);
-    setU64(actx, 16, bus.irq.ptr    as u64);
-    setU64(actx, 24, cop0.ptr       as u64);
-    const cbAddr: u64 = psone_audio_cb as u64;
-    var audioDev: u32 = sdlAudioOpen(1024, cbAddr, actx as u64);
+    // Audio device — queue mode. Since the SPU is now advanced CPU-
+    // synchronously inside runOneFrame (one sample per 768 cycles for
+    // deterministic envelope state — required for Brave Fencer's intro
+    // to not loop, see commit 51b9ad9), the audio thread doesn't drive
+    // the SPU anymore. We open without a callback (cbAddr = 0) and feed
+    // SDL via SDL_QueueAudio (sdlAudioPush) at end of each frame. SDL
+    // pulls from its internal queue at the host audio rate.
+    const cbAddr: u64 = 0 as u64;
+    var audioDev: u32 = sdlAudioOpen(1024, cbAddr, 0 as u64);
     if (audioDev == 0) {
         var afmt: []u8 = "WARN: SDL audio device failed to open\n";
         write(STDOUT, afmt.ptr, afmt.len);
     } else {
-        print("Audio device opened (id={audioDev}, 44.1kHz S16 stereo, callback mode)\n");
+        print("Audio device opened (id={audioDev}, 44.1kHz S16 stereo, queue mode)\n");
     }
     var postMsg: []u8 = "SDL2 ready.\n";
     write(STDOUT, postMsg.ptr, postMsg.len);
@@ -664,7 +691,7 @@ fn main() {
                 lastPoly = curPoly;
             }
         }
-        runOneFrame(c, bus, regs.ptr, cop0.ptr);
+        runOneFrame(c, bus, regs.ptr, cop0.ptr, audioDev);
         // Audio: nothing to do on the main thread anymore. SDL's audio
         // thread is pulling samples from psone_audio_cb at 44.1 kHz.
         var vram: *mut[] u8 = busVramPtr(bus);
