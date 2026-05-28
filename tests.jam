@@ -29,7 +29,7 @@ const { gteAlloc, gteExec, gteDivide,
         gteDataRead, gteDataWrite, gteCtrlWrite, gteCtrlRead,
         gteOpCycles } = import("gte");
 const { Cdrom } = import("cdrom");
-const { discAlloc, discOpen } = import("disc");
+const { Disc, discAlloc, discOpen } = import("disc");
 const { dmaAlloc, dmaUpdate } = import("dma");
 const { padAlloc, padUpdate } = import("pad");
 const { spuAlloc, spuRamAlloc, spuUpdate } = import("spu");
@@ -47,18 +47,8 @@ const { File, exists } = import("std/fs");
 const C0_SR:  u32 = 12;
 const SR_BEV: u32 = 0x00400000;
 
-// Re-declare the same shapes as bus.jam / cpu.jam — structural equality
-// lets us pass values across module boundaries.
-const Disc = struct {
-    file: File,
-    loaded: u8,
-    isCue: u8,
-    pad1: u8,
-    pad2: u8,
-    cuePtr: *mut[] u8,
-};
-
-
+// Re-declare the same shapes as cpu.jam — structural equality lets us
+// pass values across module boundaries.
 const Cpu = struct {
     pc: u32,
     nextPc: u32,
@@ -540,7 +530,7 @@ fn emuRunOneFrame(c: mut Cpu, bus: Bus, regs: Vec(u32), cop0: Vec(u32)) {
         const delta: u32 = (c.cycles - before) as u32;
         bus.timer.updateCyc(bus.irq.ptr, cop0.ptr, delta);
         dmaUpdate(bus.dma.ptr, bus.irq.ptr, cop0.ptr);
-        bus.cdrom.update(bus.disc, bus.irq.ptr, cop0.ptr, delta);
+        bus.cdrom.update(bus.disc.ptrMut(), bus.irq.ptr, cop0.ptr, delta);
         padUpdate(bus.pad.ptr, bus.irq.ptr, cop0.ptr, delta);
         bus.sio1.update(bus.irq.ptr, cop0.ptr, delta);
         spuUpdate(bus.spu.ptr, bus.spuram.ptr, bus.irq.ptr, cop0.ptr, delta);
@@ -610,7 +600,7 @@ tfn emuDiscBootsExec() {
     if (emuBoot(c, bus, regs.ptr, cop0.ptr) == 0) { freeBus(bus);
         return;
     }
-    discOpen(bus.disc, diskPath);
+    discOpen(bus.disc.ptrMut(), diskPath);
     emuRunFrames(c, bus, regs.ptr, cop0.ptr, 120);
     // Bare minimum: BIOS handed control out of ROM (0xBFC*) into RAM
     // or scratchpad. Stricter "PC inside game text segment" check is

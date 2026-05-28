@@ -19,7 +19,8 @@ const { Vec } = import("std/collections");
 const { Timer } = import("timer");
 const { gteAlloc } = import("gte");
 const { Cdrom } = import("cdrom");
-const { discAlloc, discFree } = import("disc");
+const { Disc, discAlloc, discClose } = import("disc");
+const { Box } = import("std/box");
 const { padRead32, padRead16, padRead8,
         padWrite32, padWrite16, padWrite8,
         padAlloc } = import("pad");
@@ -29,17 +30,6 @@ const { spuRead32, spuRead16, spuRead8,
 const { Mdec, mdecInputAlloc, mdecOutputAlloc } = import("mdec");
 const { Sio1 } = import("sio1");
 const { Mcd, mcdRamAlloc } = import("mcd");
-
-// Disc shape — kept in sync with disc.jam so callers can reference the
-// stored pointer via `bus.disc[0]`.
-const Disc = struct {
-    file: *mut[] u8,
-    loaded: u8,
-    isCue: u8,
-    pad1: u8,
-    pad2: u8,
-    cuePtr: *mut[] u8,
-};
 
 pub extern fn fflush(stream: u64) i32;
 
@@ -60,7 +50,7 @@ pub const Bus = struct {
     timer: Timer,
     gte:   Vec(u32),
     cdrom: Cdrom,
-    disc:  *mut[] Disc,
+    disc:  Box(Disc),
     pad:   Vec(u8),
     spu:     Vec(u8),
     spuram:  Vec(u8),
@@ -231,7 +221,9 @@ pub fn freeBus(b: Bus) {
     // b.timer is by-value; no free needed.
     // b.gte is a Vec(u32) — auto-dropped when `b` goes out of scope.
     // b.cdrom is by-value; no free needed.
-    discFree(b.disc);
+    // Close any open file/cue resources the Disc was holding; the Box
+    // itself auto-drops the backing memory when `b` goes out of scope.
+    discClose(b.disc.ptrMut());
     // b.pad is a Vec(u8) — auto-dropped when `b` goes out of scope.
     // b.spu and b.spuram are Vec(u8) — auto-dropped when `b` goes out of scope.
     // b.mdec is by-value; no free needed.

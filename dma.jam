@@ -18,21 +18,9 @@ const { Bus } = import("bus");
 const { Cdrom } = import("cdrom");
 const { Mdec } = import("mdec");
 const { spuWrite16, spuRead16 } = import("spu");
+const { Disc } = import("disc");
 
 const SPU_TFIFO_OFF: u32 = 0x1A8;
-
-
-// Disc shape — keep in sync with disc.jam / bus.jam so the structural
-// match holds at the call site. Members aren't accessed here; only the
-// pointer is moved around.
-const Disc = struct {
-    file: *mut[] u8,
-    loaded: u8,
-    isCue: u8,
-    pad1: u8,
-    pad2: u8,
-    cuePtr: *mut[] u8,
-};
 
 
 // d[0..20] = 7 channels × 3 regs (MADR/BCR/CHCR)

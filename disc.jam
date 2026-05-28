@@ -21,9 +21,7 @@
 const { cueAlloc, cueFree, cueParse, cueRead, cueQuery,
         cueGetTrackCount, cueGetTrackLba, cueGetTrackNumber } = import("cue");
 
-pub extern fn malloc(size: u64) *mut[] u8;
-pub extern fn free(ptr: *mut[] u8);
-pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+const { Box } = import("std/box");
 // File I/O exclusively via std.fs — no raw libc file ABI in this module.
 const { File, exists } = import("std/fs");
 const { print } = import("std/fmt");
@@ -31,7 +29,7 @@ const { print } = import("std/fmt");
 const SECTOR_SIZE: u32 = 2352;
 const LEAD_IN_SECTORS: u32 = 150;
 
-const Disc = struct {
+pub const Disc = struct {
     file: File,        // std.fs.File — valid when a raw .bin is loaded
     loaded: u8,        // 1 once discOpen succeeds
     isCue: u8,         // 1 if cue-loaded (cuePtr is valid)
@@ -40,21 +38,34 @@ const Disc = struct {
     cuePtr: *mut[] u8, // opaque *mut[] Cue stored as bytes for struct-mirror compat
 };
 
-pub fn discAlloc() *mut[] Disc {
-    // Disc struct: file ptr (16) + 4*u8 + cuePtr (16) = ~40 with align.
-    // Bump to 48 to be safe.
-    var raw: *mut[] u8 = malloc(48);
-    memset(raw, 0, 48);
-    return raw as *mut[] Disc;
+// Owning heap-allocated Disc. Bus stores it as a `Box(Disc)` and the
+// auto-drop fires when the Bus goes out of scope. Internal helpers
+// (discOpen / discRead / ...) still take a raw `*mut[] Disc` so the
+// callsites can keep the `d[0].field` idiom; callers extract the raw
+// pointer with `box.ptrMut()`.
+pub fn discAlloc() Box(Disc) {
+    return Box(Disc).init(Disc {
+        file:    File { handle: 0 as *mut[] u8 },
+        loaded:  0,
+        isCue:   0,
+        pad1:    0,
+        pad2:    0,
+        cuePtr:  0 as *mut[] u8,
+    });
 }
 
-pub fn discFree(d: *mut[] Disc) {
+// File-handle / cue-buffer cleanup that the auto-drop can't do on its own.
+// Box's drop frees the Disc's backing memory; this hook closes any open
+// resources the Disc was holding.
+pub fn discClose(d: *mut[] Disc) {
     if (d[0].isCue != 0) {
         cueFree(d[0].cuePtr);
+        d[0].cuePtr = 0 as *mut[] u8;
+        d[0].isCue = 0;
     } else if (d[0].loaded != 0) {
         d[0].file.close();
     }
-    free(d as *mut[] u8);
+    d[0].loaded = 0;
 }
 
 // Detect .cue extension on a path. Case-insensitive on the suffix bytes.
@@ -111,8 +122,9 @@ pub fn discOpen(d: *mut[] Disc, path: []u8) i32 {
 // zero. Matches psxe cue.c:535-536. Some games inspect the sync pattern
 // when reading pregap sectors and would otherwise see all-zero data.
 pub fn fillPregapSector(buf: *mut[] u8) {
-    memset(buf, 0, SECTOR_SIZE as u64);
-    var i: u32 = 1;
+    var i: u32 = 0;
+    while (i < SECTOR_SIZE) { buf[i] = 0; i = i + 1; }
+    i = 1;
     while (i < 11) { buf[i] = 0xFF; i = i + 1; }
 }
 

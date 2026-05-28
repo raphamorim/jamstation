@@ -20,7 +20,7 @@ const {
 const { Gpu } = import("gpu");
 const { gteAlloc } = import("gte");
 const { Cdrom } = import("cdrom");
-const { discAlloc, discOpen } = import("disc");
+const { Disc, discAlloc, discOpen } = import("disc");
 const { dmaAlloc, dmaTickSpu, dmaUpdate } = import("dma");
 const { padAlloc, padUpdate, padSetButtons } = import("pad");
 const { spuAlloc, spuRamAlloc, psone_audio_cb, setU64, spuStepAdsrCpu,
@@ -50,9 +50,6 @@ const { File, exists } = import("std/fs");
 const { Args, args, next, exit } = import("std").process;
 const { print } = import("std/fmt");
 
-extern fn malloc(size: u64) *mut[] u8;
-extern fn free(ptr: *mut[] u8);
-extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 extern fn write(fd: i32, buf: *const[] u8, count: u64) i64;
 extern fn putchar(c: i32) i32;
 // File I/O (fopen/fread/fwrite/fclose/fseek/access) comes from std/fs
@@ -97,17 +94,7 @@ fn fileExists(path: []u8) bool {
     return exists(path);
 }
 
-// Locally-redeclared shapes matching bus.jam / cpu.jam / sdl.jam.
-const Disc = struct {
-    file: File,
-    loaded: u8,
-    isCue: u8,
-    pad1: u8,
-    pad2: u8,
-    cuePtr: *mut[] u8,
-};
-
-
+// Locally-redeclared shapes matching cpu.jam / sdl.jam.
 const Cpu = struct {
     pc: u32,
     nextPc: u32,
@@ -315,7 +302,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         // psxe fires the GPU hblank/vblank events BEFORE the sysclk timer +2.)
 
         // 1. CDROM (psx.c:95)
-        bus.cdrom.update(bus.disc, bus.spu.ptr, bus.irq.ptr, cop0, delta);
+        bus.cdrom.update(bus.disc.ptrMut(), bus.spu.ptr, bus.irq.ptr, cop0, delta);
 
         // 2. GPU (psx.c:96) — psx_gpu_update: scanline window [0,3413], HBlank
         // [2560,3413]. The HBlank event (line++, GPUSTAT bit-31 odd/even, the
@@ -381,12 +368,6 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     gpuBuf[37] = outB.i;
     gpuBuf[35] = spuAcc;
 }
-
-// Pre-fill VRAM with a soft gradient so the user sees the SDL pipe is
-// alive even before the GPU emits a single pixel.
-// (the prime helper is gone; main() inlines a memset for now since the
-//  gradient version is too slow in unoptimized builds — see issue
-//  notes in the README.)
 
 // Dump the full 1024x512 VRAM as a binary PPM (P6 / 24-bit RGB) at
 // `path`. BGR555 → RGB888 expansion is done inline so the output is
@@ -537,20 +518,20 @@ fn main() {
             pendingGameExe = true;
             var msg: []u8 = "EXE arg — booting BIOS first, will side-load at PC=80030000\n";
             write(STDOUT, msg.ptr, msg.len);
-        } else if (discOpen(bus.disc, gameArg) != 0) {
-            bus.cdrom.attachDisc(bus.disc);
+        } else if (discOpen(bus.disc.ptrMut(), gameArg) != 0) {
+            bus.cdrom.attachDisc(bus.disc.ptrMut());
         } else {
             var msg: []u8 = "Could not open game image from arg — running BIOS only\n";
             write(STDOUT, msg.ptr, msg.len);
         }
     } else {
         if (fileExists(cuePath)) {
-            if (discOpen(bus.disc, cuePath) != 0) {
-                bus.cdrom.attachDisc(bus.disc);
+            if (discOpen(bus.disc.ptrMut(), cuePath) != 0) {
+                bus.cdrom.attachDisc(bus.disc.ptrMut());
             }
         } else if (fileExists(binPath)) {
-            if (discOpen(bus.disc, binPath) != 0) {
-                bus.cdrom.attachDisc(bus.disc);
+            if (discOpen(bus.disc.ptrMut(), binPath) != 0) {
+                bus.cdrom.attachDisc(bus.disc.ptrMut());
             }
         }
         if (fileExists(demoPath)) {
@@ -572,7 +553,7 @@ fn main() {
     // is a debug pattern.
     var preMsg: []u8 = "Initializing SDL2...\n";
     write(STDOUT, preMsg.ptr, preMsg.len);
-    var title: []u8 = "psone-jam";
+    var title: []u8 = "jamstation";
     // Set the JAM_PSONE_FULL_VRAM env var (any non-empty value) to
     // see the whole 1024×512 VRAM in the window instead of the
     // BIOS's 320×240 display rectangle. Useful for spotting where the
@@ -601,27 +582,28 @@ fn main() {
     // services that pull by running the SPU one sample per output
     // frame. The audio thread needs handles to spu / spuram / irq /
     // cop0 — pack them into a 32-byte AudioCtx so we can pass a
-    // single pointer through SDL_AudioSpec.userdata.
-    var audioCtx: *mut[] u8 = malloc(32);
-    setU64(audioCtx,  0, bus.spu.ptr    as u64);
-    setU64(audioCtx,  8, bus.spuram.ptr as u64);
-    setU64(audioCtx, 16, bus.irq.ptr    as u64);
-    setU64(audioCtx, 24, cop0.ptr   as u64);
+    // single pointer through SDL_AudioSpec.userdata. Lives on main()'s
+    // stack: it has to outlive the SDL audio thread, but main() runs
+    // until the user quits, so this is safe and avoids a heap alloc.
+    var audioCtx: [32]u8 = [0; 32];
+    var actx: *mut[] u8 = audioCtx.asMutPtr();
+    setU64(actx,  0, bus.spu.ptr    as u64);
+    setU64(actx,  8, bus.spuram.ptr as u64);
+    setU64(actx, 16, bus.irq.ptr    as u64);
+    setU64(actx, 24, cop0.ptr       as u64);
     const cbAddr: u64 = psone_audio_cb as u64;
-    var audioDev: u32 = sdlAudioOpen(1024, cbAddr, audioCtx as u64);
+    var audioDev: u32 = sdlAudioOpen(1024, cbAddr, actx as u64);
     if (audioDev == 0) {
         var afmt: []u8 = "WARN: SDL audio device failed to open\n";
         write(STDOUT, afmt.ptr, afmt.len);
     } else {
         print("Audio device opened (id={audioDev}, 44.1kHz S16 stereo, callback mode)\n");
     }
-    var postMsg: []u8 = "SDL2 ready. Priming VRAM...\n";
+    var postMsg: []u8 = "SDL2 ready.\n";
     write(STDOUT, postMsg.ptr, postMsg.len);
-    // Skip the gradient test pattern for now — the nested 1024x512 loop
-    // is slow in debug builds. Memset the VRAM to a solid dark gray so
-    // the window is visibly populated.
-    var vp: *mut[] u8 = busVramPtr(bus);
-    memset(vp, 0x18, 0x100000);          // 0x1818 → muted blue-grey in BGR555
+    // VRAM was already zero-filled when the Bus was allocated; the BIOS
+    // renders into it within the first frame, so the brief black flash
+    // before its first GP0 commit is fine.
 
     var msg: []u8 = "Running — Esc or close to quit\n";
     write(STDOUT, msg.ptr, msg.len);
@@ -629,9 +611,10 @@ fn main() {
     // Active-low button mask the SDL pump updates from keyboard events.
     // 0xFFFF = no buttons pressed; sdlPump clears bits on KEYDOWN and
     // sets them on KEYUP. padUpdate copies it into the SDA pad state
-    // each frame so the next controller poll sees fresh input.
-    var buttons: *mut[] u32 = malloc(4) as *mut[] u32;
-    buttons[0] = 0xFFFF;
+    // each frame so the next controller poll sees fresh input. Stack-
+    // local — sdlPump just borrows the pointer per call.
+    var buttons: [1]u32 = [0xFFFF; 1];
+    var btnPtr: *mut[] u32 = buttons.asMutPtr();
 
     var frames: u32 = 0;
     var quit: u32 = 0;
@@ -705,7 +688,7 @@ fn main() {
             sdlBlit(sdl, vram, dispX, dispY, w, h,
                 is24bpp, displayOff);
         }
-        quit = sdlPump(buttons);
+        quit = sdlPump(btnPtr);
         // Push the latest keyboard state into the SDA pad. Cheap (2-byte
         // write); doing it once per frame is enough since controller
         // polling runs at VBlank cadence in the BIOS.
@@ -726,8 +709,8 @@ fn main() {
     mcdRamSave(bus.mcdRam.ptr, mcdPath);
 
     sdlAudioClose(audioDev);
-    free(audioCtx);
-    free(buttons as *mut[] u8);
+    // audioCtx and buttons are stack arrays — they vanish with main()'s
+    // frame; no manual free needed.
     sdlQuit(sdl);
     freeBus(bus);
 }

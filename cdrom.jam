@@ -27,7 +27,7 @@
 // then.
 
 const { irqRaise, IC_CDROM } = import("irq");
-const { discRead, discLoaded,
+const { Disc, discRead, discLoaded,
         discTrackCount, discTrackLba, discTrackNumber, discQuery } = import("disc");
 const {
     xaSectorIsAudio, xaSectorMatchesFilter, xaSectorIsStereo,
@@ -35,16 +35,6 @@ const {
 } = import("xa");
 const { spuPushCdSample } = import("spu");
 
-
-// Disc struct redeclaration (same shape as disc.jam).
-const Disc = struct {
-    file: *mut[] u8,
-    loaded: u8,
-    isCue: u8,
-    pad1: u8,
-    pad2: u8,
-    cuePtr: *mut[] u8,
-};
 
 const SECTOR_BYTES: u32 = 2352;
 

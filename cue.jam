@@ -18,9 +18,15 @@
 // than 99 tracks anyway. Each track stores absolute LBA start/end so the
 // disc-read path can look up by LBA.
 
-pub extern fn malloc(size: u64) *mut[] u8;
-pub extern fn free(ptr: *mut[] u8);
-pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+// Internal to cue.jam — the Cue struct is heap-allocated with a custom
+// layout that doesn't fit the Box(T) / Vec(T) machinery cleanly (its
+// inner Vec fields would still need explicit cleanup because they live
+// inside heap bytes, not a stack-tracked container). Keeping the libc
+// allocator extern-private here means no other jamstation module sees
+// these symbols — defining-module resolution scopes them locally.
+extern fn malloc(size: u64) *mut[] u8;
+extern fn free(ptr: *mut[] u8);
+extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 // All file I/O goes through std.fs — no raw libc file ABI in this module.
 const { File, exists, canonicalize } = import("std/fs");
 
@@ -334,6 +340,17 @@ pub fn cueFindTrack(raw: *mut[] u8, lba: u32) u32 {
     return c[0].trackCount;
 }
 
+// Pregap sector layout: byte 0 = 0x00, bytes 1..10 = 0xFF (sync pattern),
+// byte 11 = 0x00, the rest zero. Matches psxe cue.c:535-536. Local
+// duplicate of disc.fillPregapSector — keeps cue.jam acyclic (disc
+// imports cue, not the other way around).
+fn fillPregap(buf: *mut[] u8) {
+    var i: u32 = 0;
+    while (i < SECTOR) { buf[i] = 0; i = i + 1; }
+    i = 1;
+    while (i < 11) { buf[i] = 0xFF; i = i + 1; }
+}
+
 // Read a 2352-byte sector at the given absolute LBA. Returns 1 on
 // success, 0 on out-of-range or read failure.
 pub fn cueRead(raw: *mut[] u8, lba: u32, buf: *mut[] u8) i32 {
@@ -345,17 +362,13 @@ pub fn cueRead(raw: *mut[] u8, lba: u32, buf: *mut[] u8) i32 {
             return 0;
         }
         // Pregap: psxe cue.c:535-536 fills zero + sync at bytes [1..10].
-        memset(buf, 0, SECTOR as u64);
-        var i: u32 = 1;
-        while (i < 11) { buf[i] = 0xFF; i = i + 1; }
+        fillPregap(buf);
         return 1;
     }
     const fi: u32 = c[0].tracks[ti].fileIdx;
     const off: i64 = ((lba - c[0].files[fi].startLba) as i64) * (SECTOR as i64);
     if (off < 0) {
-        memset(buf, 0, SECTOR as u64);
-        var j: u32 = 1;
-        while (j < 11) { buf[j] = 0xFF; j = j + 1; }
+        fillPregap(buf);
         return 1;
     }
     var tf: File = c[0].files[fi].file;
