@@ -43,7 +43,6 @@ pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
 pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
 pub extern fn fflush(stream: u64) i32;
-pub extern fn printf(format: *const[] u8, ...) i32;   // TEMP memwrite-trace
 
 // The Bus struct holds every piece of state we route through the
 // memory bus: raw buffers (RAM, BIOS, scratchpad, flat-IO fallback,
@@ -407,12 +406,7 @@ pub fn busWrite32(bus: Bus, cop0: *mut[] u32, addr: u32, val: u32) {
     const paddr: u32 = addr & regionMask(addr);
     const r: BusRoute = route(paddr);
     match (r.kind) {
-        1 {
-            if ((r.off & (RAM_SIZE - 1)) == 0x50f2c) {
-                var f: []u8 = "[MW32] 50f2c <= %08x\n"; printf(f.ptr, val);
-            }
-            bufWrite32(bus.ram,  r.off & (RAM_SIZE  - 1), val);
-        }
+        1 { bufWrite32(bus.ram,  r.off & (RAM_SIZE  - 1), val); }
         3 { bufWrite32(bus.spad, r.off & (SPAD_SIZE - 1), val); }
         4 { ioWrite32(bus, cop0, r.off, val); }
         _ {}
@@ -423,12 +417,7 @@ pub fn busWrite16(bus: Bus, cop0: *mut[] u32, addr: u32, val: u32) {
     const paddr: u32 = addr & regionMask(addr);
     const r: BusRoute = route(paddr);
     match (r.kind) {
-        1 {
-            if ((r.off & (RAM_SIZE - 1)) == 0x50f2c) {
-                var f: []u8 = "[MW16] 50f2c <= %04x\n"; printf(f.ptr, val & 0xFFFF);
-            }
-            bufWrite16(bus.ram,  r.off & (RAM_SIZE  - 1), val);
-        }
+        1 { bufWrite16(bus.ram,  r.off & (RAM_SIZE  - 1), val); }
         3 { bufWrite16(bus.spad, r.off & (SPAD_SIZE - 1), val); }
         4 { ioWrite16(bus, cop0, r.off, val); }
         _ {}

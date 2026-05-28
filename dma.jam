@@ -22,7 +22,6 @@ const SPU_TFIFO_OFF: u32 = 0x1A8;
 pub extern fn malloc(size: u64) *mut[] u8;
 pub extern fn free(ptr: *mut[] u8);
 pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
-pub extern fn printf(format: *const[] u8, ...) i32;   // TEMP FMV-debug
 
 // Disc shape — keep in sync with disc.jam / bus.jam so the structural
 // match holds at the call site. Members aren't accessed here; only the
@@ -246,7 +245,13 @@ pub fn dmaTrigger(d: *mut[] u32, bus: Bus, cop0: *mut[] u32, ch: u32) {
         6 { dmaDoOtc(d, bus); }
         _ {}
     }
-    dmaUpdate(d, bus.irq, cop0);
+    // No store-time dmaUpdate: psxe's psx_dma_write32 only runs the transfer
+    // and defers all IRQ folding to the per-instruction psx_dma_update. The
+    // old store-time call here was a workaround for the obsolete per-scanline
+    // update granularity; with per-instruction dmaUpdate (main.jam) it's
+    // redundant and caused DMA IRQs to fire re-entrantly mid-store, ahead of
+    // psxe. The next instruction's dmaUpdate folds the done-flag in the same
+    // iteration psxe would (DICR polls one instruction later still see it).
 }
 
 pub fn chcrBusy(d: *mut[] u32, ch: u32) bool {
@@ -348,7 +353,6 @@ pub fn dmaDoMdecIn(d: *mut[] u32, bus: Bus) {
     const size: u32 = bcrSize(d, 0) * bcrBlocks(d, 0);
     const step: u32 = chcrStep(d, 0);
     var addr: u32 = d[chBase(0) + F_MADR];
-    const startAddr0: u32 = addr;
     var i: u32 = 0;
     while (i < size) {
         const w: u32 = ramRead32(bus, addr);
@@ -360,11 +364,6 @@ pub fn dmaDoMdecIn(d: *mut[] u32, bus: Bus) {
     d[chBase(0) + F_CHCR] = 0;
     d[chBase(0) + F_BCR]  = 0;
     d[23] = size;
-    d[30] = d[30] + 1;
-    if (d[30] <= 20 || (d[30] % 500) == 0) {
-        var pf: []u8 = "[MDECin] #%u size=%u madr=%08x mdecStat=%08x\n";
-        printf(pf.ptr, d[30], size, startAddr0, bus.mdec.read32(bus.mdecOut, 4));
-    }
 }
 
 // DMA1: MDEC output port → RAM. Match psxe exactly (dma.c:208-235).
@@ -384,11 +383,6 @@ pub fn dmaDoMdecOut(d: *mut[] u32, bus: Bus) {
     d[chBase(1) + F_CHCR] = 0;
     d[chBase(1) + F_BCR]  = 0;
     d[24] = size;
-    d[31] = d[31] + 1;
-    if (d[31] <= 20 || (d[31] % 500) == 0) {
-        var pf: []u8 = "[MDECout] #%u size=%u madr=%08x\n";
-        printf(pf.ptr, d[31], size, d[chBase(1) + F_MADR]);
-    }
 }
 
 // CD-ROM → RAM transfer. Each "word" in BCR.size is 4 bytes from the
@@ -401,11 +395,7 @@ pub fn dmaDoCdrom(d: *mut[] u32, bus: Bus) {
     var size: u32 = bcrSize(d, 3);
     if (size == 0) { size = 0x10000; }
     var addr: u32 = d[chBase(3) + F_MADR];
-    const startAddr: u32 = addr;
     const step: u32 = chcrStep(d, 3);
-    var firstW: u32 = 0;
-    var nonZero: u32 = 0;
-    const fifo0: u32 = bus.cdrom.dbgFifo();   // FIFO state BEFORE the transfer
     var i: u32 = 0;
     while (i < size) {
         const b0: u32 = bus.cdrom.readData();
@@ -413,16 +403,10 @@ pub fn dmaDoCdrom(d: *mut[] u32, bus: Bus) {
         const b2: u32 = bus.cdrom.readData();
         const b3: u32 = bus.cdrom.readData();
         const w: u32 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
-        if (i == 0) { firstW = w; }
-        if (w != 0) { nonZero = nonZero + 1; }
         ramWrite32(bus, addr, w);
         addr = addr + step;
         i = i + 1;
     }
-    const cdi: u32 = bus.cdrom.dbgInfo();
-    var df: []u8 = "[CDdma] size=%u firstW=%08x nonZero=%u lba=%u req=%u ridx=%u widx=%u\n";
-    printf(df.ptr, size, firstW, nonZero, bus.cdrom.dbgLba(),
-        (fifo0 >> 28) & 1, fifo0 & 0xFFF, (fifo0 >> 12) & 0xFFF);
     d[chBase(3) + F_MADR] = addr;
     d[chBase(3) + F_CHCR] = 0;
     d[chBase(3) + F_BCR]  = 0;
@@ -526,9 +510,26 @@ pub fn dmaTickSpu(d: *mut[] u32, delta: u32) {
     }
 }
 
+// Called once per CPU instruction (main.jam), exactly like psxe's
+// psx_dma_update (psx.c:99). MDEC-in/out (ch0/ch1) are the only channels
+// psxe genuinely DELAYS: it decrements mdec_in/out_irq_delay by 1 per call
+// and raises the completion flag only when it reaches 0 — so the MDEC
+// DMA-done IRQ fires `size` instructions AFTER the transfer (dma.c:525-539).
+// d[23]/d[24] hold that remaining-instruction COUNT (set to `size` by the
+// transfer). All other channels fire on the next update (psxe zeroes their
+// delay before the !delay test = immediate). Brave Fencer's FMV chains the
+// next MDEC frame-decode off this IRQ; jam's old immediate fire landed it
+// before the handler was ready, so the decode pipeline never re-fed the
+// MDEC → black video.
 pub fn dmaUpdate(d: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32) {
-    if (d[23] != 0) { d[23] = 0; if ((d[22] & 0x00010000) != 0) { d[22] = d[22] | 0x01000000; } }
-    if (d[24] != 0) { d[24] = 0; if ((d[22] & 0x00020000) != 0) { d[22] = d[22] | 0x02000000; } }
+    if (d[23] != 0) {
+        d[23] = d[23] - 1;
+        if (d[23] == 0 && (d[22] & 0x00010000) != 0) { d[22] = d[22] | 0x01000000; }
+    }
+    if (d[24] != 0) {
+        d[24] = d[24] - 1;
+        if (d[24] == 0 && (d[22] & 0x00020000) != 0) { d[22] = d[22] | 0x02000000; }
+    }
     if (d[25] != 0) { d[25] = 0; if ((d[22] & 0x00040000) != 0) { d[22] = d[22] | 0x04000000; } }
     if (d[26] != 0) { d[26] = 0; if ((d[22] & 0x00080000) != 0) { d[22] = d[22] | 0x08000000; } }
     if (d[27] != 0) { d[27] = 0; if ((d[22] & 0x00100000) != 0) { d[22] = d[22] | 0x10000000; } }

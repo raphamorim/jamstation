@@ -1,5 +1,3 @@
-// Timers (port of psxe/psx/dev/timer.c).
-//
 // Three 16-bit timers at 0x1F801100 / 0x1F801110 / 0x1F801120, each
 // exposing three registers (counter, mode, target). They count at
 // different clock sources — system clock, dotclock, hblank — and can
@@ -13,11 +11,6 @@ const { irqRaise, IC_TIMER0, IC_TIMER1, IC_TIMER2 } = import("irq");
 // flag bits stay u32 so they round-trip cleanly through the mode
 // register's pack/unpack without per-field width juggling.
 pub const TimerChannel = struct {
-    // psxe stores the counter as a `float` (timer.h:100) and accumulates
-    // `+= (float)cyc` / `/8.0f` / `*dotclock_div`, so it DRIFTS from an
-    // exact integer over time. We mirror that f32 drift bit-for-bit (an
-    // exact u32 counter diverged from psxe ~0.3% by frame ~224, found via
-    // REG_TRACE cmp). Reads truncate to u16; IRQ/target compare the float.
     counter:       f32,
     target:        u32,
     syncEnable:    u32,
@@ -251,9 +244,16 @@ pub const Timer = struct {
 
     pub fn updateCyc(self: mut Self, ic: *mut[] u32, cop0: *mut[] u32,
                  cyc: u32) {
-        self.updateOne(0, cyc, ic, cop0);
-        self.updateOne(1, cyc, ic, cop0);
-        self.updateOne(2, cyc, ic, cop0);
+        // psxe's psx_timer_update (timer.c:338-345) IGNORES its cyc arg and
+        // advances all three timers by a hardcoded 2 per instruction —
+        // NOT the real per-instruction cycle count. (timer_update_timer0/1/2
+        // do `+= (float)cyc`, but cyc is always 2.) Feeding the real `cyc`
+        // (fetchCyc+2 = 20 for BIOS-resident code) made jam's sysclk timers
+        // run ~10× too fast in BIOS/kernel loops, drifting any timer value the
+        // game reads. Match psxe: pass 2. (`cyc` kept for signature parity.)
+        self.updateOne(0, 2, ic, cop0);
+        self.updateOne(1, 2, ic, cop0);
+        self.updateOne(2, 2, ic, cop0);
     }
 
     pub fn updateOne(self: mut Self, idx: u32, cyc: u32,

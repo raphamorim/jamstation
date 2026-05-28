@@ -50,9 +50,9 @@ pub extern fn fprintf(stream: u64, fmt: *const[] u8, ...) i32;
 // emit one line every TRACE_STRIDE instructions, starting at TRACE_START.
 // STRIDE=10000 downsamples the whole run to localize the diverging frame;
 // then STRIDE=1 + START=<window> detail-traces it.
-const TRACE_START:  u64 = 50325000;
+const TRACE_START:  u64 = 154843000;
 const TRACE_STRIDE: u64 = 1;
-const TRACE_END:    u64 = 50335000;
+const TRACE_END:    u64 = 154850000;
 
 const Disc = struct {
     file: *mut[] u8,
@@ -575,6 +575,23 @@ pub fn iSw(c: mut Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         cop0Write(cop0, C0_BADVADDR, addr);
         raiseException(c, cop0, CAUSE_ADES);
         return;
+    }
+    // TEMP FMV probe: PC that writes the MDEC command port (0x1F801820).
+    // psxe issues all MDEC cmds (tables + 88 decodes) from pc=0x800d2ecc;
+    // see if jam reaches that PC for the decode or only the tables.
+    if ((addr & 0x1FFFFFFF) == 0x1F801820 && (t & 0x80000000) == 0) {
+        var pf: []u8 = "[MDECstore] pc=%08x op=%u val=%08x ra=%08x\n";
+        printf(pf.ptr, c.savedPc, (t >> 29) & 7, t, gprRead(regs, 31));
+        // Dump the function body around the store so we can read the
+        // decode-loop gate (disassemble manually). Same code in psxe.
+        var df: []u8 = "[DIS] %08x: %08x\n";
+        var a: u32 = 0x800d2bc0;   // decode-loop region around the 0x800d2c70 F-call
+        var k: u32 = 0;
+        while (k < 110) {
+            printf(df.ptr, a, busRead32(bus, a));
+            a = a + 4;
+            k = k + 1;
+        }
     }
     busWrite32(bus, cop0, addr, t);
 }
@@ -1259,7 +1276,7 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
             // Leading %llu = cumulative cycle count BEFORE this instruction
             // (jam c.cycles ↔ psxe total_cycles). Lets `cmp` of field 1
             // pinpoint where the cycle models first disagree.
-            var tfmt: []u8 = "%llu %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n";
+            var tfmt: []u8 = "%llu %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n";
             fprintf(c.traceFp, tfmt.ptr, c.cycles, c.savedPc, topc,
                 regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7],
                 regs[8], regs[9], regs[10], regs[11], regs[12], regs[13], regs[14], regs[15],
@@ -1267,7 +1284,8 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
                 regs[24], regs[25], regs[26], regs[27], regs[28], regs[29], regs[30], regs[31],
                 c.hi, c.lo,
                 bus.timer.dbgTimerCounter(0), bus.timer.dbgTimerCounter(1),
-                bus.timer.dbgTimerCounter(2));
+                bus.timer.dbgTimerCounter(2), bus.irq[0], bus.irq[1],
+                bus.cdrom.dbgDelay(), bus.cdrom.dbgInfo(), bus.cdrom.dbgLba());
         }
         if ((ic & 0x3FFFFF) == 0) { fflush(c.traceFp); }
     }
@@ -1306,6 +1324,10 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     }
 
     const opc: u32 = busRead32(bus, c.pc);
+    if (opc == 0x0c034b99) {   // TEMP: jal 0x800d2e64 (MDEC-cmd helper F)
+        var jf: []u8 = "[jalF] from=%08x ra=%08x\n";
+        printf(jf.ptr, c.savedPc, gprRead(regs, 31));
+    }
 
     c.pc = c.nextPc;
     c.nextPc = c.nextPc + 4;

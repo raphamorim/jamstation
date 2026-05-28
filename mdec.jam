@@ -439,6 +439,10 @@ pub const Mdec = struct {
             self.inputFull = 0;
             self.busy = 1;
             const op: u32 = (val >> 29) & 7;
+            // TEMP FMV probe: log every MDEC command word. op=1 DECODE is the
+            // frame decode the FMV needs; op=2/3 are the quant/IDCT tables.
+            var pf: []u8 = "[MDECcmd] op=%u val=%08x words=%u\n";
+            printf(pf.ptr, op, val, val & 0xFFFF);
             var newWords: u32 = 0;
             if (op == MDEC_CMD_NOP) {
                 self.busy = 0;

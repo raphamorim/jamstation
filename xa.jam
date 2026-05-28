@@ -26,10 +26,6 @@
 // are decoded as they stream. Playback (mixing into the SPU CDIN path) is
 // not yet integrated — psxe routes XA through SDL audio in audio.c.
 
-pub extern fn malloc(size: u64) *mut[] u8;
-pub extern fn free(ptr: *mut[] u8);
-pub extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
-
 // ADPCM predictor coefficient tables (5 entries; filter index 0..3 maps
 // to entries 0..3; entry 4 is psxe's table padding and rarely hit).
 pub fn xaPosCoef(idx: u32) i32 {

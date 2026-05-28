@@ -58,6 +58,7 @@ const CD_STATE_READ:      u32 = 3;
 const CD_STATE_PLAY:      u32 = 4;
 
 // psxe's CD_DELAY_FR / CD_DELAY_INIT_FR / CD_DELAY_READ_* (CPU cycles).
+const CD_DELAY_1MS:       u32 = 33869;       // psxe CD_DELAY_1MS
 const CD_DELAY_FR:        u32 = 50401;
 const CD_DELAY_INIT_FR:   u32 = 81102;
 const CD_DELAY_READ_SS:   u32 = 451584;     // 33_868_800 / 75
@@ -493,8 +494,11 @@ pub const Cdrom = struct {
             self.pushResp(self.getStat());
             self.state = CD_STATE_TX_RESP2 as u8;
             // seek_precision is set in resp2 on success, like psxe — not
-            // here in resp1.
-            self.delay = CD_DELAY_FR;
+            // here in resp1. psxe cdrom_cmd_seekl sets the 2nd-response delay
+            // to CD_DELAY_1MS (NOT FR) — the FR=50401 vs 1MS=33869 gap (16532
+            // cyc) made jam's SeekL INT2 fire ~8266 instrs late, the root of
+            // the FMV CD-INT divergence at ~102.7M.
+            self.delay = CD_DELAY_1MS;
             return;
         }
         if (cmd == CDL_GETID) {
@@ -639,9 +643,10 @@ pub const Cdrom = struct {
             self.ifr = 3;
             self.pushResp(self.getStat());
             self.state = CD_STATE_TX_RESP2 as u8;
-            self.delay = CD_DELAY_FR;
+            self.delay = CD_DELAY_1MS;   // psxe cdrom_cmd_seekp: 1MS, not FR
             return;
         }
+
         if (cmd == CDL_SETSESSION) {
             self.ifr = 3;
             self.pushResp(self.getStat());
@@ -899,7 +904,7 @@ pub const Cdrom = struct {
         self.ifr = 1;
         self.pushResp(self.getStat());
 
-        self.lba = lba + 1;
+        self.pendingLba = lba + 1;   // psxe cdrom_handle_read: deferred via pending_lba, lba promoted on next process_setloc (GetLocL/P returns current sector, not next)
         self.delay = self.readDelay();
     }
 
@@ -968,6 +973,12 @@ pub const Cdrom = struct {
     // TEMP: pack FIFO state — dataReq(bit28) | dataWidx(<<12) | dataRidx.
     pub fn dbgFifo(self: mut Self) u32 {
         return self.dataRidx | (self.dataWidx << 12) | ((self.dataReq as u32) << 28);
+    }
+    // TEMP CD-state trace: the delay countdown, and pending cmd | prevState.
+    pub fn dbgDelay(self: mut Self) u32 { return self.delay; }
+    pub fn dbgPend(self: mut Self) u32 {
+        return (self.pendingCmd as u32) | ((self.prevState as u32) << 8)
+            | ((self.busy as u32) << 16);
     }
 
     // Read one byte from the data FIFO (the 0x1F801802 register).
