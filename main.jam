@@ -617,7 +617,6 @@ fn main() {
     var buttons: [1]u32 = [0xFFFF; 1];
     var btnPtr: *mut[] u32 = buttons.asMutPtr();
 
-    var frames: u32 = 0;
     var quit: bool = false;
     // Wall-clock window so we can print a rolling FPS without depending on
     // the SDL window close to flush state.
@@ -692,7 +691,6 @@ fn main() {
         // write); doing it once per frame is enough since controller
         // polling runs at VBlank cadence in the BIOS.
         padSetButtons(bus.pad.ptr, buttons[0]);
-        frames = frames + 1;
     }
 
     // Persist memcard slot 1 to disk before freeing the bus. psxe does
