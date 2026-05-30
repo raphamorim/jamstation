@@ -222,7 +222,7 @@ pub const Sio1 = struct {
         // response byte we staged in writeData is "received").
         if ((ctrl & (CTRL_TX_IE | CTRL_RX_IE)) != 0) {
             self.stat = self.stat | STAT_IRQ;
-            irqRaise(ic, cop0, IC_SIO());
+            irqRaise(ic, cop0, IC_SIO);
         }
     }
 };

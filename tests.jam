@@ -541,7 +541,7 @@ fn emuRunOneFrame(c: mut Cpu, bus: Bus, regs: Vec(u32), cop0: Vec(u32)) {
             bus.timer.hblankEnd();
             if (line == SCANLINES_VDRAW) {
                 bus.timer.vblankBegin(bus.irq.ptr, cop0.ptr);
-                irqRaise(bus.irq.ptr, cop0.ptr, IC_VBLANK());
+                irqRaise(bus.irq.ptr, cop0.ptr, IC_VBLANK);
             }
             line = line + 1;
         }

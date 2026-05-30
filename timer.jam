@@ -175,10 +175,10 @@ pub const Timer = struct {
         self.channels[idx].irq = 1;
 
         if (trigger) {
-            var line: u32 = IC_TIMER0();
+            var line: u32 = IC_TIMER0;
             match (idx) {
-                1 { line = IC_TIMER1(); }
-                2 { line = IC_TIMER2(); }
+                1 { line = IC_TIMER1; }
+                2 { line = IC_TIMER2; }
                 _ {}
             }
             irqRaise(ic, cop0, line);

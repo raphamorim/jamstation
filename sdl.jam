@@ -358,21 +358,23 @@ const BTN_SQUARE:   u32 = 0x8000;
 // for unmapped keys. Keep close to the standard PCSX / DuckStation /
 // PSXE keybinding layout so it feels familiar.
 pub fn scancodeToBtn(scan: u32) u32 {
-    if (scan == SC_UP)     { return BTN_UP; }
-    if (scan == SC_DOWN)   { return BTN_DOWN; }
-    if (scan == SC_LEFT)   { return BTN_LEFT; }
-    if (scan == SC_RIGHT)  { return BTN_RIGHT; }
-    if (scan == SC_Z)      { return BTN_CROSS; }
-    if (scan == SC_X)      { return BTN_CIRCLE; }
-    if (scan == SC_A)      { return BTN_SQUARE; }
-    if (scan == SC_S)      { return BTN_TRIANGLE; }
-    if (scan == SC_Q)      { return BTN_L1; }
-    if (scan == SC_W)      { return BTN_R1; }
-    if (scan == SC_1)      { return BTN_L2; }
-    if (scan == SC_2)      { return BTN_R2; }
-    if (scan == SC_RETURN) { return BTN_START; }
-    if (scan == SC_RSHIFT) { return BTN_SELECT; }
-    return 0;
+    match (scan) {
+        SC_UP     { return BTN_UP; }
+        SC_DOWN   { return BTN_DOWN; }
+        SC_LEFT   { return BTN_LEFT; }
+        SC_RIGHT  { return BTN_RIGHT; }
+        SC_Z      { return BTN_CROSS; }
+        SC_X      { return BTN_CIRCLE; }
+        SC_A      { return BTN_SQUARE; }
+        SC_S      { return BTN_TRIANGLE; }
+        SC_Q      { return BTN_L1; }
+        SC_W      { return BTN_R1; }
+        SC_1      { return BTN_L2; }
+        SC_2      { return BTN_R2; }
+        SC_RETURN { return BTN_START; }
+        SC_RSHIFT { return BTN_SELECT; }
+        _         { return 0; }
+    }
 }
 
 // Pump SDL events. Returns non-zero when the user has requested quit

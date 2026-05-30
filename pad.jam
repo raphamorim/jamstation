@@ -323,5 +323,5 @@ pub fn padUpdate(p: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
         padSetU16(p, P_STAT_LO, stat);
         p[P_IRQ_BIT] = 0;
     }
-    irqRaise(ic, cop0, IC_JOY());
+    irqRaise(ic, cop0, IC_JOY);
 }

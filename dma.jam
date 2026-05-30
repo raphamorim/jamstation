@@ -22,7 +22,6 @@ const { Disc } = import("disc");
 
 const SPU_TFIFO_OFF: u32 = 0x1A8;
 
-
 // d[0..20] = 7 channels × 3 regs (MADR/BCR/CHCR)
 // d[21]    = DPCR
 // d[22]    = DICR
@@ -503,7 +502,7 @@ pub fn dmaUpdate(d: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32) {
 
     const signal: bool = forceB || (flagsB && irqEn);
 
-    if (signal && !prev) { irqRaise(ic, cop0, IC_DMA()); }
+    if (signal && !prev) { irqRaise(ic, cop0, IC_DMA); }
 
     d[22] = d[22] & (~DICR_IRQSI);
     if (signal) { d[22] = d[22] | DICR_IRQSI; }

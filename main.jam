@@ -330,7 +330,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
             line = line + 1;
             if (line == SCANLINES_VDRAW) {
                 bus.timer.vblankBegin(bus.irq.ptr, cop0);
-                irqRaise(bus.irq.ptr, cop0, IC_VBLANK());
+                irqRaise(bus.irq.ptr, cop0, IC_VBLANK);
             } else if (line == SCANLINES_TOTAL) {
                 bus.timer.vblankEnd();
                 line = 0;

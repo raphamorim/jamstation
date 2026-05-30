@@ -843,7 +843,7 @@ pub const Cdrom = struct {
         }
         // Only raise CPU IRQ if the corresponding IER bit is enabled.
         if ((self.ifr as u32 & self.ier as u32 & 0x1F) == 0) { return; }
-        irqRaise(ic, cop0, IC_CDROM());
+        irqRaise(ic, cop0, IC_CDROM);
     }
 
     pub fn handleRead(self: mut Self, disc: *mut[] Disc, spu: *mut[] u8) {

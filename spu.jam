@@ -881,11 +881,11 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
                     const irq9: u32 = getU16(s, R_IRQADDR) << 3;
                     const spucnt: u32 = getU16(s, R_SPUCNT);
                     if (irq9 == getU32(s, rt + D_CURADDR) && (spucnt & 0x40) != 0) {
-                        irqRaise(ic, cop0, IC_SPU());
+                        irqRaise(ic, cop0, IC_SPU);
                     }
                     setU32(s, rt + D_CURADDR, getU32(s, rt + D_CURADDR) + 0x10);
                     if (irq9 == getU32(s, rt + D_CURADDR) && (spucnt & 0x40) != 0) {
-                        irqRaise(ic, cop0, IC_SPU());
+                        irqRaise(ic, cop0, IC_SPU);
                     }
                 } else if (lp == 1) {
                     setU32(s, rt + D_CURADDR, getU32(s, rt + D_REPADDR));

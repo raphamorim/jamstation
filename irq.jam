@@ -15,17 +15,17 @@
 const { Vec } = import("std/collections");
 
 // IRQ line bits (psxe ic.h: IC_VBLANK = 0x001, etc.).
-pub fn IC_VBLANK() u32 { return 0x001; }
-pub fn IC_GPU()    u32 { return 0x002; }
-pub fn IC_CDROM()  u32 { return 0x004; }
-pub fn IC_DMA()    u32 { return 0x008; }
-pub fn IC_TIMER0() u32 { return 0x010; }
-pub fn IC_TIMER1() u32 { return 0x020; }
-pub fn IC_TIMER2() u32 { return 0x040; }
-pub fn IC_JOY()    u32 { return 0x080; }
-pub fn IC_SIO()    u32 { return 0x100; }
-pub fn IC_SPU()    u32 { return 0x200; }
-pub fn IC_LP_PIO() u32 { return 0x400; }
+pub const IC_VBLANK: u32 = 0x001;
+pub const IC_GPU:    u32 = 0x002;
+pub const IC_CDROM:  u32 = 0x004;
+pub const IC_DMA:    u32 = 0x008;
+pub const IC_TIMER0: u32 = 0x010;
+pub const IC_TIMER1: u32 = 0x020;
+pub const IC_TIMER2: u32 = 0x040;
+pub const IC_JOY:    u32 = 0x080;
+pub const IC_SIO:    u32 = 0x100;
+pub const IC_SPU:    u32 = 0x200;
+pub const IC_LP_PIO: u32 = 0x400;
 
 // COP0 CAUSE bit that signals "external IRQ pending". The R3000's
 // general exception handler dispatches on this when SR.IEC and SR.IM2
