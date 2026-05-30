@@ -618,7 +618,7 @@ fn main() {
     var btnPtr: *mut[] u32 = buttons.asMutPtr();
 
     var frames: u32 = 0;
-    var quit: u32 = 0;
+    var quit: bool = false;
     // Wall-clock window so we can print a rolling FPS without depending on
     // the SDL window close to flush state.
     var winStartMs: u32 = SDL_GetTicks();
@@ -632,7 +632,7 @@ fn main() {
     var lastPoly: u32 = 0;
     const IDLE_TRIGGER: u32 = 180;     // ~3s at 60 fps
     const MIN_POLY_DRAWN: u32 = 200;   // boot animation + shell minimum
-    while (quit == 0) {
+    while (!quit) {
         // Game-EXE side-load. Two trigger paths:
         //   1. BIOS jumps to 0x80030000 (real-disc boot handoff).
         //   2. BIOS shell is parked at the kernel idle loop with no disc;
@@ -687,20 +687,12 @@ fn main() {
             sdlBlit(sdl, vram, dispX, dispY, w, h,
                 is24bpp, displayOff);
         }
-        quit = sdlPump(btnPtr);
+        quit = sdlPump(btnPtr) > 0;
         // Push the latest keyboard state into the SDA pad. Cheap (2-byte
         // write); doing it once per frame is enough since controller
         // polling runs at VBlank cadence in the BIOS.
         padSetButtons(bus.pad.ptr, buttons[0]);
         frames = frames + 1;
-
-        // FMV-debug probe: periodic GP0 family histogram. Once every
-        // 300 frames (~5s at 60Hz) dump g[72..79] so we can see if/when
-        // family 5 (CPU→VRAM, the FMV upload signature) starts firing.
-        // Bail after a long-but-finite session if no quit event comes —
-        // protects users from a runaway window when there's no controller
-        // input wired up yet.
-        if (frames > 100000) { quit = 1; }
     }
 
     // Persist memcard slot 1 to disk before freeing the bus. psxe does
