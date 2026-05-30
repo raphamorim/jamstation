@@ -17,8 +17,6 @@
 // stay heap-allocated separately (256KB + 1MB) so we avoid per-command
 // malloc/free.
 
-pub extern fn memcpy(dst: *mut[] u8, src: *mut[] u8, n: u64) *mut[] u8;
-
 const { Vec } = import("std/collections");
 
 const MDEC_INPUT_SIZE: u32  = 0x40000;   // 256 KB
