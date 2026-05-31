@@ -768,7 +768,10 @@ pub fn gteClampMac(g: *mut[] u32, i: u32, v: i64, sf: u32) i64 {
     if (v < (0 - lim)) { g[32 + C_FLAG] = g[32 + C_FLAG] | (0x8000000 >> (i - 1)); }
     if (v > (lim - 1)) { g[32 + C_FLAG] = g[32 + C_FLAG] | (0x40000000 >> (i - 1)); }
     const t: i64 = (v << 20) >> 20;
-    return t >> sf;
+    // psxe gte_clamp_mac returns (int32_t)(...): MAC1..3 are 32-bit, so
+    // truncate before this feeds the IR clamp (a >32-bit result otherwise
+    // clamps IR / sets the saturation flag from the wrong magnitude).
+    return truncI32(t >> sf);
 }
 
 // Running-accumulation 44-bit check (gte_check_mac): flag overflow and

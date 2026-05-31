@@ -924,9 +924,11 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
             const lvol: i32 = getI32(s, rt + D_LVOL);
             const rvol: i32 = getI32(s, rt + D_RVOL);
             // psxe: samplel = (out * lvol) * (envcvol / 32767)
-            // Integer form: (out * lvol * envcvol) >> 15  (kept signed)
-            const sl: i32 = (out * lvol >> 15) * envc >> 15;
-            const sr: i32 = (out * rvol >> 15) * envc >> 15;
+            // i64 fused form: (out * vol * envcvol) >> 30 in one step. psxe
+            // uses a single float multiply; doing it in i64 avoids the
+            // precision loss of truncating after an intermediate >>15.
+            const sl: i32 = (((out as i64) * (lvol as i64) * (envc as i64)) >> 30) as i32;
+            const sr: i32 = (((out as i64) * (rvol as i64) * (envc as i64)) >> 30) as i32;
             left = left + sl;
             right = right + sr;
 

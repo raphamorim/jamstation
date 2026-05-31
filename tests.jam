@@ -8,7 +8,7 @@ const { assert } = import("test");
 
 const {
     Bus,
-    allocBus, freeBus,
+    allocBus,
     busWrite32
 } = import("bus");
 
@@ -87,8 +87,10 @@ fn allocHarness() Harness {
     return h;
 }
 
+// Bus now tears down via its `cfn drop` when the Harness goes out of
+// scope (struct-field auto-drop), so this is a no-op kept for call-site
+// readability.
 fn freeHarness(h: Harness) {
-    freeBus(h.bus);
 }
 
 fn placeOp(bus: Bus, cop0: Vec(u32), addr: u32, opc: u32) {
@@ -578,12 +580,11 @@ tfn emuBiosShellBoots() {
     var cop0: Vec(u32) = allocRegFile(16);
     var bus: Bus = allocBus();
     var c: Cpu = freshCpu();
-    if (emuBoot(c, bus, regs.ptr, cop0.ptr) == 0) { freeBus(bus);
+    if (emuBoot(c, bus, regs.ptr, cop0.ptr) == 0) {
         return;
     }
     emuRunFrames(c, bus, regs.ptr, cop0.ptr, 60);
     assert(emuPcInRamOrScratchpad(c.pc), true);
-    freeBus(bus);
 }
 
 // With game.bin attached, BIOS bootstrap reads the disc and hands off to
@@ -597,7 +598,7 @@ tfn emuDiscBootsExec() {
     var cop0: Vec(u32) = allocRegFile(16);
     var bus: Bus = allocBus();
     var c: Cpu = freshCpu();
-    if (emuBoot(c, bus, regs.ptr, cop0.ptr) == 0) { freeBus(bus);
+    if (emuBoot(c, bus, regs.ptr, cop0.ptr) == 0) {
         return;
     }
     discOpen(bus.disc.ptrMut(), diskPath);
@@ -607,7 +608,6 @@ tfn emuDiscBootsExec() {
     // a TODO — currently fails for the Harvest Moon SIO0-WaitEvent
     // stall where PC stays in BIOS scratchpad at 0x00001EB0.
     assert(emuPcInRamOrScratchpad(c.pc), true);
-    freeBus(bus);
 }
 
 // With a disc attached the BIOS bootstrap-loader should issue CD reads.

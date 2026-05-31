@@ -139,6 +139,7 @@ pub const Cdrom = struct {
     delay:       u32,
     lba:         u32,
     pendingLba:  u32,
+    pendingSpeedSwitch: u32,  // psxe pending_speed_switch_delay (1x<->2x resync)
     dataRidx:    u32,
     dataWidx:    u32,
     // XA-ADPCM per-channel history (2 i32 each). Persists across
@@ -168,7 +169,7 @@ pub const Cdrom = struct {
             // (psx_cdrom_init). jam's LBA is pregap-inclusive — cueRead
             // maps off=(lba-startLba)*SECTOR with track1 startLba=150 —
             // so 0 would read a negative offset (zero pregap), not sector 0.
-            delay: 0, lba: 150, pendingLba: 150,
+            delay: 0, lba: 150, pendingLba: 150, pendingSpeedSwitch: 0,
             dataRidx: 0, dataWidx: 0,
             xaLh: [0, 0],
             xaRh: [0, 0],
@@ -416,7 +417,15 @@ pub const Cdrom = struct {
         if (cmd == CDL_GETSTAT || cmd == CDL_MUTE || cmd == CDL_DEMUTE ||
             cmd == CDL_SETMODE || cmd == CDL_RESET || cmd == CDL_SETLOC) {
             if (cmd == CDL_SETMODE) {
+                // psxe cmd_setmode (impl.c:355-361): a 1x<->2x speed change
+                // costs a big ~650ms drive resync, charged to the next read.
+                // FMV setup (SetMode double-speed -> ReadN) relies on it;
+                // without it the first STR sector arrives too early.
+                const prevSpeed: u32 = self.mode as u32 & MODE_SPEED;
                 self.mode = self.popParam() as u8;
+                if (prevSpeed != (self.mode as u32 & MODE_SPEED)) {
+                    self.pendingSpeedSwitch = 650 * 33869;
+                }
             }
             if (cmd == CDL_SETLOC) {
                 const m: u32 = self.popParam();
@@ -830,13 +839,21 @@ pub const Cdrom = struct {
             // command in TX_RESP1 incurs a delay.
             if (self.state == CD_STATE_READ as u8) {
                 self.processSetloc();
-                self.delay = self.readDelay() + 4 * 33869;
+                // First sector after a command: add psxe's pending
+                // speed-switch resync (0 unless SetMode just flipped 1x<->2x),
+                // consumed once. Normal reads are unchanged.
+                self.delay = self.readDelay() + 4 * 33869 + self.pendingSpeedSwitch;
+                self.pendingSpeedSwitch = 0;
             }
         } else if (self.state == CD_STATE_TX_RESP2 as u8) {
             self.executeResp2(disc);
             if (self.state == CD_STATE_READ as u8) {
                 self.processSetloc();
-                self.delay = self.readDelay() + 4 * 33869;
+                // First sector after a command: add psxe's pending
+                // speed-switch resync (0 unless SetMode just flipped 1x<->2x),
+                // consumed once. Normal reads are unchanged.
+                self.delay = self.readDelay() + 4 * 33869 + self.pendingSpeedSwitch;
+                self.pendingSpeedSwitch = 0;
             }
         } else if (self.state == CD_STATE_READ as u8) {
             self.handleRead(disc, spu);
