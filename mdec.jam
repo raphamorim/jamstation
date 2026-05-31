@@ -386,11 +386,19 @@ pub const Mdec = struct {
             if (self.outputBit15  != 0) { st = st | (1 << 23); }
             if (self.outputSigned != 0) { st = st | (1 << 24); }
             st = st | ((self.outputDepth & 3) << 25);
-            if (self.outputReq    != 0) { st = st | (1 << 27); }
-            if (self.inputReq     != 0) { st = st | (1 << 28); }
+            // Request bits 27/28 and Data-Out FIFO Empty (31) are LEVELS
+            // recomputed here, NOT latched: bit 27 = DMA1 enabled AND output
+            // has data; bit 28 = DMA0 enabled AND more input wanted; bit 31 =
+            // output drained. Matches nocash psx-spx, DuckStation
+            // (`enable_dma_out && !out_fifo.empty()`) and Avocado. psxe latches
+            // outputReq at the final decode word, so a game that enables DMA1
+            // AFTER the decode reads bit 27 = 0 forever and never DMAs the MDEC
+            // output back out -- the frame decodes but is never read (FMV skip).
+            if (self.enableDma1 != 0 && self.outputWords > 0) { st = st | (1 << 27); }
+            if (self.enableDma0 != 0 && self.wordsRem  > 0) { st = st | (1 << 28); }
             if (self.busy         != 0) { st = st | (1 << 29); }
             if (self.inputFull    != 0) { st = st | (1 << 30); }
-            if (self.outputEmpty  != 0) { st = st | (1 << 31); }
+            if (self.outputWords == 0) { st = st | (1 << 31); }
             return st;
         }
         return 0;

@@ -622,6 +622,14 @@ fn main() {
     var lastPoly: u32 = 0;
     const IDLE_TRIGGER: u32 = 180;     // ~3s at 60 fps
     const MIN_POLY_DRAWN: u32 = 200;   // boot animation + shell minimum
+    // Frame-rate limiter: pace to the PSX's native ~59.94 Hz, independent of
+    // the host display refresh. The emulated frame is already ~565K cycles
+    // (33.8688 MHz / 59.94); without wall-clock pacing the VSync-only present
+    // runs the whole machine at the monitor's rate (2x on a 120 Hz ProMotion
+    // panel) and overruns/drops the audio queue. The f64 accumulator avoids
+    // the drift an integer-ms target would introduce.
+    const FRAME_MS: f64 = 1000.0 / 59.94;
+    var nextFrameMs: f64 = SDL_GetTicks() as f64;
     while (!quit) {
         // Game-EXE side-load. Two trigger paths:
         //   1. BIOS jumps to 0x80030000 (real-disc boot handoff).
@@ -682,6 +690,20 @@ fn main() {
         // write); doing it once per frame is enough since controller
         // polling runs at VBlank cadence in the BIOS.
         padSetButtons(bus.pad.ptr, buttons[0]);
+
+        // Pace this frame to ~59.94 Hz. The VSync present above already
+        // blocked to a host vblank; pad the rest of the frame so the loop
+        // runs at the PSX rate rather than the (possibly 120 Hz) panel rate.
+        nextFrameMs = nextFrameMs + FRAME_MS;
+        const nowMs: u32 = SDL_GetTicks();
+        if ((nowMs as f64) < nextFrameMs) {
+            SDL_Delay((nextFrameMs - (nowMs as f64)) as u32);
+        } else {
+            // Fell behind (slow frame, or a 60 Hz host where VSync already
+            // paced us) — resync so we never burst-catch-up faster than
+            // real time.
+            nextFrameMs = nowMs as f64;
+        }
     }
 
     // Persist memcard slot 1 to disk before freeing the bus. psxe does
