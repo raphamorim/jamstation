@@ -10,12 +10,10 @@
 
 const {
     Bus,
-    allocBus, freeBus,
-    busRead32, busRead16, busRead8,
+    allocBus, busRead32, busRead16, busRead8,
     busWrite32, busWrite16, busWrite8,
     busRamPtr, busBiosPtr, busVramPtr
 } = import("bus");
-
 // Force device modules into main.jam's codegen context.
 const { Gpu } = import("gpu");
 const { gteAlloc } = import("gte");
@@ -85,11 +83,6 @@ extern fn SDL_CloseAudioDevice(dev: u32);
 extern fn SDL_PauseAudioDevice(dev: u32, pause_on: i32);
 extern fn SDL_QueueAudio(dev: u32, data: *const[] u8, len: u32) i32;
 extern fn SDL_GetQueuedAudioSize(dev: u32) u32;
-
-
-fn fileExists(path: []u8) bool {
-    return exists(path);
-}
 
 // Locally-redeclared shapes matching cpu.jam / sdl.jam.
 const Cpu = struct {
@@ -167,8 +160,6 @@ fn dmodeHeight(dm: u32, gpuState: *mut[] u32) i32 {
     if (disp > 0 && disp < 239) { return disp; }
     return 240;
 }
-
-// ---------- PSX-EXE loader ---------------------------------------------
 
 fn readU32At(buf: *mut[] u8, off: u32) u32 {
     return  (buf[off]       as u32)
@@ -505,7 +496,7 @@ fn main() {
         print("error: no BIOS image given\nusage: jamstation <BIOS_PATH> [GAME_PATH]\n");
         exit(1);
     }
-    if (!fileExists(biosPath)) {
+    if (!exists(biosPath)) {
         print("error: BIOS file not found: {biosPath}\n");
         exit(1);
     }
@@ -519,8 +510,8 @@ fn main() {
     // `./game.exe` instead: we boot the BIOS first and only sideload
     // when PC reaches 0x80030000 (the standard "kernel ready" address
     // psxe uses for the same handoff).
-    var demoPath: []u8 = "./demo.exe";
-    var gamePath: []u8 = "./game.exe";
+    var demoPath = "./demo.exe";
+    var gamePath = "./game.exe";
     var cuePath:  []u8 = "./game.cue";
     var binPath:  []u8 = "./game.bin";
     var pendingGameExe: bool = false;
@@ -541,18 +532,18 @@ fn main() {
             print("Could not open game image from arg — running BIOS only\n");
         }
     } else {
-        if (fileExists(cuePath)) {
+        if (exists(cuePath)) {
             if (discOpen(bus.disc.ptrMut(), cuePath) != 0) {
                 bus.cdrom.attachDisc(bus.disc.ptrMut());
             }
-        } else if (fileExists(binPath)) {
+        } else if (exists(binPath)) {
             if (discOpen(bus.disc.ptrMut(), binPath) != 0) {
                 bus.cdrom.attachDisc(bus.disc.ptrMut());
             }
         }
-        if (fileExists(demoPath)) {
+        if (exists(demoPath)) {
             loadExe(demoPath, bus, regs.ptr, c);
-        } else if (fileExists(gamePath)) {
+        } else if (exists(gamePath)) {
             pendingGameExe = true;
             print("game.exe found — booting BIOS first, will side-load at PC=80030000\n");
         } else {
@@ -565,7 +556,7 @@ fn main() {
     // future GPU implementation pokes pixels into VRAM; until then this
     // is a debug pattern.
     print("Initializing SDL2...\n");
-    var title: []u8 = "jamstation";
+    var title = "jamstation";
     // Set the JAM_PSONE_FULL_VRAM env var (any non-empty value) to
     // see the whole 1024×512 VRAM in the window instead of the
     // BIOS's 320×240 display rectangle. Useful for spotting where the
@@ -578,10 +569,10 @@ fn main() {
     // the visible window looks empty. (Env-var detection would have
     // been cleaner but Jam v0.1.0 can't compare a `*const[] u8` from
     // getenv() against NULL.)
-    var sentinel: []u8 = "./FULL_VRAM";
-    const fullVram: bool = fileExists(sentinel);
-    var sdlW: i32 = SCREEN_W;
-    var sdlH: i32 = SCREEN_H;
+    var sentinel = "./FULL_VRAM";
+    const fullVram: bool = exists(sentinel);
+    var sdlW = SCREEN_W;
+    var sdlH = SCREEN_H;
     if (fullVram) {
         sdlW = VRAM_WIDTH;
         sdlH = VRAM_HEIGHT;
@@ -701,5 +692,5 @@ fn main() {
     // audioCtx and buttons are stack arrays — they vanish with main()'s
     // frame; no manual free needed.
     sdlQuit(sdl);
-    freeBus(bus);
+    print("\nsdl quitted\n");
 }

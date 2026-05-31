@@ -9,7 +9,6 @@
 // don't import bus.jam — they take whichever raw pointers they need as
 // arguments — so the import graph stays acyclic. The orchestration layer
 // (cpu/dma/main/tests) imports `Bus` from here for its function signatures.
-
 const { Gpu } = import("gpu");
 const { dmaRead32, dmaRead16, dmaRead8,
         dmaWrite32, dmaWrite16, dmaWrite8, dmaAlloc } = import("dma");
@@ -18,6 +17,7 @@ const { irqRead32, irqRead16, irqRead8,
 const { Vec } = import("std/collections");
 const { Timer } = import("timer");
 const { gteAlloc } = import("gte");
+const std = import("std");
 const { Cdrom } = import("cdrom");
 const { Disc, discAlloc, discClose } = import("disc");
 const { Box } = import("std/box");
@@ -60,6 +60,10 @@ pub const Bus = struct {
     mcd:     Mcd,
     mcdRam:  Vec(u8),
     biosLoaded: u8,
+    cfn drop(self: mut Self) {
+        discClose(self.disc.ptrMut());
+        std.fmt.print("disc closed");
+    }
 };
 
 pub const BusRoute = struct {
@@ -124,19 +128,19 @@ pub fn bufWrite8(buf: *mut[] u8, off: u32, val: u32) {
 //   6 = EXP2 (DTL debug-console region; only the ATC status byte matters)
 pub fn route(paddr: u32) BusRoute {
     if (paddr < 0x00800000) {
-        var r: BusRoute = BusRoute { kind: 1, off: paddr & 0x001FFFFF };
+        const r = BusRoute { kind: 1, off: paddr & 0x001FFFFF };
         return r;
     }
     if (paddr >= 0x1F000000 && paddr < 0x1F080000) {
-        var r: BusRoute = BusRoute { kind: 5, off: paddr - 0x1F000000 };
+        const r = BusRoute { kind: 5, off: paddr - 0x1F000000 };
         return r;
     }
     if (paddr >= 0x1F800000 && paddr < 0x1F800400) {
-        var r: BusRoute = BusRoute { kind: 3, off: paddr - 0x1F800000 };
+        const r = BusRoute { kind: 3, off: paddr - 0x1F800000 };
         return r;
     }
     if (paddr >= 0x1F801000 && paddr < 0x1F802000) {
-        var r: BusRoute = BusRoute { kind: 4, off: paddr - 0x1F801000 };
+        const r = BusRoute { kind: 4, off: paddr - 0x1F801000 };
         return r;
     }
     // EXP2 (0x1F802000–0x1F9FFFFF): psxe routes this whole range to the
@@ -144,22 +148,20 @@ pub fn route(paddr: u32) BusRoute {
     // read back the zero buffer; route it as kind 6 so the DTL ATC status
     // byte reads correctly.
     if (paddr >= 0x1F802000 && paddr < 0x1FA00000) {
-        var r: BusRoute = BusRoute { kind: 6, off: paddr - 0x1F802000 };
+        const r = BusRoute { kind: 6, off: paddr - 0x1F802000 };
         return r;
     }
     if (paddr >= 0x1FC00000 && paddr < 0x1FC80000) {
-        var r: BusRoute = BusRoute { kind: 2, off: paddr - 0x1FC00000 };
+        const r = BusRoute { kind: 2, off: paddr - 0x1FC00000 };
         return r;
     }
     if (paddr >= 0xFFFE0130 && paddr < 0xFFFE0134) {
-        var r: BusRoute = BusRoute { kind: 4, off: 0x1F00 + (paddr - 0xFFFE0130) };
+        const r = BusRoute { kind: 4, off: 0x1F00 + (paddr - 0xFFFE0130) };
         return r;
     }
-    var r: BusRoute = BusRoute { kind: 0, off: 0 };
+    const r = BusRoute { kind: 0, off: 0 };
     return r;
 }
-
-// ---------- public surface ---------------------------------------------
 
 pub fn allocBus() Bus {
     // RAM/BIOS get rewritten end-to-end by the loader (fread overwrites
@@ -167,13 +169,13 @@ pub fn allocBus() Bus {
     // — Rust's `Vec::with_capacity(n) + set_len(n)` pattern. SPAD/IO/VRAM
     // need zeroed defaults at boot (the BIOS reads them before writing),
     // so they take the filled(0, N) path.
-    var ram:  Vec(u8) = Vec(u8).withCapacity(RAM_SIZE);
-    var bios: Vec(u8) = Vec(u8).withCapacity(BIOS_SIZE);
+    var ram = Vec(u8).withCapacity(RAM_SIZE);
+    var bios = Vec(u8).withCapacity(BIOS_SIZE);
     ram.setLen(RAM_SIZE);
     bios.setLen(BIOS_SIZE);
-    var spad: Vec(u8) = Vec(u8).filled(0, SPAD_SIZE);
-    var io:   Vec(u8) = Vec(u8).filled(0, IO_SIZE);
-    var vram: Vec(u8) = Vec(u8).filled(0, VRAM_SIZE);
+    var spad = Vec(u8).filled(0, SPAD_SIZE);
+    var io = Vec(u8).filled(0, IO_SIZE);
+    var vram = Vec(u8).filled(0, VRAM_SIZE);
     // Pre-init MC1 (0x1F801000..0x1F801023) and MC2 (0x1F801060) with the
     // BIOS-expected default values per psxe mc1.c/mc2.c. The BIOS reads
     // these at boot to verify access timings and RAM mirror config; before
@@ -210,26 +212,6 @@ pub fn allocBus() Bus {
         biosLoaded: 0,
     };
     return b;
-}
-
-pub fn freeBus(b: Bus) {
-    // b.ram.ptr/bios/spad/io/vram are Vec(u8) — auto-dropped with `b`.
-    // b.gpu is by-value; no free needed.
-    // b.dma is a Vec(u32) — auto-dropped when `b` goes out of scope.
-    // b.irq is a Vec(u32) — auto-dropped when `b` goes out of scope.
-    // b.timer is by-value; no free needed.
-    // b.gte is a Vec(u32) — auto-dropped when `b` goes out of scope.
-    // b.cdrom is by-value; no free needed.
-    // Close any open file/cue resources the Disc was holding; the Box
-    // itself auto-drops the backing memory when `b` goes out of scope.
-    discClose(b.disc.ptrMut());
-    // b.pad is a Vec(u8) — auto-dropped when `b` goes out of scope.
-    // b.spu and b.spuram are Vec(u8) — auto-dropped when `b` goes out of scope.
-    // b.mdec is by-value; no free needed.
-    // b.mdecIn and b.mdecOut are Vec(u8) — auto-dropped when `b` goes out of scope.
-    // b.sio1 is by-value; no free needed.
-    // b.mcd is by-value; no free needed.
-    // b.mcdRam is a Vec(u8) — auto-dropped when `b` goes out of scope.
 }
 
 // Dispatch an IO-region address to the right device. The offset is
