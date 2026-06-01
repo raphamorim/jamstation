@@ -30,7 +30,7 @@ build:
 	$(BUILD_ENV) $(JAM) -lSDL2 -o $(BIN) main.jam
 
 release:
-	$(BUILD_ENV) $(JAM) --release -lSDL2 -o $(BIN) main.jam
+	$(BUILD_ENV) $(JAM) -C opt-level=3 -lSDL2 -o $(BIN) main.jam
 
 run: build
 	$(RUN_ENV) ./$(BIN)
