@@ -877,6 +877,22 @@ pub const Cdrom = struct {
                           CD_ERR_INVALID_SUBFUNC);
             return;
         }
+        // XA-ADPCM audio sectors are consumed by the SPU and are NOT delivered
+        // to the game's data FIFO / do not raise INT1 -- only video/data
+        // sectors are. Without this filter, audio sectors pollute the game's
+        // STR video stream so its frame parser never assembles a frame to
+        // decode (cmdDecode stays 0). Avocado (cdrom.cpp:141) delivers to the
+        // host only when !audio || !realtime; submode is at sector offset 0x12
+        // (bit 2 = Audio, bit 6 = Real-time).
+        const submode: u32 = self.dataBuf[18] as u32;
+        const isXaAudio: bool = (submode & 0x04) != 0 && (submode & 0x40) != 0;
+        if ((self.mode as u32 & MODE_XA_ADPCM) != 0 && isXaAudio) {
+            self.tryDecodeXa(spu);       // SPU CD-audio (honours the filter)
+            self.pendingLba = lba + 1;   // consume the sector, advance, no INT1
+            self.delay = self.readDelay();
+            return;
+        }
+
         var rIdx: u32 = 24;
         var wEnd: u32 = 24 + 0x800;
         if ((self.mode as u32 & MODE_SECTOR_SIZE) != 0) {
@@ -885,10 +901,6 @@ pub const Cdrom = struct {
         }
         self.dataRidx = rIdx;
         self.dataWidx = wEnd;
-
-        if ((self.mode as u32 & MODE_XA_ADPCM) != 0) {
-            self.tryDecodeXa(spu);
-        }
 
         self.ifr = 1;
         self.pushResp(self.getStat());

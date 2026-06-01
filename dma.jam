@@ -30,7 +30,7 @@ const SPU_TFIFO_OFF: u32 = 0x1A8;
 //           channel stay "busy" while the test polls CHCR — ps1-tests
 //           spu/memory-transfer testDMAWriteTiming asserts that the
 //           transfer is observable in-flight (loopCount > 0).
-const DMA_STATE_WORDS: u32 = 32;
+const DMA_STATE_WORDS: u32 = 35;   // [32]=CD-DMA cnt [33]=STR-magic cnt [34]=last hdr word (TEMP FMV probe)
 const F_SPU_REMAIN: u32 = 29;
 // TEMP FMV probe: d[30]=mdecIn call count, d[31]=mdecOut call count.
 
@@ -324,6 +324,7 @@ pub fn dmaDoMdecIn(d: *mut[] u32, bus: Bus) {
     d[chBase(0) + F_CHCR] = 0;
     d[chBase(0) + F_BCR]  = 0;
     d[23] = size;
+    d[30] = d[30] + 1;   // TEMP FMV probe: MDEC-in DMA fire count
 }
 
 // DMA1: MDEC output port → RAM. Match psxe exactly (dma.c:208-235).
@@ -343,6 +344,7 @@ pub fn dmaDoMdecOut(d: *mut[] u32, bus: Bus) {
     d[chBase(1) + F_CHCR] = 0;
     d[chBase(1) + F_BCR]  = 0;
     d[24] = size;
+    d[31] = d[31] + 1;   // TEMP FMV probe: MDEC-out DMA fire count
 }
 
 // CD-ROM → RAM transfer. Each "word" in BCR.size is 4 bytes from the
@@ -363,6 +365,10 @@ pub fn dmaDoCdrom(d: *mut[] u32, bus: Bus) {
         const b2: u32 = bus.cdrom.readData();
         const b3: u32 = bus.cdrom.readData();
         const w: u32 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        if (i == 0) {   // TEMP FMV probe: STR header word of each read sector
+            d[34] = w;
+            if ((w & 0xFFFF) == 0x0160) { d[33] = d[33] + 1; }
+        }
         ramWrite32(bus, addr, w);
         addr = addr + step;
         i = i + 1;
@@ -371,6 +377,7 @@ pub fn dmaDoCdrom(d: *mut[] u32, bus: Bus) {
     d[chBase(3) + F_CHCR] = 0;
     d[chBase(3) + F_BCR]  = 0;
     d[26] = 1;
+    d[32] = d[32] + 1;   // TEMP FMV probe: CD->RAM DMA fire count
 }
 
 // SPU DMA (channel 4). psxe dma.c:375-437 pipes each 32-bit word through
