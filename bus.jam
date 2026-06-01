@@ -164,15 +164,13 @@ pub fn route(paddr: u32) BusRoute {
 }
 
 pub fn allocBus() Bus {
-    // RAM/BIOS get rewritten end-to-end by the loader (fread overwrites
-    // every byte), so withCapacity+setLen avoids the zero-fill traffic
-    // — Rust's `Vec::with_capacity(n) + set_len(n)` pattern. SPAD/IO/VRAM
-    // need zeroed defaults at boot (the BIOS reads them before writing),
-    // so they take the filled(0, N) path.
-    var ram = Vec(u8).withCapacity(RAM_SIZE);
-    var bios = Vec(u8).withCapacity(BIOS_SIZE);
-    ram.setLen(RAM_SIZE);
-    bios.setLen(BIOS_SIZE);
+    // RAM/BIOS are zero-initialised. The BIOS loader rewrites BIOS end-
+    // to-end, and the real boot path eventually writes most of RAM, but
+    // the test harness only writes a handful of opcodes and reads past
+    // them; on Darwin uninitialised pages happen to read as zero (NOP),
+    // on Linux glibc returns dirty memory and the CPU executes garbage.
+    var ram = Vec(u8).filled(0, RAM_SIZE);
+    var bios = Vec(u8).filled(0, BIOS_SIZE);
     var spad = Vec(u8).filled(0, SPAD_SIZE);
     var io = Vec(u8).filled(0, IO_SIZE);
     var vram = Vec(u8).filled(0, VRAM_SIZE);
