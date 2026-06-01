@@ -1,29 +1,42 @@
-# todo: I need to update it before make public
-JAM      := ../jam/output/jam.out
-SDL_LIB  := /opt/homebrew/lib
-SDL_INC  := /opt/homebrew/include
-BIN      := jamstation
+JAM := ../jam/output/jam.out
+BIN := jamstation
 
-# macOS: SDL2 is installed via brew under /opt/homebrew. Override these
-# paths for /usr/local (Intel macOS) or /usr (Linux).
-LIBPATH := $(SDL_LIB)
+# SDL2 locations differ per platform. Override SDL_LIB/SDL_INC on the
+# command line to point at a non-default install (e.g. /usr/local on
+# Intel macOS).
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+    SDL_LIB ?= /opt/homebrew/lib
+    SDL_INC ?= /opt/homebrew/include
+    RUN_ENV := DYLD_LIBRARY_PATH=$(SDL_LIB)
+else
+    SDL_LIB ?= /usr/lib
+    SDL_INC ?= /usr/include
+    RUN_ENV := LD_LIBRARY_PATH=$(SDL_LIB)
+endif
 
-.PHONY: test build run release clean fmt
+# Point at the std/ directory in the in-tree jam build. The installed
+# jam binary auto-discovers std/ via $PREFIX/lib/jam/std, but the dev
+# layout (../jam/output/jam.out + ../jam/std) needs an explicit hint.
+JAM_STD ?= ../jam/std
+BUILD_ENV := LIBRARY_PATH=$(SDL_LIB) JAM_STD_PATH=$(JAM_STD)
+
+.PHONY: test build run release run-release clean fmt
 
 test:
-	$(JAM) test tests.jam
+	$(BUILD_ENV) $(JAM) test tests.jam
 
 build:
-	LIBRARY_PATH=$(LIBPATH) $(JAM) -lSDL2 -o $(BIN) main.jam
+	$(BUILD_ENV) $(JAM) -lSDL2 -o $(BIN) main.jam
 
 release:
-	LIBRARY_PATH=$(LIBPATH) $(JAM) --release -lSDL2 -o $(BIN) main.jam
+	$(BUILD_ENV) $(JAM) --release -lSDL2 -o $(BIN) main.jam
 
 run: build
-	DYLD_LIBRARY_PATH=$(LIBPATH) ./$(BIN)
+	$(RUN_ENV) ./$(BIN)
 
 run-release: release
-	DYLD_LIBRARY_PATH=$(LIBPATH) ./$(BIN)
+	$(RUN_ENV) ./$(BIN)
 
 clean:
 	rm -f $(BIN)
