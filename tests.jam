@@ -62,9 +62,6 @@ const Cpu = struct {
     branchTaken: u8,
     halted: u8,
     cycles: u64,
-    traceFp:   u64,   // TEMP REG_TRACE (mirror cpu.jam)
-    traceInit: u32,
-    traceN:    u64,
 };
 
 

@@ -1031,13 +1031,6 @@ pub const Cdrom = struct {
         return discRead(disc, lba, self.dataBuf.asMutPtr());
     }
 
-    // TEMP FMV PROBE — CD state for the stuck-loop diagnosis (remove after).
-    pub fn dbgLba(self: mut Self) u32 { return self.lba; }
-    pub fn dbgState(self: mut Self) u32 {
-        return (self.state as u32) | ((self.readOngoing as u32) << 8)
-            | ((self.pendingCmd as u32) << 16);
-    }
-
     // Read one byte from the data FIFO (the 0x1F801802 register).
     pub fn readData(self: mut Self) u32 {
         if (self.dataReq == 0) { return 0; }

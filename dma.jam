@@ -18,7 +18,6 @@ const { Bus } = import("bus");
 const { Cdrom } = import("cdrom");
 const { Mdec } = import("mdec");
 const { spuWrite16, spuRead16 } = import("spu");
-const { print } = import("std/fmt");   // TEMP FMV: DICR write logging
 const { Disc } = import("disc");
 
 const SPU_TFIFO_OFF: u32 = 0x1A8;
