@@ -24,7 +24,7 @@ LIBRARY_PATH=/opt/homebrew/lib jam -lSDL2 -C opt-level=3 -o jamstation main.jam
 
 ## Tested on x86 and macOS arm
 
-![https://media.mas.to/media_attachments/files/116/674/503/103/746/875/original/5a53ef5936b5095e.jpeg](Suikoden 2 running on jamstation).
+![Suikoden 2 running on jamstation](https://media.mas.to/media_attachments/files/116/674/503/103/746/875/original/5a53ef5936b5095e.jpeg)
 
 ## Controls
 
