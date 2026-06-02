@@ -320,8 +320,12 @@ pub fn cueComputeRanges(raw: *mut[] u8) {
                 if (ti == lastTrack) {
                     c[0].tracks.ptr[ti].endLba = lba + fileSectors;
                 } else {
+                    // endLba is exclusive, so it equals the next track's
+                    // startLba — contiguous, no 1-sector gap at the boundary
+                    // (mednafen/Avocado compute track length = next.index1 -
+                    // this.index1 with no -1).
                     c[0].tracks.ptr[ti].endLba =
-                        ((c[0].tracks.ptr[ti + 1].index1 as u32) + 150) - 1;
+                        (c[0].tracks.ptr[ti + 1].index1 as u32) + 150;
                 }
                 ti = ti + 1;
             }

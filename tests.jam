@@ -65,6 +65,7 @@ const Cpu = struct {
     diagDumped: u32,
     diagExcCount: u32,
     diagWalkCount: u32,
+    lastBiosCall: u32,
 };
 
 
@@ -80,7 +81,7 @@ const Harness = struct {
 
 fn allocHarness() Harness {
     var regs: Vec(u32) = allocRegFile(32);
-    var cop0: Vec(u32) = allocRegFile(16);
+    var cop0: Vec(u32) = allocRegFile(32);
     var bus: Bus = allocBus();
     var cpu: Cpu = freshCpuAt(0x80000000);
     var h: Harness = Harness { cpu: cpu, regs: regs, cop0: cop0, bus: bus };
@@ -577,7 +578,7 @@ fn emuPcInRamOrScratchpad(pc: u32) bool {
 
 tfn emuBiosShellBoots() {
     var regs: Vec(u32) = allocRegFile(32);
-    var cop0: Vec(u32) = allocRegFile(16);
+    var cop0: Vec(u32) = allocRegFile(32);
     var bus: Bus = allocBus();
     var c: Cpu = freshCpu();
     if (emuBoot(c, bus, regs.ptr, cop0.ptr) == 0) {
@@ -595,7 +596,7 @@ tfn emuDiscBootsExec() {
     var diskPath: []u8 = "game.bin";
     if (!fileExists(diskPath)) { return; }
     var regs: Vec(u32) = allocRegFile(32);
-    var cop0: Vec(u32) = allocRegFile(16);
+    var cop0: Vec(u32) = allocRegFile(32);
     var bus: Bus = allocBus();
     var c: Cpu = freshCpu();
     if (emuBoot(c, bus, regs.ptr, cop0.ptr) == 0) {
@@ -645,7 +646,7 @@ fn tCycRam() u32 {
 // the (zeroed) BIOS actually decodes to, as long as it isn't a GTE op.
 fn tCycBios() u32 {
     var regs: Vec(u32) = allocRegFile(32);
-    var cop0: Vec(u32) = allocRegFile(16);
+    var cop0: Vec(u32) = allocRegFile(32);
     var bus: Bus = allocBus();
     var cpu: Cpu = freshCpuAt(0xBFC00000);       // KSEG1 BIOS entry
     var h: Harness = Harness { cpu: cpu, regs: regs, cop0: cop0, bus: bus };

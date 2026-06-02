@@ -73,7 +73,7 @@ pub const Mcd = struct {
     flag:     u8,
     msb:      u8,
     lsb:      u8,
-    addr:     u16,
+    addr:     u32,
     pend:     u16,
     checksum: u8,
     pad:      [16]u8,
@@ -164,7 +164,7 @@ pub const Mcd = struct {
             const pend: u32 = self.pend as u32;
             const addr: u32 = self.addr as u32;
             const b: u8 = ram[addr];
-            self.addr = (addr + 1) as u16;
+            self.addr = addr + 1;
             self.checksum = self.checksum ^ b;
             self.pend = (pend - 1) as u16;
             if (pend - 1 == 0) {
@@ -187,7 +187,7 @@ pub const Mcd = struct {
             const pend: u32 = self.pend as u32;
             const addr: u32 = self.addr as u32;
             ram[addr] = self.rxData;
-            self.addr = (addr + 1) as u16;
+            self.addr = addr + 1;
             self.pend = (pend - 1) as u16;
             if (pend - 1 == 0) {
                 self.txData = self.rxData;
@@ -223,11 +223,11 @@ pub const Mcd = struct {
         } else if (st == MCD_R_RX_LSB) {
             self.lsb = d;
             const a: u32 = ((self.msb as u32) << 8) | (d as u32);
-            self.addr = (a << 7) as u16;
+            self.addr = (a & 0x3FF) << 7;
         } else if (st == MCD_W_RX_LSB) {
             self.lsb = d;
             const a: u32 = ((self.msb as u32) << 8) | (d as u32);
-            self.addr = (a << 7) as u16;
+            self.addr = (a & 0x3FF) << 7;
         }
     }
 };

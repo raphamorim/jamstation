@@ -385,7 +385,14 @@ pub const Mdec = struct {
         }
         if (off == 4) {
             // Status register — psxe mdec.c:316.
-            var st: u32 = self.wordsRem & 0xFFFF;
+            // Bits 0-15 = "number of parameter words remaining MINUS 1"
+            // (nocash: FFFFh = none). DuckStation `(remaining/2)-1`, Avocado
+            // `(paramCount-1)&0xffff`, mednafen's 0xFFFF sentinel all agree;
+            // psxe (and the old jam code) reported the raw count, so a game
+            // that polls for (status & 0xFFFF)==0xFFFF after a SET_QT/SET_ST
+            // upload to confirm "no params pending" never saw it and never
+            // advanced to DECODE. wordsRem is u32, so 0-1 wraps to 0xFFFF here.
+            var st: u32 = (self.wordsRem - 1) & 0xFFFF;
             st = st | ((self.curBlock & 0x7) << 16);
             if (self.outputBit15  != 0) { st = st | (1 << 23); }
             if (self.outputSigned != 0) { st = st | (1 << 24); }
@@ -429,7 +436,13 @@ pub const Mdec = struct {
                 self.wordsRem = wordsRem - 1;
                 if (wordsRem - 1 == 0) {
                     self.outputEmpty = 0;
-                    self.inputFull = 1;
+                    // dispatch() consumes the whole input FIFO synchronously,
+                    // so by the time the guest reads status the data-in FIFO is
+                    // empty (bit30 = 0), NOT full. The old `inputFull = 1` left
+                    // bit30 stuck at 1 after a SET_QT/SET_ST upload, so a game
+                    // that polls "in-FIFO not full" before issuing the next
+                    // command (the DECODE) would wait forever. Refs report 0.
+                    self.inputFull = 0;
                     self.inputReq = 0;
                     self.busy = 0;
                     self.outputReq = self.enableDma1;

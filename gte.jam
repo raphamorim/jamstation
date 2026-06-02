@@ -600,20 +600,13 @@ pub fn gteIntpl(g: *mut[] u32, sf: u32, lm: u32) {
 // DCPL — depth-cue color light. Like CDP but uses (RC*IR)<<4 to derive
 // the first MAC stage instead of BK+LC*IR. Final stage = FC interpolation.
 pub fn gteDcpl(g: *mut[] u32, sf: u32, lm: u32) {
-    const ir1Pre: i64 = s16ToI64(g[9]);
-    const ir2Pre: i64 = s16ToI64(g[10]);
-    const ir3Pre: i64 = s16ToI64(g[11]);
-    const rgbc: u32 = g[6];
-    const rc: i64 = (rgbc & 0xFF) as i64;
-    const gc: i64 = ((rgbc >> 8) & 0xFF) as i64;
-    const bc: i64 = ((rgbc >> 16) & 0xFF) as i64;
-    var s1: i64 = (rc * ir1Pre) << 4;
-    var s2: i64 = (gc * ir2Pre) << 4;
-    var s3: i64 = (bc * ir3Pre) << 4;
-    s1 = gteClampMac(g, 1, s1, sf); s2 = gteClampMac(g, 2, s2, sf); s3 = gteClampMac(g, 3, s3, sf);
-    g[D_MAC1] = (s1 as u64 & 0xFFFFFFFF) as u32;
-    g[D_MAC2] = (s2 as u64 & 0xFFFFFFFF) as u32;
-    g[D_MAC3] = (s3 as u64 & 0xFFFFFFFF) as u32;
+    // DCPL = far-colour interpolation of (RGBC<<4)*IR. gteFarColorInterp
+    // already consumes the (RC<<4)*IR term raw (matching DuckStation's
+    // in_MAC = (RGBC*IR)<<4 fed straight into InterpolateColor), so the old
+    // separate clampMac pre-stage here was dead — its MAC writes were
+    // immediately overwritten — but it polluted the FLAG register with
+    // spurious MAC1-3 overflow bits. mednafen/DuckStation/Avocado fold the
+    // term directly with no extra clamp, so we drop the dead stage.
     gteFarColorInterp(g, sf, lm);
     const m1: i64 = s32ToI64(g[D_MAC1]);
     const m2: i64 = s32ToI64(g[D_MAC2]);

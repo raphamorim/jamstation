@@ -142,6 +142,12 @@ pub const Cdrom = struct {
     pendingSpeedSwitch: u32,  // psxe pending_speed_switch_delay (1x<->2x resync)
     dataRidx:    u32,
     dataWidx:    u32,
+    // TEMP FMV probe: handleRead calls / XA-audio-filtered / INT1-delivered /
+    // FIFO-drained reads (readData hit rIdx>=wIdx -> returned 0 = underflow).
+    dbgHr:       u32,
+    dbgXa:       u32,
+    dbgInt1:     u32,
+    dbgDrain:    u32,
     // XA-ADPCM per-channel history (2 i32 each). Persists across
     // sectors so block-N's predictor sees block-(N-1)'s tail.
     xaLh:        [2]i32,
@@ -171,6 +177,7 @@ pub const Cdrom = struct {
             // so 0 would read a negative offset (zero pregap), not sector 0.
             delay: 0, lba: 150, pendingLba: 150, pendingSpeedSwitch: 0,
             dataRidx: 0, dataWidx: 0,
+            dbgHr: 0, dbgXa: 0, dbgInt1: 0, dbgDrain: 0,
             xaLh: [0, 0],
             xaRh: [0, 0],
             paramFifo: [0; 32],
@@ -828,8 +835,19 @@ pub const Cdrom = struct {
         }
         if (self.state == CD_STATE_IDLE as u8) { return; }
         if (self.state == CD_STATE_PLAY as u8) { return; }
-        // Hold off until BIOS acks the previous INT.
+        // Hold off until the game acks the previous INT. Re-assert the CPU
+        // IRQ each tick while it is pending AND enabled: if IER bit 0 was
+        // clear when the sector fired (so no IRQ reached the CPU) and the
+        // game enables it afterwards, this delivers the pending INT1 instead
+        // of wedging the drive forever with an unacked, never-delivered INT.
+        // All four reference emulators guarantee a queued INT1 is eventually
+        // delivered (DuckStation cdrom.cpp:1806 "there isn't much that can
+        // stop an INT1 once it's been queued"). Idempotent: irqRaise only ORs
+        // I_STAT, so re-raising an already-set bit each tick is harmless.
         if ((self.ifr as u32 & 0x1F) != 0) {
+            if ((self.ifr as u32 & self.ier as u32 & 0x1F) != 0) {
+                irqRaise(ic, cop0, IC_CDROM);
+            }
             self.delay = 2;
             return;
         }
@@ -864,6 +882,7 @@ pub const Cdrom = struct {
     }
 
     pub fn handleRead(self: mut Self, disc: *mut[] Disc, spu: *mut[] u8) {
+        self.dbgHr = self.dbgHr + 1;
         self.processSetloc();
         if (self.hasDisc == 0) {
             // psxe reports no-disc as SHELLOPEN (0x10), giving INT5(11h,80h)
@@ -877,20 +896,21 @@ pub const Cdrom = struct {
                           CD_ERR_INVALID_SUBFUNC);
             return;
         }
-        // XA-ADPCM audio sectors are consumed by the SPU and are NOT delivered
-        // to the game's data FIFO / do not raise INT1 -- only video/data
-        // sectors are. Without this filter, audio sectors pollute the game's
-        // STR video stream so its frame parser never assembles a frame to
-        // decode (cmdDecode stays 0). Avocado (cdrom.cpp:141) delivers to the
-        // host only when !audio || !realtime; submode is at sector offset 0x12
+        // XA-ADPCM audio sectors are decoded to the SPU, but we STILL deliver
+        // the sector via INT1 + the data FIFO. psxe's cdrom_handle_read raises
+        // INT1 for EVERY data-track sector regardless of submode (it decodes
+        // XA on a separate parallel xa_lba path), and so does real hardware
+        // when no audio filter is set. Suppressing audio-sector INT1s here
+        // (the previous "filter" behaviour, ported from Avocado's filtered
+        // model) desynced games that do SOFTWARE de-interleaving — they expect
+        // one interrupt per sector to track stream position, so dropping the
+        // audio INT1s stalled FMV streaming. submode is at sector offset 0x12
         // (bit 2 = Audio, bit 6 = Real-time).
         const submode: u32 = self.dataBuf[18] as u32;
         const isXaAudio: bool = (submode & 0x04) != 0 && (submode & 0x40) != 0;
         if ((self.mode as u32 & MODE_XA_ADPCM) != 0 && isXaAudio) {
-            self.tryDecodeXa(spu);       // SPU CD-audio (honours the filter)
-            self.pendingLba = lba + 1;   // consume the sector, advance, no INT1
-            self.delay = self.readDelay();
-            return;
+            self.dbgXa = self.dbgXa + 1;
+            self.tryDecodeXa(spu);       // SPU CD-audio; fall through to deliver INT1
         }
 
         var rIdx: u32 = 24;
@@ -903,6 +923,7 @@ pub const Cdrom = struct {
         self.dataWidx = wEnd;
 
         self.ifr = 1;
+        self.dbgInt1 = self.dbgInt1 + 1;
         self.pushResp(self.getStat());
 
         self.pendingLba = lba + 1;   // psxe cdrom_handle_read: deferred via pending_lba, lba promoted on next process_setloc (GetLocL/P returns current sector, not next)
@@ -971,6 +992,11 @@ pub const Cdrom = struct {
             | ((self.mode as u32) << 16)
             | ((self.ifr as u32) << 24);
     }
+    // TEMP FMV probe getters: handleRead calls / XA-filtered / INT1-delivered.
+    pub fn dbgHrCount(self: mut Self) u32   { return self.dbgHr; }
+    pub fn dbgXaCount(self: mut Self) u32   { return self.dbgXa; }
+    pub fn dbgInt1Count(self: mut Self) u32 { return self.dbgInt1; }
+    pub fn dbgDrainCount(self: mut Self) u32 { return self.dbgDrain; }
     // TEMP: pack FIFO state — dataReq(bit28) | dataWidx(<<12) | dataRidx.
     pub fn dbgFifo(self: mut Self) u32 {
         return self.dataRidx | (self.dataWidx << 12) | ((self.dataReq as u32) << 28);
@@ -987,7 +1013,7 @@ pub const Cdrom = struct {
         if (self.dataReq == 0) { return 0; }
         var rIdx: u32 = self.dataRidx;
         const wIdx: u32 = self.dataWidx;
-        if (rIdx >= wIdx) { return 0; }
+        if (rIdx >= wIdx) { self.dbgDrain = self.dbgDrain + 1; return 0; }
         const v: u8 = self.dataBuf[rIdx];
         self.dataRidx = rIdx + 1;
         return v as u32;

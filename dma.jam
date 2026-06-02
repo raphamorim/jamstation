@@ -30,7 +30,7 @@ const SPU_TFIFO_OFF: u32 = 0x1A8;
 //           channel stay "busy" while the test polls CHCR — ps1-tests
 //           spu/memory-transfer testDMAWriteTiming asserts that the
 //           transfer is observable in-flight (loopCount > 0).
-const DMA_STATE_WORDS: u32 = 35;   // [32]=CD-DMA cnt [33]=STR-magic cnt [34]=last hdr word (TEMP FMV probe)
+const DMA_STATE_WORDS: u32 = 39;   // [32]=CD-DMA cnt [33]=STR-magic cnt [34]=last hdr [35]=CD sync [36]=CD BCR [37]=STR word1 [38]=STR word2 (TEMP FMV probe)
 const F_SPU_REMAIN: u32 = 29;
 // TEMP FMV probe: d[30]=mdecIn call count, d[31]=mdecOut call count.
 
@@ -354,11 +354,26 @@ pub fn dmaDoMdecOut(d: *mut[] u32, bus: Bus) {
 // dmaUpdate raises the channel-3 IRQ if enabled.
 pub fn dmaDoCdrom(d: *mut[] u32, bus: Bus) {
     if (!chcrBusy(d, 3)) { return; }
-    var size: u32 = bcrSize(d, 3);
-    if (size == 0) { size = 0x10000; }
+    // CD->RAM is SyncMode 0 (burst: BCR low 16 = word count) or SyncMode 1
+    // (block: low = block size in words, high = block count; total =
+    // size*blocks). The old code used only bcrSize, so a SyncMode-1 read
+    // transferred ONE block instead of all of them — matching psxe but
+    // diverging from all four reference emulators (and the SPU channel here,
+    // which already multiplies). Under-reading made the game re-kick DMA3 per
+    // block, draining a partially-consumed FIFO into zero words.
+    var size: u32 = 0;
+    match (chcrSync(d, 3)) {
+        0 { size = bcrSize(d, 3); if (size == 0) { size = 0x10000; } }
+        1 { size = bcrSize(d, 3) * bcrBlocks(d, 3); }
+        _ { return; }
+    }
+    // TEMP FMV probe: CD DMA sync mode + raw BCR (blocksize | blocks<<16).
+    d[35] = chcrSync(d, 3);
+    d[36] = d[chBase(3) + F_BCR];
     var addr: u32 = d[chBase(3) + F_MADR];
     const step: u32 = chcrStep(d, 3);
     var i: u32 = 0;
+    var capVid: u32 = 0;   // TEMP: this DMA's sector is an STR video sector
     while (i < size) {
         const b0: u32 = bus.cdrom.readData();
         const b1: u32 = bus.cdrom.readData();
@@ -367,8 +382,12 @@ pub fn dmaDoCdrom(d: *mut[] u32, bus: Bus) {
         const w: u32 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
         if (i == 0) {   // TEMP FMV probe: STR header word of each read sector
             d[34] = w;
-            if ((w & 0xFFFF) == 0x0160) { d[33] = d[33] + 1; }
+            if ((w & 0xFFFF) == 0x0160) { d[33] = d[33] + 1; capVid = 1; }
         }
+        // TEMP: STR frame header words 1 (chunkNo|chunksInFrame) and 2 of
+        // the last video sector — to see whether frame assembly can complete.
+        if (capVid != 0 && i == 1) { d[37] = w; }
+        if (capVid != 0 && i == 2) { d[38] = w; }
         ramWrite32(bus, addr, w);
         addr = addr + step;
         i = i + 1;

@@ -101,6 +101,7 @@ const Cpu = struct {
     diagDumped: u32,
     diagExcCount: u32,
     diagWalkCount: u32,
+    lastBiosCall: u32,
 };
 
 const Sdl = struct {
@@ -453,7 +454,10 @@ fn pathEndsWithExe(p: []u8) bool {
 
 fn main() {
     var regs: Vec(u32) = allocRegFile(32);
-    var cop0: Vec(u32) = allocRegFile(16);
+    // 32 COP0 slots (not 16): MFC0/MTC0 take a 5-bit rd (0..31), so a
+    // reserved index like $16+ must land in a valid slot rather than read/
+    // write past the end. Matches PCSX-Redux's 32-entry COP0 array.
+    var cop0: Vec(u32) = allocRegFile(32);
     var bus: Bus = allocBus();
     var c: Cpu = freshCpu();
 
@@ -675,6 +679,9 @@ fn main() {
         // GPUSTAT bit 21 (mode bit 4) = 24bpp display.
         // GPUSTAT bit 23 = display disabled (black screen).
         const dm: u32 = gpuState[47];
+        // Refresh Timer 0's dot-clock divisor from the current display mode
+        // (used when timer 0's clock source is the GPU dot-clock).
+        bus.timer.setDotclock(dm);
         const is24bpp: bool = (dm & 0x10) != 0;
         const displayOff: bool = (gpuState[46] & 0x00800000) != 0;
         // TEMP FMV display probe — ~1x/sec, dump the display config + whether
@@ -707,6 +714,10 @@ fn main() {
             const cdDma: u32 = dmaP[32];   // CD->RAM DMA fire count
             const strMagic: u32 = dmaP[33];   // sectors read with STR magic 0x0160
             const lastHdr: u32 = dmaP[34];    // last read sector's first word
+            const cdSync: u32 = dmaP[35];     // CD DMA sync mode (0 burst / 1 block)
+            const cdBcr: u32 = dmaP[36];      // CD DMA raw BCR (blocksize | blocks<<16)
+            const strW1: u32 = dmaP[37];      // STR frame header word1 (chunkNo | chunksInFrame<<16)
+            const strW2: u32 = dmaP[38];      // STR frame header word2
             var bestY: u32 = 0;
             var bestNz: u32 = 0;
             var yy: u32 = 0;
@@ -743,7 +754,61 @@ fn main() {
                              | ((mo[0xFFF0A] as u32) << 16) | ((mo[0xFFF0B] as u32) << 24);
             const cmdSt: u32 = (mo[0xFFF0C] as u32) | ((mo[0xFFF0D] as u32) << 8)
                              | ((mo[0xFFF0E] as u32) << 16) | ((mo[0xFFF0F] as u32) << 24);
-            print("FMV: 24bpp={b24} cdDma={cdDma} strMagic={strMagic} lastHdr={lastHdr} in={d30} | cmdDecode={cmdDec} cmdQt={cmdQt} cmdSt={cmdSt} done={decCount}\n");
+            print("FMV: 24bpp={b24} cdDma={cdDma} strMagic={strMagic} lastHdr={lastHdr} in={d30} out={d31} | cmdDecode={cmdDec} cmdQt={cmdQt} cmdSt={cmdSt} done={decCount}\n");
+            // CD read pump probe: is handleRead still running during the FMV,
+            // and is the XA filter eating sectors? state(3=READ) / mode /
+            // handleRead-calls / XA-filtered / INT1-delivered.
+            const cdInfo: u32 = bus.cdrom.dbgInfo();
+            const cdState: u32 = cdInfo & 0xFF;
+            const cdMode: u32 = (cdInfo >> 16) & 0xFF;
+            const hrN: u32 = bus.cdrom.dbgHrCount();
+            const xaN: u32 = bus.cdrom.dbgXaCount();
+            const i1N: u32 = bus.cdrom.dbgInt1Count();
+            const drN: u32 = bus.cdrom.dbgDrainCount();
+            print("CD: state={cdState} mode={cdMode} hr={hrN} xaFilt={xaN} int1={i1N} drain={drN} | sync={cdSync} bcr={cdBcr} str1={strW1} str2={strW2}\n");
+            // Where is the CPU spinning during the stall, and the last BIOS
+            // call it made (1xx=A0 2xx=B0 3xx=C0, low byte = function number).
+            const pcNow: u32 = c.pc;
+            const biosCall: u32 = c.lastBiosCall;
+            print("CPU: pc={pcNow} lastBios={biosCall}\n");
+            // The FMV player polls bit24 of *[0x80107DC0] and only advances
+            // its progress counter [0x8010BCD4] when set. Dump the register
+            // pointer, the value it reads, the counter, and the queue index
+            // [0x8010D604] to see what hardware bit it's stuck waiting on.
+            // STR ring/queue state: base ptr, write/read indices, the player
+            // state code [0x80107de8], the gate spin-counter [0x80109b2c], and
+            // the state field of the first 4 slots (0=empty, 1/2/4=in use).
+            // Shows whether the sector processor is FILLING the ring at all.
+            const sbase: u32 = busRead32(bus, 0x8010D6FC);
+            const widx:  u32 = busRead32(bus, 0x8010D5F4);
+            const ridx:  u32 = busRead32(bus, 0x8010D604);
+            const sstate: u32 = busRead32(bus, 0x80107DE8);
+            const gctr:  u32 = busRead32(bus, 0x80109B2C);
+            const sl0: u32 = busRead32(bus, sbase) & 0xFFFF;
+            const sl1: u32 = busRead32(bus, sbase + 32) & 0xFFFF;
+            const sl2: u32 = busRead32(bus, sbase + 64) & 0xFFFF;
+            const sl3: u32 = busRead32(bus, sbase + 96) & 0xFFFF;
+            print("STR: base={sbase} w={widx} r={ridx} state={sstate} gctr={gctr} slots={sl0},{sl1},{sl2},{sl3}\n");
+            // Map the producer's register-pointer table: the DMA CHCR it spin-
+            // waits on [0x80107dd0], and its register write targets [0x80107db0]
+            // / [0x80107db4] / [0x80107dc0]=DMA1CHCR. Reveals which DMA channels
+            // drive the pipeline (to confirm the bit24/synchronous-DMA theory).
+            const rdd0: u32 = busRead32(bus, 0x80107DD0);
+            const rdb0: u32 = busRead32(bus, 0x80107DB0);
+            const rdb4: u32 = busRead32(bus, 0x80107DB4);
+            const rda8: u32 = busRead32(bus, 0x80107DA8);
+            print("REG: waitCHCR={rdd0} wr0={rdb0} wr4={rdb4} rda8={rda8}\n");
+            // De-interleaver ground-truth: MODE flag [0x8010d6e0], the decode
+            // callback ptr [0x80109eac] (0 => decode never invoked), the frame
+            // threshold [0x8010d6ec], and the ridx slot's header (field0=state,
+            // word at +4 = chunkIndex|chunksInFrame<<16).
+            const diMode: u32 = busRead32(bus, 0x8010D6E0);
+            const diCb: u32 = busRead32(bus, 0x80109EAC);
+            const diThr: u32 = busRead32(bus, 0x8010D6EC);
+            const rslot: u32 = sbase + ridx * 32;
+            const rsHdr0: u32 = busRead32(bus, rslot);
+            const rsHdr4: u32 = busRead32(bus, rslot + 4);
+            print("DI: mode={diMode} cb={diCb} thr={diThr} rslot0={rsHdr0} rslot4={rsHdr4}\n");
         }
         if (fullVram) {
             sdlBlit(sdl, vram, 0, 0, VRAM_WIDTH, VRAM_HEIGHT,
