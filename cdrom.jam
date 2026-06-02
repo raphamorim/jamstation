@@ -125,6 +125,7 @@ pub const Cdrom = struct {
     region:      u8,    // 0=Japan, 1=America, 2=Europe
     version:     u8,    // CDR_VERSION_* index
     readOngoing: u8,    // sector pump active
+    xaPlaying:   u8,    // XA-ADPCM streaming active (status reg bit2 ADPBUSY)
     hasDisc:     u8,
     cmdPending:  u8,
     xaFile:      u8,    // SetFilter file
@@ -164,6 +165,7 @@ pub const Cdrom = struct {
             state: 0, prevState: 0, pendingCmd: 0, dataReq: 0,
             mode: 0, discType: 0, region: 1, version: 1,
             readOngoing: 0,
+            xaPlaying: 0,
             hasDisc: 0,
             cmdPending: 0, xaFile: 0, xaChannel: 0,
             seekPrec: 1, prevSpeed: 0,
@@ -262,7 +264,12 @@ pub const Cdrom = struct {
     // Status register at offset 0 (always, regardless of bank).
     pub fn readStatus(self: mut Self) u32 {
         var r: u32 = (self.index as u32) & 0x3;
-        // bit 2: xa_playing — always 0 (no audio implementation).
+        // bit 2 (ADPBUSY): XA-ADPCM streaming active — psxe cdrom_read_status
+        // returns `xa_playing << 2`. Set when a ReadN/ReadS runs in XA mode.
+        // (Brave Fencer's FMV polls this; jam hardcoding 0 made the game
+        // branch away from the decode path — the SECOND trace-diff divergence,
+        // instr ~368.37M.)
+        if (self.xaPlaying != 0) { r = r | 0x04; }
         if (self.paramEmpty()) { r = r | 0x08; }
         if (!self.paramFull())  { r = r | 0x10; }
         if (!self.respEmpty())  { r = r | 0x20; }
@@ -460,6 +467,7 @@ pub const Cdrom = struct {
                 self.state        = CD_STATE_IDLE as u8;
                 self.prevState    = CD_STATE_IDLE as u8;
                 self.readOngoing  = 0;
+                self.xaPlaying    = 0;
                 return;
             }
             self.state = self.prevState;
@@ -522,6 +530,9 @@ pub const Cdrom = struct {
             self.state        = CD_STATE_READ as u8;
             self.prevState    = CD_STATE_READ as u8;
             self.readOngoing  = 1;
+            // psxe impl.c:229/683 — a read in XA-ADPCM mode marks the drive
+            // as XA-streaming (status bit2 ADPBUSY). The game polls this.
+            if ((self.mode as u32 & MODE_XA_ADPCM) != 0) { self.xaPlaying = 1; }
             self.delay = self.readDelay();
             return;
         }
@@ -758,6 +769,7 @@ pub const Cdrom = struct {
             self.pendingLba = 150;
             self.processSetloc();
             self.readOngoing = 0;
+            self.xaPlaying   = 0;
             self.ifr = 2;
             self.pushResp(self.getStat());
             self.state     = CD_STATE_IDLE as u8;
@@ -779,6 +791,7 @@ pub const Cdrom = struct {
             self.pendingCmd   = 0;
             self.busy         = 0;
             self.readOngoing  = 0;
+            self.xaPlaying    = 0;
             return;
         }
         if (cmd == CDL_GETID) {
@@ -1016,6 +1029,13 @@ pub const Cdrom = struct {
     // Read one sector at `lba` into the dataBuf. Returns 1 on success.
     pub fn discReadAt(self: mut Self, disc: *mut[] Disc, lba: u32) i32 {
         return discRead(disc, lba, self.dataBuf.asMutPtr());
+    }
+
+    // TEMP FMV PROBE — CD state for the stuck-loop diagnosis (remove after).
+    pub fn dbgLba(self: mut Self) u32 { return self.lba; }
+    pub fn dbgState(self: mut Self) u32 {
+        return (self.state as u32) | ((self.readOngoing as u32) << 8)
+            | ((self.pendingCmd as u32) << 16);
     }
 
     // Read one byte from the data FIFO (the 0x1F801802 register).

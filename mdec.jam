@@ -72,6 +72,11 @@ pub const Mdec = struct {
     inputSizeB:     u32,
     outputIndex:    u32,
     outputWords:    u32,
+    dbgDecodes:     u32,   // TEMP FMV PROBE: count of completed DECODE ops
+    dbgDecCmd:      u32,   // TEMP FMV PROBE: count of DECODE commands issued
+    dbgCmdWrites:   u32,   // TEMP FMV PROBE: total MDEC0 command words
+    dbgLastOp:      u32,   // TEMP FMV PROBE: last MDEC op seen (0..3)
+    dbgStatusReads: u32,   // TEMP FMV PROBE: count of status-reg (0x1824) reads
     yQuant:  [64]u8,
     uvQuant: [64]u8,
     scale:   [64]i16,
@@ -88,7 +93,8 @@ pub const Mdec = struct {
             inputFull: 0, outputEmpty: 0,
             enableDma0: 0, enableDma1: 0,
             recvColor: 0, inputIndex: 0, inputSizeB: 0,
-            outputIndex: 0, outputWords: 0,
+            outputIndex: 0, outputWords: 0, dbgDecodes: 0, dbgDecCmd: 0,
+            dbgCmdWrites: 0, dbgLastOp: 0, dbgStatusReads: 0,
             yQuant: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
                      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
                      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
@@ -349,6 +355,7 @@ pub const Mdec = struct {
         const op: u32 = (cmd >> 29) & 7;
         if (op == MDEC_CMD_NOP) { return; }
         if (op == MDEC_CMD_DECODE) {
+            self.dbgDecodes = self.dbgDecodes + 1;   // TEMP FMV PROBE
             self.decodeMacroblock(input, output);
             return;
         }
@@ -361,6 +368,13 @@ pub const Mdec = struct {
             return;
         }
     }
+
+    // TEMP FMV PROBE: counts of completed decodes + issued DECODE commands.
+    pub fn dbgDecodeCount(self: mut Self) u32 { return self.dbgDecodes; }
+    pub fn dbgDecCmdCount(self: mut Self) u32 { return self.dbgDecCmd; }
+    pub fn dbgCmdWriteCount(self: mut Self) u32 { return self.dbgCmdWrites; }
+    pub fn dbgLastOpSeen(self: mut Self) u32 { return self.dbgLastOp; }
+    pub fn dbgStatusReadCount(self: mut Self) u32 { return self.dbgStatusReads; }
 
     // ---------- bus dispatch (mdec.c:287/348) ------------------------
     pub fn read32(self: mut Self, output: *mut[] u8, off: u32) u32 {
@@ -380,6 +394,7 @@ pub const Mdec = struct {
             return 0xAAAAAAAA;
         }
         if (off == 4) {
+            self.dbgStatusReads = self.dbgStatusReads + 1;   // TEMP FMV PROBE
             // Status register — psxe mdec.c:316.
             // Bits 0-15 = "number of parameter words remaining MINUS 1"
             // (nocash: FFFFh = none). DuckStation `(remaining/2)-1`, Avocado
@@ -448,6 +463,8 @@ pub const Mdec = struct {
             }
             // Start a new command.
             self.cmd = val;
+            self.dbgCmdWrites = self.dbgCmdWrites + 1;   // TEMP FMV PROBE
+            self.dbgLastOp = (val >> 29) & 7;            // TEMP FMV PROBE
             self.outputReq = 0;
             self.outputEmpty = 1;
             // Clear any stale output count from a prior decode so status
@@ -467,6 +484,7 @@ pub const Mdec = struct {
                 self.busy = 0;
             } else if (op == MDEC_CMD_DECODE) {
                 newWords = val & 0xFFFF;
+                self.dbgDecCmd = self.dbgDecCmd + 1;   // TEMP FMV PROBE
             } else if (op == MDEC_CMD_SET_QT) {
                 self.recvColor = val & 1;
                 if ((val & 1) != 0) { newWords = 32; } else { newWords = 16; }

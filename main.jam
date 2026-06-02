@@ -98,6 +98,9 @@ const Cpu = struct {
     branchTaken: u8,
     halted: u8,
     cycles: u64,
+    traceFp:   u64,   // TEMP REG_TRACE (mirror cpu.jam)
+    traceInit: u32,
+    traceN:    u64,
 };
 
 const Sdl = struct {
@@ -678,6 +681,78 @@ fn main() {
         bus.timer.setDotclock(dm);
         const is24bpp: bool = (dm & 0x10) != 0;
         const displayOff: bool = (gpuState[46] & 0x00800000) != 0;
+        // TEMP FMV PROBE — state disambiguation (stuck vs reaching the FMV).
+        // Prints poly count + display mode + 24bpp flag every 120 frames; the
+        // FMV turns 24bpp ON, while the stuck resource-loop freezes the poly
+        // counter with dm staying 0x27 / is24=0. Remove after the grind.
+        winStartFrames = winStartFrames + 1;
+        if (winStartFrames % 120 == 0) {
+            const pf: u32 = winStartFrames;
+            const ppoly: u32 = bus.gpu.familyCount(1);
+            const pdm: u32 = dm;
+            var p24: u32 = 0;
+            if (is24bpp) { p24 = 1; }
+            const plba: u32 = bus.cdrom.dbgLba();
+            const pcd: u32 = bus.cdrom.dbgState();
+            const pcdState: u32 = pcd & 0xFF;
+            const pcdRead: u32 = (pcd >> 8) & 0xFF;
+            const pcdCmd: u32 = (pcd >> 16) & 0xFF;
+            const pdec: u32 = bus.mdec.dbgDecodeCount();
+            const pdcmd: u32 = bus.mdec.dbgDecCmdCount();
+            const pallcmd: u32 = bus.mdec.dbgCmdWriteCount();
+            const pstr: u32 = bus.mdec.dbgStatusReadCount();
+            const ppc: u32 = c.pc;
+            // The stuck main loop busy-waits for the counter at 0x8006CBB8 to
+            // reach a target (likely the VBlank-callback frame counter). Watch
+            // it: if it never advances, the VSync wait never completes.
+            const vctr: u32 = busRead32(bus, 0x8006CBB8);
+            // FMV STR scheduler state: frame index [0x800EC9CC] + frame-clock
+            // counter [0x800EC9D0] (lh). The decode is gated on this clock
+            // reaching per-frame target times — watch whether it advances.
+            const sIdx: u32 = busRead32(bus, 0x800EC9CC) & 0xFFFF;
+            const sClk: u32 = busRead32(bus, 0x800EC9D0) & 0xFFFF;
+            print("[probe] f {pf} | cd lba {plba} | mdec dec {pdec} | vctr {vctr} | strIdx {sIdx} strClk {sClk}\n");
+            // One-shot dump of the CALLER (the per-frame FMV loop) around ra,
+            // captured mid-streaming. ra points just after the jal to the vsync
+            // wait, so [ra-0xA0, ra+0x20] covers the calling loop's body.
+            if (winStartFrames == 1800) {
+                // Disassembly dump of 0x800d2c88 — the per-frame decode fn the
+                // scheduler calls; should advance the STR clock + decode but
+                // doesn't. Its internal gate (likely a hardware-status read) is
+                // the next layer of the bug.
+                // DMA-callback dispatcher state: which channel's callback is
+                // 0x800d24d0 (the FMV clock-inc), and jam's DICR / I_STAT.
+                const dicrPtr: u32 = busRead32(bus, 0x8006CBC0);
+                const dicr: u32 = busRead32(bus, 0x1F8010F4);
+                const istat: u32 = busRead32(bus, 0x1F801070);
+                const imask: u32 = busRead32(bus, 0x1F801074);
+                print("[dma] dicrPtr {dicrPtr} dicr {dicr} istat {istat} imask {imask}\n");
+                var ci: u32 = 0;
+                while (ci < 7) {
+                    const cb: u32 = busRead32(bus, 0x8006CBC4 + ci * 4);
+                    print("[dma] cbTable[{ci}] {cb}\n");
+                    ci = ci + 1;
+                }
+                // 0x800d24d0 is installed as a BIOS event handler into the
+                // EvCB table at physical 0xE2AC / 0xE2C0. Dump that region to
+                // read each EvCB's class/status/mode/func — the status field
+                // tells us whether the event is ENABLED (so VBLANK should fire
+                // it) or DISABLED (an earlier OpenEvent/EnableEvent divergence).
+                var ea: u32 = 0x8000E260;
+                while (ea < 0x8000E300) {
+                    const ew: u32 = busRead32(bus, ea);
+                    print("[evcb] {ea} {ew}\n");
+                    ea = ea + 4;
+                }
+                // libcd STR control struct around the callback pointer.
+                var la: u32 = 0x8006CBB0;
+                while (la < 0x8006CC00) {
+                    const lw: u32 = busRead32(bus, la);
+                    print("[lib] {la} {lw}\n");
+                    la = la + 4;
+                }
+            }
+        }
         if (fullVram) {
             sdlBlit(sdl, vram, 0, 0, VRAM_WIDTH, VRAM_HEIGHT,
                 false, displayOff);
