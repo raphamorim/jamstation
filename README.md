@@ -17,10 +17,10 @@ LIBRARY_PATH=/opt/homebrew/lib jam -lSDL2 -C opt-level=3 -o jamstation main.jam
 ./jamstation /path/to/SCPH1001.BIN
 ```
 
-- **`BIOS_PATH`** — the PSX BIOS image.
-- **`GAME_PATH`** — optional, dispatched by extension:
-  - `.cue` / `.bin` — disc image; the BIOS bootstraps it off the disc. Pass the **`.cue`**, not the game folder — its `.bin` tracks are resolved relative to the cue (multi-track and spaces in the name are fine, so quote paths with spaces).
-  - `.exe` — a PS-X executable, sideloaded after the BIOS boots.
+- **`BIOS_PATH`** - the PSX BIOS image.
+- **`GAME_PATH`** - optional, dispatched by extension:
+  - `.cue` / `.bin` (disc image); the BIOS bootstraps it off the disc. Pass the **`.cue`**, not the game folder, its `.bin` tracks are resolved relative to the cue (multi-track and spaces in the name are fine, so quote paths with spaces).
+  - `.exe` - a PS-X executable, sideloaded after the BIOS boots.
 
 ## Tested on x86 and macOS arm
 
