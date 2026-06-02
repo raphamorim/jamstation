@@ -28,6 +28,8 @@ LIBRARY_PATH=/opt/homebrew/lib jam -lSDL2 -C opt-level=3 -o jamstation main.jam
 
 ## Controls
 
+![PS1 DualShock Controller](https://coregamingnh.com/cdn/shop/files/PS_DUALSHOCKLG.webp?v=1737998619&width=900)
+
 Keyboard maps to a digital PSX controller in slot 1:
 
 | PSX button | Key       |
