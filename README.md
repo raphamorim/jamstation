@@ -22,6 +22,10 @@ LIBRARY_PATH=/opt/homebrew/lib jam -lSDL2 -C opt-level=3 -o jamstation main.jam
   - `.cue` / `.bin` — disc image; the BIOS bootstraps it off the disc. Pass the **`.cue`**, not the game folder — its `.bin` tracks are resolved relative to the cue (multi-track and spaces in the name are fine, so quote paths with spaces).
   - `.exe` — a PS-X executable, sideloaded after the BIOS boots.
 
+## Tested on x86 and macOS arm
+
+![https://media.mas.to/media_attachments/files/116/674/503/103/746/875/original/5a53ef5936b5095e.jpeg](Suikoden 2 running on jamstation).
+
 ## Controls
 
 Keyboard maps to a digital PSX controller in slot 1:
