@@ -311,10 +311,6 @@ pub const Mdec = struct {
         }
 
         self.outputWords = outBytes / 4;
-        // TEMP FMV probe: monotonic decode counter + last outputWords stashed
-        // at the tail of the 1 MB output buffer (a frame is <256 KB, no clash).
-        writeU32(output, 0xFFFFC, readU32(output, 0xFFFFC) + 1);
-        writeU32(output, 0xFFFF8, self.outputWords);
         self.outputEmpty = 0;
         self.outputIndex = 0;
     }
@@ -461,9 +457,6 @@ pub const Mdec = struct {
             self.inputFull = 0;
             self.busy = 1;
             const op: u32 = (val >> 29) & 7;
-            // TEMP FMV probe: count command words started, per op, at the
-            // output-buffer tail (0xFFF00 + op*4). cmd[1]=DECODE started.
-            writeU32(output, 0xFFF00 + op * 4, readU32(output, 0xFFF00 + op * 4) + 1);
             var newWords: u32 = 0;
             if (op == MDEC_CMD_NOP) {
                 self.busy = 0;

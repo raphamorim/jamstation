@@ -101,7 +101,6 @@ const Cpu = struct {
     diagDumped: u32,
     diagExcCount: u32,
     diagWalkCount: u32,
-    lastBiosCall: u32,
 };
 
 const Sdl = struct {
@@ -634,7 +633,6 @@ fn main() {
     // the drift an integer-ms target would introduce.
     const FRAME_MS: f64 = 1000.0 / 59.94;
     var nextFrameMs: f64 = SDL_GetTicks() as f64;
-    var probeN: u32 = 0;   // TEMP: FMV display probe rate-limiter
     while (!quit) {
         // Game-EXE side-load. Two trigger paths:
         //   1. BIOS jumps to 0x80030000 (real-disc boot handoff).
@@ -684,132 +682,6 @@ fn main() {
         bus.timer.setDotclock(dm);
         const is24bpp: bool = (dm & 0x10) != 0;
         const displayOff: bool = (gpuState[46] & 0x00800000) != 0;
-        // TEMP FMV display probe — ~1x/sec, dump the display config + whether
-        // VRAM holds data at the display origin. Pinpoints "black video":
-        //   off=1            -> display disabled (re-enable not seen)
-        //   24bpp=0 in FMV   -> game/jamstation not in 24bpp mode
-        //   vramNZ=0         -> frame not at (dispX,dispY): wrong origin / no upload
-        //   vramNZ>0 + black -> 24bpp readout (sdlBlit) bug
-        probeN = probeN + 1;
-        if (probeN >= 60) {
-            probeN = 0;
-            var b24: u32 = 0;
-            if (is24bpp) { b24 = 1; }
-            var boff: u32 = 0;
-            if (displayOff) { boff = 1; }
-            const base: u32 = (dispY as u32) * 2048 + (dispX as u32) * 2;
-            var nz: u32 = 0;
-            if (base + 256 < 1048576) {
-                var k: u32 = 0;
-                while (k < 256) {
-                    if (vram[base + k] != 0) { nz = nz + 1; }
-                    k = k + 1;
-                }
-            }
-            // MDEC DMA fire counts (wired in dma.jam) + locate the VRAM row
-            // holding the most data (where the decoded frame actually lands).
-            var dmaP: *mut[] u32 = bus.dma.ptr;
-            const d30: u32 = dmaP[30];
-            const d31: u32 = dmaP[31];
-            const cdDma: u32 = dmaP[32];   // CD->RAM DMA fire count
-            const strMagic: u32 = dmaP[33];   // sectors read with STR magic 0x0160
-            const lastHdr: u32 = dmaP[34];    // last read sector's first word
-            const cdSync: u32 = dmaP[35];     // CD DMA sync mode (0 burst / 1 block)
-            const cdBcr: u32 = dmaP[36];      // CD DMA raw BCR (blocksize | blocks<<16)
-            const strW1: u32 = dmaP[37];      // STR frame header word1 (chunkNo | chunksInFrame<<16)
-            const strW2: u32 = dmaP[38];      // STR frame header word2
-            var bestY: u32 = 0;
-            var bestNz: u32 = 0;
-            var yy: u32 = 0;
-            while (yy < 512) {
-                const rb: u32 = yy * 2048;
-                var rnz: u32 = 0;
-                var j: u32 = 0;
-                while (j < 256) {
-                    if (vram[rb + j] != 0) { rnz = rnz + 1; }
-                    j = j + 1;
-                }
-                if (rnz > bestNz) { bestNz = rnz; bestY = yy; }
-                yy = yy + 16;
-            }
-            // MDEC status (read32 off=4 is a pure read): wordsRem (bits
-            // 0-15), bit27 Data-Out-Req, bit29 busy, bit31 Data-Out-empty.
-            // Tells us WHY DMA1 never fires: output empty (no decode) vs
-            // stuck waiting for input (wordsRem>0/busy) vs ready-but-ignored.
-            const mst: u32 = bus.mdec.read32(bus.mdecOut.ptr, 4);
-            const mWords: u32 = mst & 0xFFFF;
-            const mB27: u32 = (mst >> 27) & 1;
-            const mB31: u32 = (mst >> 31) & 1;
-            // Monotonic decode counter + last outputWords stashed by the MDEC
-            // at the output-buffer tail (offsets 0xFFFFC / 0xFFFF8).
-            var mo: *mut[] u8 = bus.mdecOut.ptr;
-            const decCount: u32 = (mo[0xFFFFC] as u32) | ((mo[0xFFFFD] as u32) << 8)
-                                | ((mo[0xFFFFE] as u32) << 16) | ((mo[0xFFFFF] as u32) << 24);
-            const lastOW: u32 = (mo[0xFFFF8] as u32) | ((mo[0xFFFF9] as u32) << 8)
-                              | ((mo[0xFFFFA] as u32) << 16) | ((mo[0xFFFFB] as u32) << 24);
-            // DECODE/SET_QT/SET_ST command-STARTED counts (op*4 @ 0xFFF00).
-            const cmdDec: u32 = (mo[0xFFF04] as u32) | ((mo[0xFFF05] as u32) << 8)
-                              | ((mo[0xFFF06] as u32) << 16) | ((mo[0xFFF07] as u32) << 24);
-            const cmdQt: u32 = (mo[0xFFF08] as u32) | ((mo[0xFFF09] as u32) << 8)
-                             | ((mo[0xFFF0A] as u32) << 16) | ((mo[0xFFF0B] as u32) << 24);
-            const cmdSt: u32 = (mo[0xFFF0C] as u32) | ((mo[0xFFF0D] as u32) << 8)
-                             | ((mo[0xFFF0E] as u32) << 16) | ((mo[0xFFF0F] as u32) << 24);
-            print("FMV: 24bpp={b24} cdDma={cdDma} strMagic={strMagic} lastHdr={lastHdr} in={d30} out={d31} | cmdDecode={cmdDec} cmdQt={cmdQt} cmdSt={cmdSt} done={decCount}\n");
-            // CD read pump probe: is handleRead still running during the FMV,
-            // and is the XA filter eating sectors? state(3=READ) / mode /
-            // handleRead-calls / XA-filtered / INT1-delivered.
-            const cdInfo: u32 = bus.cdrom.dbgInfo();
-            const cdState: u32 = cdInfo & 0xFF;
-            const cdMode: u32 = (cdInfo >> 16) & 0xFF;
-            const hrN: u32 = bus.cdrom.dbgHrCount();
-            const xaN: u32 = bus.cdrom.dbgXaCount();
-            const i1N: u32 = bus.cdrom.dbgInt1Count();
-            const drN: u32 = bus.cdrom.dbgDrainCount();
-            print("CD: state={cdState} mode={cdMode} hr={hrN} xaFilt={xaN} int1={i1N} drain={drN} | sync={cdSync} bcr={cdBcr} str1={strW1} str2={strW2}\n");
-            // Where is the CPU spinning during the stall, and the last BIOS
-            // call it made (1xx=A0 2xx=B0 3xx=C0, low byte = function number).
-            const pcNow: u32 = c.pc;
-            const biosCall: u32 = c.lastBiosCall;
-            print("CPU: pc={pcNow} lastBios={biosCall}\n");
-            // The FMV player polls bit24 of *[0x80107DC0] and only advances
-            // its progress counter [0x8010BCD4] when set. Dump the register
-            // pointer, the value it reads, the counter, and the queue index
-            // [0x8010D604] to see what hardware bit it's stuck waiting on.
-            // STR ring/queue state: base ptr, write/read indices, the player
-            // state code [0x80107de8], the gate spin-counter [0x80109b2c], and
-            // the state field of the first 4 slots (0=empty, 1/2/4=in use).
-            // Shows whether the sector processor is FILLING the ring at all.
-            const sbase: u32 = busRead32(bus, 0x8010D6FC);
-            const widx:  u32 = busRead32(bus, 0x8010D5F4);
-            const ridx:  u32 = busRead32(bus, 0x8010D604);
-            const sstate: u32 = busRead32(bus, 0x80107DE8);
-            const gctr:  u32 = busRead32(bus, 0x80109B2C);
-            const sl0: u32 = busRead32(bus, sbase) & 0xFFFF;
-            const sl1: u32 = busRead32(bus, sbase + 32) & 0xFFFF;
-            const sl2: u32 = busRead32(bus, sbase + 64) & 0xFFFF;
-            const sl3: u32 = busRead32(bus, sbase + 96) & 0xFFFF;
-            print("STR: base={sbase} w={widx} r={ridx} state={sstate} gctr={gctr} slots={sl0},{sl1},{sl2},{sl3}\n");
-            // Map the producer's register-pointer table: the DMA CHCR it spin-
-            // waits on [0x80107dd0], and its register write targets [0x80107db0]
-            // / [0x80107db4] / [0x80107dc0]=DMA1CHCR. Reveals which DMA channels
-            // drive the pipeline (to confirm the bit24/synchronous-DMA theory).
-            const rdd0: u32 = busRead32(bus, 0x80107DD0);
-            const rdb0: u32 = busRead32(bus, 0x80107DB0);
-            const rdb4: u32 = busRead32(bus, 0x80107DB4);
-            const rda8: u32 = busRead32(bus, 0x80107DA8);
-            print("REG: waitCHCR={rdd0} wr0={rdb0} wr4={rdb4} rda8={rda8}\n");
-            // De-interleaver ground-truth: MODE flag [0x8010d6e0], the decode
-            // callback ptr [0x80109eac] (0 => decode never invoked), the frame
-            // threshold [0x8010d6ec], and the ridx slot's header (field0=state,
-            // word at +4 = chunkIndex|chunksInFrame<<16).
-            const diMode: u32 = busRead32(bus, 0x8010D6E0);
-            const diCb: u32 = busRead32(bus, 0x80109EAC);
-            const diThr: u32 = busRead32(bus, 0x8010D6EC);
-            const rslot: u32 = sbase + ridx * 32;
-            const rsHdr0: u32 = busRead32(bus, rslot);
-            const rsHdr4: u32 = busRead32(bus, rslot + 4);
-            print("DI: mode={diMode} cb={diCb} thr={diThr} rslot0={rsHdr0} rslot4={rsHdr4}\n");
-        }
         if (fullVram) {
             sdlBlit(sdl, vram, 0, 0, VRAM_WIDTH, VRAM_HEIGHT,
                 false, displayOff);

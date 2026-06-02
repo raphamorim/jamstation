@@ -63,8 +63,6 @@ const Cpu = struct {
     diagDumped: u32,
     diagExcCount: u32,
     diagWalkCount: u32,
-    // TEMP FMV probe: last BIOS call, vector id in high byte function in low.
-    lastBiosCall: u32,
 };
 
 // COP0 register indices.
@@ -121,7 +119,6 @@ pub fn freshCpu() Cpu {
         branch: 0, delaySlot: 0, branchTaken: 0, halted: 0,
         cycles: 0,
         diagDumped: 0, diagExcCount: 0, diagWalkCount: 0,
-        lastBiosCall: 0,
     };
     return c;
 }
@@ -1177,11 +1174,6 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         raiseException(c, cop0, CAUSE_IBE);
         return;
     }
-    // TEMP FMV probe: capture BIOS calls (A0/B0/C0 vectors) + the function
-    // number in $t1 ($9). vector_id: 1=A0 2=B0 3=C0.
-    if (pcPhys == 0xA0) { c.lastBiosCall = 0x100 | (gprRead(regs, 9) & 0xFF); }
-    else if (pcPhys == 0xB0) { c.lastBiosCall = 0x200 | (gprRead(regs, 9) & 0xFF); }
-    else if (pcPhys == 0xC0) { c.lastBiosCall = 0x300 | (gprRead(regs, 9) & 0xFF); }
 
     // Take an external interrupt before issuing the next instruction —
     // matches psxe's check at the top of psx_cpu_cycle, after fetch and

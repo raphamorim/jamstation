@@ -142,12 +142,6 @@ pub const Cdrom = struct {
     pendingSpeedSwitch: u32,  // psxe pending_speed_switch_delay (1x<->2x resync)
     dataRidx:    u32,
     dataWidx:    u32,
-    // TEMP FMV probe: handleRead calls / XA-audio-filtered / INT1-delivered /
-    // FIFO-drained reads (readData hit rIdx>=wIdx -> returned 0 = underflow).
-    dbgHr:       u32,
-    dbgXa:       u32,
-    dbgInt1:     u32,
-    dbgDrain:    u32,
     // XA-ADPCM per-channel history (2 i32 each). Persists across
     // sectors so block-N's predictor sees block-(N-1)'s tail.
     xaLh:        [2]i32,
@@ -177,7 +171,6 @@ pub const Cdrom = struct {
             // so 0 would read a negative offset (zero pregap), not sector 0.
             delay: 0, lba: 150, pendingLba: 150, pendingSpeedSwitch: 0,
             dataRidx: 0, dataWidx: 0,
-            dbgHr: 0, dbgXa: 0, dbgInt1: 0, dbgDrain: 0,
             xaLh: [0, 0],
             xaRh: [0, 0],
             paramFifo: [0; 32],
@@ -882,7 +875,6 @@ pub const Cdrom = struct {
     }
 
     pub fn handleRead(self: mut Self, disc: *mut[] Disc, spu: *mut[] u8) {
-        self.dbgHr = self.dbgHr + 1;
         self.processSetloc();
         if (self.hasDisc == 0) {
             // psxe reports no-disc as SHELLOPEN (0x10), giving INT5(11h,80h)
@@ -909,7 +901,6 @@ pub const Cdrom = struct {
         const submode: u32 = self.dataBuf[18] as u32;
         const isXaAudio: bool = (submode & 0x04) != 0 && (submode & 0x40) != 0;
         if ((self.mode as u32 & MODE_XA_ADPCM) != 0 && isXaAudio) {
-            self.dbgXa = self.dbgXa + 1;
             self.tryDecodeXa(spu);       // SPU CD-audio; fall through to deliver INT1
         }
 
@@ -923,7 +914,6 @@ pub const Cdrom = struct {
         self.dataWidx = wEnd;
 
         self.ifr = 1;
-        self.dbgInt1 = self.dbgInt1 + 1;
         self.pushResp(self.getStat());
 
         self.pendingLba = lba + 1;   // psxe cdrom_handle_read: deferred via pending_lba, lba promoted on next process_setloc (GetLocL/P returns current sector, not next)
@@ -983,37 +973,12 @@ pub const Cdrom = struct {
         return discRead(disc, lba, self.dataBuf.asMutPtr());
     }
 
-    // Debug: expose read position + packed state so the FMV probe can
-    // tell whether the drive is actively streaming sectors or idle.
-    pub fn dbgLba(self: mut Self) u32 { return self.lba; }
-    pub fn dbgInfo(self: mut Self) u32 {
-        return (self.state as u32)
-            | ((self.readOngoing as u32) << 8)
-            | ((self.mode as u32) << 16)
-            | ((self.ifr as u32) << 24);
-    }
-    // TEMP FMV probe getters: handleRead calls / XA-filtered / INT1-delivered.
-    pub fn dbgHrCount(self: mut Self) u32   { return self.dbgHr; }
-    pub fn dbgXaCount(self: mut Self) u32   { return self.dbgXa; }
-    pub fn dbgInt1Count(self: mut Self) u32 { return self.dbgInt1; }
-    pub fn dbgDrainCount(self: mut Self) u32 { return self.dbgDrain; }
-    // TEMP: pack FIFO state — dataReq(bit28) | dataWidx(<<12) | dataRidx.
-    pub fn dbgFifo(self: mut Self) u32 {
-        return self.dataRidx | (self.dataWidx << 12) | ((self.dataReq as u32) << 28);
-    }
-    // TEMP CD-state trace: the delay countdown, and pending cmd | prevState.
-    pub fn dbgDelay(self: mut Self) u32 { return self.delay; }
-    pub fn dbgPend(self: mut Self) u32 {
-        return (self.pendingCmd as u32) | ((self.prevState as u32) << 8)
-            | ((self.busy as u32) << 16);
-    }
-
     // Read one byte from the data FIFO (the 0x1F801802 register).
     pub fn readData(self: mut Self) u32 {
         if (self.dataReq == 0) { return 0; }
         var rIdx: u32 = self.dataRidx;
         const wIdx: u32 = self.dataWidx;
-        if (rIdx >= wIdx) { self.dbgDrain = self.dbgDrain + 1; return 0; }
+        if (rIdx >= wIdx) { return 0; }
         const v: u8 = self.dataBuf[rIdx];
         self.dataRidx = rIdx + 1;
         return v as u32;

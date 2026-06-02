@@ -65,7 +65,6 @@ const Cpu = struct {
     diagDumped: u32,
     diagExcCount: u32,
     diagWalkCount: u32,
-    lastBiosCall: u32,
 };
 
 

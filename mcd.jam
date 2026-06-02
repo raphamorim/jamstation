@@ -73,7 +73,7 @@ pub const Mcd = struct {
     flag:     u8,
     msb:      u8,
     lsb:      u8,
-    addr:     u32,
+    addr:     u16,
     pend:     u16,
     checksum: u8,
     pad:      [16]u8,
@@ -109,101 +109,101 @@ pub const Mcd = struct {
     // Returns the byte the host should latch into SIO0's RX register.
     pub fn read(self: mut Self, ram: *mut[] u8) u32 {
         const st: u32 = self.state as u32;
-        if (st == MCD_TX_HIZ) {
-            self.txData = 0xFF;
-        } else if (st == MCD_TX_FLG) {
-            // psxe patch: if the host's last RX was 0x81/0x01 the card
-            // bails out — game-side probe code expects 0xFF when it
-            // tries to ping us by sending the dest byte twice.
-            const rx: u32 = self.rxData as u32;
-            if (rx == 0x81 || rx == 0x01) {
+        match (st) {
+            MCD_TX_HIZ { self.txData = 0xFF; }
+            MCD_TX_FLG {
+                // psxe patch: if the host's last RX was 0x81/0x01 the card
+                // bails out — game-side probe code expects 0xFF when it
+                // tries to ping us by sending the dest byte twice.
+                const rx: u32 = self.rxData as u32;
+                if (rx == 0x81 || rx == 0x01) {
+                    self.txReady = 1;
+                    self.txData = 0xFF;
+                    self.state = MCD_TX_HIZ as u8;
+                    return 0xFF;
+                }
+                self.txData = self.flag;
+                self.flag = 0;          // "first access" flag is one-shot
+            }
+            MCD_TX_ID1 { self.txData = 0x5A; }
+            MCD_TX_ID2 {
+                // Choose subprotocol based on the mode byte the host sent
+                // earlier.
                 self.txReady = 1;
-                self.txData = 0xFF;
-                self.state = MCD_TX_HIZ as u8;
-                return 0xFF;
+                self.txData = 0x5D;
+                const m: u32 = self.mode as u32;
+                if (m == 0x52) {                            // 'R' = read
+                    self.state = MCD_R_RX_MSB as u8;
+                } else if (m == 0x57) {                     // 'W' = write
+                    self.state = MCD_W_RX_MSB as u8;
+                } else if (m == 0x53) {                     // 'S' = status
+                    self.state = MCD_S_TX_ACK1 as u8;
+                } else {
+                    // Unknown mode — drop the slot.
+                    self.txReady = 0;
+                    self.txData = 0xFF;
+                    self.state = MCD_TX_HIZ as u8;
+                }
+                return self.txData as u32;
             }
-            self.txData = self.flag;
-            self.flag = 0;          // "first access" flag is one-shot
-        } else if (st == MCD_TX_ID1) {
-            self.txData = 0x5A;
-        } else if (st == MCD_TX_ID2) {
-            // Choose subprotocol based on the mode byte the host sent
-            // earlier.
-            self.txReady = 1;
-            self.txData = 0x5D;
-            const m: u32 = self.mode as u32;
-            if (m == 0x52) {                            // 'R' = read
-                self.state = MCD_R_RX_MSB as u8;
-            } else if (m == 0x57) {                     // 'W' = write
-                self.state = MCD_W_RX_MSB as u8;
-            } else if (m == 0x53) {                     // 'S' = status
-                self.state = MCD_S_TX_ACK1 as u8;
-            } else {
-                // Unknown mode — drop the slot.
+            MCD_R_RX_MSB { self.txData = 0x00; }
+            MCD_R_RX_LSB { self.txData = self.msb; }
+            MCD_R_TX_ACK1 { self.txData = 0x5C; }
+            MCD_R_TX_ACK2 { self.txData = 0x5D; }
+            MCD_R_TX_MSB {
+                self.txData = self.msb;
+                self.checksum = self.msb;
+            }
+            MCD_R_TX_LSB {
+                self.txData = self.lsb;
+                self.checksum = self.checksum ^ self.lsb;
+                self.pend = 128;
+            }
+            MCD_R_TX_DATA {
+                const pend: u32 = self.pend as u32;
+                const addr: u32 = self.addr as u32;
+                const b: u8 = ram[addr];
+                self.addr = (addr + 1) as u16;
+                self.checksum = self.checksum ^ b;
+                self.pend = (pend - 1) as u16;
+                if (pend - 1 == 0) {
+                    self.txData = b;
+                } else {
+                    return b as u32;
+                }
+            }
+            MCD_R_TX_CHK { self.txData = self.checksum; }
+            MCD_R_TX_MEB {
                 self.txReady = 0;
-                self.txData = 0xFF;
                 self.state = MCD_TX_HIZ as u8;
+                return 0x47;            // 'G' = good end marker
             }
-            return self.txData as u32;
-        } else if (st == MCD_R_RX_MSB) {
-            self.txData = 0x00;
-        } else if (st == MCD_R_RX_LSB) {
-            self.txData = self.msb;
-        } else if (st == MCD_R_TX_ACK1) {
-            self.txData = 0x5C;
-        } else if (st == MCD_R_TX_ACK2) {
-            self.txData = 0x5D;
-        } else if (st == MCD_R_TX_MSB) {
-            self.txData = self.msb;
-            self.checksum = self.msb;
-        } else if (st == MCD_R_TX_LSB) {
-            self.txData = self.lsb;
-            self.checksum = self.checksum ^ self.lsb;
-            self.pend = 128;
-        } else if (st == MCD_R_TX_DATA) {
-            const pend: u32 = self.pend as u32;
-            const addr: u32 = self.addr as u32;
-            const b: u8 = ram[addr];
-            self.addr = addr + 1;
-            self.checksum = self.checksum ^ b;
-            self.pend = (pend - 1) as u16;
-            if (pend - 1 == 0) {
-                self.txData = b;
-            } else {
-                return b as u32;
+            MCD_W_RX_MSB { self.txData = 0x00; }
+            MCD_W_RX_LSB {
+                self.txData = self.msb;
+                self.pend = 128;
             }
-        } else if (st == MCD_R_TX_CHK) {
-            self.txData = self.checksum;
-        } else if (st == MCD_R_TX_MEB) {
-            self.txReady = 0;
-            self.state = MCD_TX_HIZ as u8;
-            return 0x47;            // 'G' = good end marker
-        } else if (st == MCD_W_RX_MSB) {
-            self.txData = 0x00;
-        } else if (st == MCD_W_RX_LSB) {
-            self.txData = self.msb;
-            self.pend = 128;
-        } else if (st == MCD_W_RX_DATA) {
-            const pend: u32 = self.pend as u32;
-            const addr: u32 = self.addr as u32;
-            ram[addr] = self.rxData;
-            self.addr = addr + 1;
-            self.pend = (pend - 1) as u16;
-            if (pend - 1 == 0) {
-                self.txData = self.rxData;
-            } else {
-                return self.rxData as u32;
+            MCD_W_RX_DATA {
+                const pend: u32 = self.pend as u32;
+                const addr: u32 = self.addr as u32;
+                ram[addr] = self.rxData;
+                self.addr = (addr + 1) as u16;
+                self.pend = (pend - 1) as u16;
+                if (pend - 1 == 0) {
+                    self.txData = self.rxData;
+                } else {
+                    return self.rxData as u32;
+                }
             }
-        } else if (st == MCD_W_RX_CHK || st == MCD_W_RX_CHK2) {
-            self.txData = self.rxData;
-        } else if (st == MCD_W_TX_ACK1) {
-            self.txData = 0x5C;
-        } else if (st == MCD_W_TX_ACK2) {
-            self.txData = 0x5D;
-        } else if (st == MCD_W_TX_MEB) {
-            self.txReady = 0;
-            self.state = MCD_TX_HIZ as u8;
-            return 0x47;
+            MCD_W_RX_CHK | MCD_W_RX_CHK2 { self.txData = self.rxData; }
+            MCD_W_TX_ACK1 { self.txData = 0x5C; }
+            MCD_W_TX_ACK2 { self.txData = 0x5D; }
+            MCD_W_TX_MEB {
+                self.txReady = 0;
+                self.state = MCD_TX_HIZ as u8;
+                return 0x47;
+            }
+            _ { }
         }
         self.txReady = 1;
         self.state = (self.state + 1) as u8;
@@ -216,18 +216,15 @@ pub const Mcd = struct {
         const d: u8 = (data & 0xFF) as u8;
         self.rxData = d;
         const st: u32 = self.state as u32;
-        if (st == MCD_TX_FLG) {
-            self.mode = d;
-        } else if (st == MCD_R_RX_MSB || st == MCD_W_RX_MSB) {
-            self.msb = d;
-        } else if (st == MCD_R_RX_LSB) {
-            self.lsb = d;
-            const a: u32 = ((self.msb as u32) << 8) | (d as u32);
-            self.addr = (a & 0x3FF) << 7;
-        } else if (st == MCD_W_RX_LSB) {
-            self.lsb = d;
-            const a: u32 = ((self.msb as u32) << 8) | (d as u32);
-            self.addr = (a & 0x3FF) << 7;
+        match (st) {
+            MCD_TX_FLG { self.mode = d; }
+            MCD_R_RX_MSB | MCD_W_RX_MSB { self.msb = d; }
+            MCD_R_RX_LSB | MCD_W_RX_LSB {
+                self.lsb = d;
+                const a: u32 = ((self.msb as u32) << 8) | (d as u32);
+                self.addr = (a << 7) as u16;
+            }
+            _ { }
         }
     }
 };
