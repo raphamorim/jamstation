@@ -103,7 +103,12 @@ pub fn xaDecodeBlock(secBuf: *mut[] u8,
                      idx: u32, blk: u32, nib: u32,
                      dst: *mut[] i32, hist: *mut[] i32) {
     const hdr: u32 = secBuf[idx + 4 + blk * 2 + nib] as u32;
-    const shift: i32 = 12 - ((hdr & 0x0F) as i32);
+    // Reserved ADPCM shift values 13..15 act as 9 on hardware (duckstation
+    // cdrom.cpp:285-289). psxe's naive `12 - (hdr&0xF)` leaves shift negative
+    // and the `old << shift` below is then an undefined negative shift; clamp.
+    var shiftVal: i32 = (hdr & 0x0F) as i32;
+    if (shiftVal > 12) { shiftVal = 9; }
+    const shift: i32 = 12 - shiftVal;
     const filter: u32 = (hdr >> 4) & 3;     // psxe masks to 0x30 then >>4
     const f0: i32 = xaPosCoef(filter);
     const f1: i32 = xaNegCoef(filter);

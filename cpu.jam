@@ -1208,6 +1208,12 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         // (cpu.c psx_cpu_cycle: total_cycles += last_cycles, then return).
         var irqCyc: u64 = fetchCyc;
         if ((irqOpc & 0xFE000000) == 0x4A000000) {
+            // psxe runs DO_PENDING_LOAD as the first statement of this
+            // GTE-wins branch (cpu.c:369-371), and duckstation flushes the
+            // load on every exception. Commit the pending delayed load so the
+            // handler observes the loaded value (without this it commits one
+            // instruction late, at the handler's first instruction).
+            commitLoad(c, regs);
             gteExec(bus.gte.ptr, irqOpc);
             irqCyc = irqCyc + (gteOpCycles(irqOpc) as u64);
         }

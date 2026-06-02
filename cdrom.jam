@@ -31,7 +31,7 @@ const { Disc, discRead, discLoaded,
         discTrackCount, discTrackLba, discTrackNumber, discQuery } = import("disc");
 const {
     xaSectorIsAudio, xaSectorMatchesFilter, xaSectorIsStereo,
-    xaDecodeSector
+    xaSectorIs18kHz, xaDecodeSector
 } = import("xa");
 const { spuPushCdSample } = import("spu");
 
@@ -146,6 +146,10 @@ pub const Cdrom = struct {
     // sectors so block-N's predictor sees block-(N-1)'s tail.
     xaLh:        [2]i32,
     xaRh:        [2]i32,
+    // Last resampled OUTPUT sample per channel — the `ls` seed for the next
+    // sector's XA→44.1kHz rate conversion (psxe xa_prev_left/right_sample).
+    xaPrevL:     i32,
+    xaPrevR:     i32,
     // Parameter / response FIFOs. Each is a 32-byte ring with u8
     // head/tail; the indexes wrap modulo 32 via `& 0x1F`, and the
     // empty test compares the raw head/tail bytes directly.
@@ -173,6 +177,7 @@ pub const Cdrom = struct {
             dataRidx: 0, dataWidx: 0,
             xaLh: [0, 0],
             xaRh: [0, 0],
+            xaPrevL: 0, xaPrevR: 0,
             paramFifo: [0; 32],
             respFifo:  [0; 32],
             dataBuf:   [0; 2352],
@@ -948,24 +953,54 @@ pub const Cdrom = struct {
                                       monoBuf.asMutPtr(),
                                       self.xaLh.asMutPtr(),
                                       self.xaRh.asMutPtr());
-        var k: u32 = 0;
-        while (k < n) {
-            var l: i32 = 0;
-            var r: i32 = 0;
-            if (stereo) {
-                l = leftBuf[k];
-                r = rightBuf[k];
-            } else {
-                l = monoBuf[k];
-                r = monoBuf[k];
+        // Resample from the sector's native rate (37800 Hz, or 18900 Hz for an
+        // f18khz sector) to the SPU's 44100 Hz output rate before pushing. The
+        // SPU CD FIFO is drained one entry per 44100 Hz output sample, so
+        // pushing native-rate samples 1:1 plays XA ~17% too fast and overruns
+        // the FIFO (most samples dropped → warble). Faithful port of psxe
+        // cdrom_resample_xa_buf (audio.c:52-86): conceptually a 7×-upsample —
+        // whose `(k+1)/8` integer-divides to 0, making it a sample-and-hold of
+        // the previous source sample — then decimate by m=f18khz?3:6, yielding
+        // `resampleCount` samples at 44100 Hz. Output j samples source index
+        // q-1 where q=(j*m)/7; q==0 uses the previous sector's last output
+        // sample (psxe's `ls`, carried in xaPrevL/R). n (2016 stereo / 4032
+        // mono) bounds the source; q-1 never reaches it for any valid j.
+        const f18: bool = xaSectorIs18kHz(scratch.asPtr());
+        var m: u32 = 6;
+        if (f18) { m = 3; }
+        var resampleCount: u32 = 2352;
+        if (!stereo) { resampleCount = 4704; }
+        if (f18) { resampleCount = resampleCount * 2; }
+        const lsL: i32 = self.xaPrevL;
+        const lsR: i32 = self.xaPrevR;
+        var outL: i32 = lsL;
+        var outR: i32 = lsR;
+        var j: u32 = 0;
+        while (j < resampleCount) {
+            const q: u32 = (j * m) / 7;
+            outL = lsL;
+            outR = lsR;
+            if (q != 0) {
+                var si: u32 = q - 1;
+                if (si >= n) { si = n - 1; }   // n = native sample count (2016/4032)
+                if (stereo) {
+                    outL = leftBuf[si];
+                    outR = rightBuf[si];
+                } else {
+                    outL = monoBuf[si];
+                    outR = monoBuf[si];
+                }
             }
-            if (l < -32768) { l = -32768; }
-            if (l > 32767)  { l = 32767; }
-            if (r < -32768) { r = -32768; }
-            if (r > 32767)  { r = 32767; }
-            spuPushCdSample(spu, (l as u32) & 0xFFFF, (r as u32) & 0xFFFF);
-            k = k + 1;
+            if (outL < -32768) { outL = -32768; }
+            if (outL > 32767)  { outL = 32767; }
+            if (outR < -32768) { outR = -32768; }
+            if (outR > 32767)  { outR = 32767; }
+            spuPushCdSample(spu, (outL as u32) & 0xFFFF, (outR as u32) & 0xFFFF);
+            j = j + 1;
         }
+        // Carry this sector's last output sample as the next sector's ls seed.
+        self.xaPrevL = outL;
+        self.xaPrevR = outR;
     }
 
     // Read one sector at `lba` into the dataBuf. Returns 1 on success.

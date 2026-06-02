@@ -450,6 +450,11 @@ pub const Mdec = struct {
             self.cmd = val;
             self.outputReq = 0;
             self.outputEmpty = 1;
+            // Clear any stale output count from a prior decode so status
+            // bit 31 (out-FIFO-empty) and bit 27 (out-request) read correctly
+            // after a SET_QT/SET_ST that doesn't write output (duckstation
+            // clears the out FIFO on every command parse, mdec.cpp:433).
+            self.outputWords = 0;
             self.outputBit15  = (val >> 25) & 1;
             self.outputSigned = (val >> 26) & 1;
             self.outputDepth  = (val >> 27) & 3;
@@ -494,6 +499,12 @@ pub const Mdec = struct {
                 self.outputReq = 0;
                 self.inputFull = 0;
                 self.outputEmpty = 1;
+                // Status bit 31 (out-FIFO-empty) is computed from outputWords,
+                // so it must be cleared here too or a reset issued with
+                // undrained output would report not-empty (duckstation SoftReset
+                // clears the out FIFO, mdec.cpp:330-344).
+                self.outputWords = 0;
+                self.outputIndex = 0;
                 self.curBlock = 4;
             }
             return;
