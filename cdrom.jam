@@ -316,12 +316,14 @@ pub const Cdrom = struct {
                 var delay: u32 = CD_DELAY_FR;
                 if ((val & 0xFF) == CDL_INIT) { delay = CD_DELAY_INIT_FR; }
                 self.delay = delay;
-                // psxe cdrom.c:668-669: a command issued while a read is in
-                // progress raises BUSYSTS (status bit 7) until the command's
-                // first response is ready. Without this, a game whose CD-sync
-                // polls BUSYSTS during streaming never sees the busy edge and
-                // spins re-issuing SetMode/SetLoc/SeekL/ReadN (FMV hang).
-                if (self.prevState == CD_STATE_READ as u8) { self.busy = 1; }
+                // psxe's cdrom_write_cmd checks `if (state == CD_STATE_READ) busy=1`
+                // (cdrom.c:683) but `state` was just set to TX_RESP1 two lines above
+                // (cdrom.c:669), so that branch is ALWAYS FALSE — psxe never raises
+                // BUSYSTS from a command write. We must not either: asserting busy on
+                // the mid-read GetlocL/Getstat polls that the BFM/Suikoden FMV loader
+                // spams makes the game see the drive busy where psxe shows it idle, so
+                // it re-reads the resource sectors forever and never triggers the MDEC
+                // decode (FMV black-screen).
             }
             // Push parameter byte.
             2 { self.pushParam(val); }
@@ -483,7 +485,11 @@ pub const Cdrom = struct {
             self.ifr = 3;
             self.pushResp(self.getStat());
             self.state = CD_STATE_TX_RESP2 as u8;
-            self.delay = CD_DELAY_INIT_FR;
+            // psxe cdrom_cmd_init (impl.c:308) sets the 2nd-response delay to
+            // CD_DELAY_1MS (33869), NOT CD_DELAY_INIT_FR (81102). The 47233-cyc
+            // gap made jam's Init INT2 fire late, slipping the CD IRQ at ~164.8M
+            // (the next trace divergence after the GPU-acc/-ffast-math one).
+            self.delay = CD_DELAY_1MS;
             return;
         }
         if (cmd == CDL_SEEKL) {
@@ -855,20 +861,24 @@ pub const Cdrom = struct {
             // command in TX_RESP1 incurs a delay.
             if (self.state == CD_STATE_READ as u8) {
                 self.processSetloc();
-                // First sector after a command: add psxe's pending
-                // speed-switch resync (0 unless SetMode just flipped 1x<->2x),
-                // consumed once. Normal reads are unchanged.
-                self.delay = self.readDelay() + 4 * 33869 + self.pendingSpeedSwitch;
+                // First sector after a command uses psxe's CD_DELAY_ONGOING_READ
+                // (= readDelay + 4ms). psxe COMPUTES a speed-switch resync delay
+                // but then OVERWRITES it with CD_DELAY_ONGOING_READ (cdrom.c:567),
+                // so it never applies; adding pendingSpeedSwitch (~650ms once)
+                // delayed the first FMV sector vs psxe. Drop it; just consume it.
+                self.delay = self.readDelay() + 4 * 33869;
                 self.pendingSpeedSwitch = 0;
             }
         } else if (self.state == CD_STATE_TX_RESP2 as u8) {
             self.executeResp2(disc);
             if (self.state == CD_STATE_READ as u8) {
                 self.processSetloc();
-                // First sector after a command: add psxe's pending
-                // speed-switch resync (0 unless SetMode just flipped 1x<->2x),
-                // consumed once. Normal reads are unchanged.
-                self.delay = self.readDelay() + 4 * 33869 + self.pendingSpeedSwitch;
+                // First sector after a command uses psxe's CD_DELAY_ONGOING_READ
+                // (= readDelay + 4ms). psxe COMPUTES a speed-switch resync delay
+                // but then OVERWRITES it with CD_DELAY_ONGOING_READ (cdrom.c:567),
+                // so it never applies; adding pendingSpeedSwitch (~650ms once)
+                // delayed the first FMV sector vs psxe. Drop it; just consume it.
+                self.delay = self.readDelay() + 4 * 33869;
                 self.pendingSpeedSwitch = 0;
             }
         } else if (self.state == CD_STATE_READ as u8) {

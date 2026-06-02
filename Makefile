@@ -9,10 +9,15 @@ ifeq ($(UNAME_S),Darwin)
     SDL_LIB ?= /opt/homebrew/lib
     SDL_INC ?= /opt/homebrew/include
     RUN_ENV := DYLD_LIBRARY_PATH=$(SDL_LIB)
+    # libobjc: sdl.jam's disableAppNap() calls the ObjC runtime to switch off
+    # macOS App Nap (which otherwise stalls the emulator when the window is
+    # unfocused). The call is @isDarwin()-guarded, so -lobjc is Darwin-only.
+    OBJC_LIB := -lobjc
 else
     SDL_LIB ?= /usr/lib
     SDL_INC ?= /usr/include
     RUN_ENV := LD_LIBRARY_PATH=$(SDL_LIB)
+    OBJC_LIB :=
 endif
 
 # Point at the std/ directory in the in-tree jam build. The installed
@@ -27,10 +32,10 @@ test:
 	$(BUILD_ENV) $(JAM) test tests.jam
 
 build:
-	$(BUILD_ENV) $(JAM) -lSDL2 -o $(BIN) main.jam
+	$(BUILD_ENV) $(JAM) -lSDL2 $(OBJC_LIB) -o $(BIN) main.jam
 
 release:
-	$(BUILD_ENV) $(JAM) -C opt-level=3 -lSDL2 -o $(BIN) main.jam
+	$(BUILD_ENV) $(JAM) -C opt-level=3 -lSDL2 $(OBJC_LIB) -o $(BIN) main.jam
 
 run: build
 	$(RUN_ENV) ./$(BIN)

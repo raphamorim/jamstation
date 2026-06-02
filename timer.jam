@@ -38,17 +38,13 @@ pub const TimerChannel = struct {
     }
 };
 
-// Aggregate timer state for the chip. Four shared blank-line flags
-// (`hblank` / `prevHblank` / `vblank` / `prevVblank`) drive sync-mode
-// behavior; `channels` carries the three 16-bit timers; `subtick`
-// is the sub-cycle accumulator for timer 2's /8 clock divisor.
+// Aggregate timer state for the chip. Two shared blank-line flags
+// (`hblank` / `vblank`) drive sync-mode behavior; `channels` carries the
+// three 16-bit timers.
 pub const Timer = struct {
     hblank:     u32,
-    prevHblank: u32,
     vblank:     u32,
-    prevVblank: u32,
     channels:   [3]TimerChannel,
-    subtick:    u32,
     // Timer 0 dot-clock ticks per sysclk cycle = (11/7)/hdiv, refreshed from
     // the GPU display mode each frame (setDotclock). Mirrors psxe
     // timer_get_dotclock_div. Default = 320-wide (hdiv 8).
@@ -56,13 +52,12 @@ pub const Timer = struct {
 
     pub fn init() Self {
         return Self {
-            hblank: 0, prevHblank: 0, vblank: 0, prevVblank: 0,
+            hblank: 0, vblank: 0,
             channels: [
                 TimerChannel.init(),
                 TimerChannel.init(),
                 TimerChannel.init(),
             ],
-            subtick: 0,
             dotDiv: 11.0 / 7.0 / 8.0,
         };
     }
@@ -159,19 +154,22 @@ pub const Timer = struct {
     pub fn handleIrq(self: mut Self, idx: u32,
                      ic: *mut[] u32, cop0: *mut[] u32) {
         // psxe timer_handle_irq compares the FLOAT counter directly to the
-        // target and to 65535.0f.
+        // target and to 65535.0f with strict `>` (timer.c:236-237). jam had
+        // used `>=` (toward hardware/duckstation), but that fires the timer
+        // IRQ one tick earlier than psxe on every exact landing — a per-IRQ
+        // delivery-timing divergence from the FMV's parity reference. Match psxe.
         const counter: f32 = self.channels[idx].counter;
         const target:  u32 = self.channels[idx].target;
         var fireIrq: u32 = 0;
 
-        if (counter >= (target as f32)) {
+        if (counter > (target as f32)) {
             self.channels[idx].targetReached = 1;
             if (self.channels[idx].resetTarget != 0) {
                 self.channels[idx].counter = 0.0;
             }
             if (self.channels[idx].irqTarget != 0) { fireIrq = 1; }
         }
-        if (counter >= 65535.0) {
+        if (counter > 65535.0) {
             self.channels[idx].counter = 0.0;
             self.channels[idx].maxReached = 1;
             if (self.channels[idx].irqMax != 0) { fireIrq = 1; }
@@ -299,7 +297,6 @@ pub const Timer = struct {
     // Hblank / vblank entry/exit hooks called by the GPU's
     // frame-pacing.
     pub fn hblankBegin(self: mut Self, ic: *mut[] u32, cop0: *mut[] u32) {
-        self.prevHblank = self.hblank;
         self.hblank = 1;
 
         if ((self.channels[1].clkSource & 1) != 0 &&
@@ -340,7 +337,6 @@ pub const Timer = struct {
     }
 
     pub fn vblankBegin(self: mut Self, ic: *mut[] u32, cop0: *mut[] u32) {
-        self.prevVblank = self.vblank;
         self.vblank = 1;
 
         if (self.channels[1].syncEnable == 0) { return; }

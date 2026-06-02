@@ -1150,13 +1150,6 @@ pub fn gteNcds(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     gtePushRgb(g, m1c, m2c, m3c);
 }
 
-// 8-bit unsigned clamp used by the RGB FIFO writes.
-pub fn clampU8(v: i64) u32 {
-    if (v < 0) { return 0; }
-    if (v > 255) { return 255; }
-    return (v as u64 & 0xFF) as u32;
-}
-
 // SQR — square each IR component. Used for vector-length computations.
 // psxe: MAC{1,2,3} = IR{1,2,3}^2; IR{1,2,3} = clamp(MAC).
 pub fn gteSqr(g: *mut[] u32, sf: u32, lm: u32) {

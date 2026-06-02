@@ -43,11 +43,14 @@ const SDL_KEYUP:      u32 = 0x301;
 // SDL2 surface — pointer-opaque handles, treated as `*mut[] u8` from Jam.
 extern fn SDL_Init(flags: u32) i32;
 extern fn SDL_Quit();
+extern fn SDL_SetHint(name: *const[] u8, value: *const[] u8) i32;
 extern fn SDL_CreateWindow(title: *const[] u8,
                            x: i32, y: i32, w: i32, h: i32,
                            flags: u32) *mut[] u8;
 extern fn SDL_DestroyWindow(window: *mut[] u8);
 extern fn SDL_CreateRenderer(window: *mut[] u8, index: i32, flags: u32) *mut[] u8;
+extern fn SDL_GetRendererInfo(renderer: *mut[] u8, info: *mut[] u8) i32;
+extern fn strlen(s: *const[] u8) u64;
 extern fn SDL_DestroyRenderer(renderer: *mut[] u8);
 extern fn SDL_CreateTexture(renderer: *mut[] u8, format: u32, access: i32,
                             w: i32, h: i32) *mut[] u8;
@@ -61,6 +64,17 @@ extern fn SDL_RenderPresent(renderer: *mut[] u8);
 extern fn SDL_Delay(ms: u32);
 extern fn SDL_PollEvent(event: *mut[] u8) i32;
 extern fn SDL_GetTicks() u32;
+
+// --- macOS App Nap disable (Objective-C runtime) ---
+// When the jam window is not focused, macOS App Nap throttles the process's
+// timers + CPU, stalling the single-threaded emulation loop ("stuck when not
+// focused"). Disable it by holding a user-initiated NSProcessInfo activity.
+// objc_msgSend is declared NON-variadic with fixed u64 args so every arg lands
+// in a register (the ARM64 ABI passes variadic args on the stack, which would
+// break objc_msgSend); unused trailing args are ignored by the target method.
+extern fn objc_getClass(name: *const[] u8) u64;
+extern fn sel_registerName(name: *const[] u8) u64;
+extern fn objc_msgSend(recv: u64, sel: u64, a: u64, b: u64) u64;
 
 // --- audio ---
 //
@@ -111,8 +125,38 @@ const Sdl = struct {
 // safe across SDL releases.
 const SDL_EVENT_SIZE: u32 = 64;
 
+// Hold a process-lifetime "user initiated" NSProcessInfo activity, which
+// disables macOS App Nap so the emulator keeps running at full speed when its
+// window is unfocused/background. The activity token is intentionally leaked
+// (releasing it would re-enable App Nap).
+fn disableAppNap() {
+    // Guarded by @isDarwin() so non-macOS builds dead-code-eliminate the body
+    // and never reference the objc_* symbols (no -lobjc needed off Darwin),
+    // mirroring std/process.jam's _NSGetArgv pattern.
+    if (@isDarwin()) {
+        var nmPi: []u8 = "NSProcessInfo";
+        const clsPi: u64 = objc_getClass(nmPi.ptr);
+        if (clsPi == 0) { return; }
+        var selPi: []u8 = "processInfo";
+        const pi: u64 = objc_msgSend(clsPi, sel_registerName(selPi.ptr), 0, 0);
+        if (pi == 0) { return; }
+        var nmStr: []u8 = "NSString";
+        var selStr: []u8 = "stringWithUTF8String:";
+        var reason: []u8 = "jamstation emulation running";
+        const nsstr: u64 = objc_msgSend(objc_getClass(nmStr.ptr),
+            sel_registerName(selStr.ptr), reason.ptr as u64, 0);
+        // NSActivityUserInitiated (0x00FFFFFF) → App Nap disabled while held.
+        var selBegin: []u8 = "beginActivityWithOptions:reason:";
+        const token: u64 = objc_msgSend(pi, sel_registerName(selBegin.ptr),
+            0x00FFFFFF, nsstr);
+        var selRetain: []u8 = "retain";
+        objc_msgSend(token, sel_registerName(selRetain.ptr), 0, 0);
+    }
+}
+
 pub fn sdlInit(title: []u8, width: i32, height: i32) Sdl {
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO);
+    disableAppNap();   // keep running at full speed when the window is unfocused
     // Window is texture-sized (no upscale) and resizable so the user
     // can scale up post-hoc. SDL_RenderCopy stretches the texture to
     // fit whatever the current window dimensions are.
@@ -120,8 +164,38 @@ pub fn sdlInit(title: []u8, width: i32, height: i32) Sdl {
         0x2FFF0000, 0x2FFF0000,
         width, height,
         SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
-    var ren: *mut[] u8 = SDL_CreateRenderer(win, -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    // Force the OpenGL renderer instead of macOS's default Metal one. Metal's
+    // SDL_RenderPresent calls [CAMetalLayer nextDrawable], which BLOCKS when
+    // the window isn't being composited (unfocused/occluded) because the
+    // drawable pool starves — this is the "stuck when not focused" freeze, and
+    // it happens even with vsync off. OpenGL's swap has no such pool, so the
+    // loop keeps running when unfocused. We also drop PRESENTVSYNC so the
+    // present never waits on a vblank (which the OS may stop delivering to an
+    // unfocused window); jam's own 59.94 Hz SDL_Delay limiter paces the loop.
+    var hintName: []u8 = "SDL_RENDER_DRIVER";
+    var hintGl: []u8 = "opengl";
+    SDL_SetHint(hintName.ptr, hintGl.ptr);
+    var ren: *mut[] u8 = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+    if (ren as u64 == 0) {
+        // OpenGL unavailable — clear the hint and fall back to the default
+        // (Metal) renderer so we still get a window rather than crashing.
+        var hintEmpty: []u8 = "";
+        SDL_SetHint(hintName.ptr, hintEmpty.ptr);
+        ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+    }
+    // Report the live render driver so it's obvious which backend won (if this
+    // says "metal", the OpenGL hint didn't take and the unfocused freeze will
+    // return). SDL_RendererInfo starts with a `const char *name`; pad to 128 B.
+    var info: [128]u8 = [0; 128];
+    SDL_GetRendererInfo(ren, info.asMutPtr());
+    var infoWords: *mut[] u64 = info.asMutPtr() as *mut[] u64;
+    const namePtr: u64 = infoWords[0];
+    if (namePtr != 0) {
+        const np: *const[] u8 = namePtr as *const[] u8;
+        const nlen: u64 = strlen(np);
+        const nameSlice: []u8 = np[0..nlen];
+        print("[sdl] render driver: {nameSlice}\n");
+    }
     // Use ARGB8888 (32-bit) so the blit can target both 15bpp and 24bpp
     // PSX display modes through a single texture. The conversion happens
     // per-pixel in sdlBlit; SDL gets a canonical 4-byte format.

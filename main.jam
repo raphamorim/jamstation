@@ -98,9 +98,6 @@ const Cpu = struct {
     branchTaken: u8,
     halted: u8,
     cycles: u64,
-    diagDumped: u32,
-    diagExcCount: u32,
-    diagWalkCount: u32,
 };
 
 const Sdl = struct {
@@ -333,7 +330,6 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
             bus.timer.hblankEnd();
             acc = acc - GPU_CYCLES_SCANL;
         }
-
         // 3. PAD (psx.c:97)
         padUpdate(bus.pad.ptr, bus.irq.ptr, cop0, delta);
         // 4. TIMER sysclk (psx.c:98) — updateCyc ignores delta, uses 2 (psxe).
@@ -697,17 +693,17 @@ fn main() {
         // polling runs at VBlank cadence in the BIOS.
         padSetButtons(bus.pad.ptr, buttons[0]);
 
-        // Pace this frame to ~59.94 Hz. The VSync present above already
-        // blocked to a host vblank; pad the rest of the frame so the loop
-        // runs at the PSX rate rather than the (possibly 120 Hz) panel rate.
+        // Pace this frame to ~59.94 Hz. The renderer runs WITHOUT vsync (see
+        // sdlInit — vsync would block the present on an unfocused window), so
+        // this wall-clock limiter is the sole pacer: sleep out the rest of the
+        // 16.68 ms frame so the loop runs at the PSX rate, not flat-out.
         nextFrameMs = nextFrameMs + FRAME_MS;
         const nowMs: u32 = SDL_GetTicks();
         if ((nowMs as f64) < nextFrameMs) {
             SDL_Delay((nextFrameMs - (nowMs as f64)) as u32);
         } else {
-            // Fell behind (slow frame, or a 60 Hz host where VSync already
-            // paced us) — resync so we never burst-catch-up faster than
-            // real time.
+            // Fell behind (slow frame) — resync so we never burst-catch-up
+            // faster than real time.
             nextFrameMs = nowMs as f64;
         }
     }

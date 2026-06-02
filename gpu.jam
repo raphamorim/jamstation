@@ -1,11 +1,9 @@
 // GPU (partial port of psxe/psx/dev/gpu.c).
 //
-// Implements the GP0/GP1 command machinery, plus the rectangle and
-// CPU↔VRAM blit commands the BIOS uses during boot. Polygon and line
-// rasterizers are stubbed (they consume args without drawing); games
-// won't render properly until a triangle rasterizer + GTE land. The
-// goal of this port is to keep the BIOS from hanging while waiting on
-// GPUSTAT and to write something visible to VRAM.
+// Implements the GP0/GP1 command machinery and the polygon, line,
+// rectangle, fill, and CPU↔VRAM blit commands. Triangles are
+// point-sampled with texture + gouraud support (gpuRasterPoly →
+// gpuRasterTri); together with the GTE this renders real game geometry.
 //
 // State buffer layout (80 u32 entries):
 //   [0..15]   command FIFO buffer
@@ -17,7 +15,10 @@
 //   [21]      color (current command's 24-bit BGR colour)
 //   [22..29]  generic command counters: xpos, ypos, xsiz, ysiz, tsiz,
 //             addr, xcnt, ycnt
-//   [30..37]  v0..v3 (x,y per vertex)
+//   [30..33]  unused (was v0..v3 vertex scratch; the rasterizer reads none)
+//   [34..37]  OWNED BY main.jam's frame loop, NOT the GPU: [34]=last CPU-clocked
+//             SPU sample, [35]=SPU sample accumulator, [36]=scanline,
+//             [37]=f32 GPU-cycle accumulator (type-punned). Do NOT reuse here.
 //   [38..43]  C0 (VRAM→CPU) state: xcnt, ycnt, xsiz, ysiz, tsiz, addr
 //   [44]      gp1_10h_req
 //   [45]      gpuread
@@ -29,8 +30,9 @@
 //   [58..59]  clut_x, clut_y
 //   [60..62]  texp_x, texp_y, texp_d
 //   [63..68]  disp_x, disp_y, disp_x1..disp_y2
-//   [69]      cycles (GPU clock cycles within current scanline)
-//   [70]      line (current scanline)
+//   [69]      unused
+//   [70]      texture-disable raw input (E1 bit 11)
+//   [71]      texture-disable allow gate (GP1 0x09); GPUSTAT.15 = g[71] & g[70]
 
 const { irqRaise, IC_VBLANK } = import("irq");
 
@@ -567,81 +569,9 @@ pub fn gpuMax3(a: u32, b: u32, c: u32) u32 {
     return m;
 }
 
-// Rasterize one flat-shaded triangle. Caller has already applied the
-// drawing offset to the vertex coordinates. Pixels are clipped to the
-// drawing area registered via GP0 0xE3 / 0xE4.
-pub fn gpuFlatTriangle(g: *mut[] u32, vram: *mut[] u8,
-                       a0x: u32, a0y: u32,
-                       b0x: u32, b0y: u32,
-                       c0x: u32, c0y: u32,
-                       color: u32) {
-    // Apply drawing offset (sign-extended in GP0 0xE5).
-    const ox: u32 = g[52];
-    const oy: u32 = g[53];
-    const ax: u32 = a0x + ox;
-    const ay: u32 = a0y + oy;
-    var bx: u32 = b0x + ox;
-    var by: u32 = b0y + oy;
-    var cx: u32 = c0x + ox;
-    var cy: u32 = c0y + oy;
-
-    // Force CCW winding: if the triangle is CW, swap b and c.
-    const area: i64 = gpuEdge(ax, ay, bx, by, cx, cy);
-    if (area < 0) {
-        const tx: u32 = bx;  const ty: u32 = by;
-        bx = cx;             by = cy;
-        cx = tx;             cy = ty;
-    }
-
-    const xmin: u32 = gpuMin3(ax, bx, cx);
-    const ymin: u32 = gpuMin3(ay, by, cy);
-    const xmax: u32 = gpuMax3(ax, bx, cx);
-    const ymax: u32 = gpuMax3(ay, by, cy);
-
-    // Clip to drawing area.
-    const dx1: u32 = g[48];
-    const dy1: u32 = g[49];
-    const dx2: u32 = g[50];
-    const dy2: u32 = g[51];
-
-    // Bail on pathologically large bounding boxes (PSX hardware caps).
-    if (sext32(xmax - xmin) > 1024 || sext32(ymax - ymin) > 512) { return; }
-
-    // Use signed comparisons throughout. The drawing-area registers
-    // are non-negative, so an unsigned `x >= dx1` would erroneously
-    // include far-negative x positions (sext32 0xFFFFF800 > 0 in
-    // unsigned terms).
-    var y: u32 = ymin;
-    while (sext32(y) <= sext32(ymax)) {
-        var x: u32 = xmin;
-        while (sext32(x) <= sext32(xmax)) {
-            if (sext32(x) >= sext32(dx1) && sext32(x) <= sext32(dx2) &&
-                sext32(y) >= sext32(dy1) && sext32(y) <= sext32(dy2)) {
-                const z0: i64 = gpuEdge(bx, by, cx, cy, x, y);
-                const z1: i64 = gpuEdge(cx, cy, ax, ay, x, y);
-                const z2: i64 = gpuEdge(ax, ay, bx, by, x, y);
-                if (!gpuTopLeftRule(z0, bx, by, cx, cy) &&
-                    !gpuTopLeftRule(z1, cx, cy, ax, ay) &&
-                    !gpuTopLeftRule(z2, ax, ay, bx, by)) {
-                    vramWritePixel(vram, x & 0x3FF, y & 0x1FF, color);
-                }
-            }
-            x = x + 1;
-        }
-        y = y + 1;
-    }
-}
-
 // Polygon dispatcher — reads the command flags and triggers one or
 // two triangles. Handles monochrome and textured variants; gouraud
 // shading falls back to flat-shaded with the base colour.
-// Decode a shaded polygon's per-vertex colour. For shaded prims each
-// vertex has an RGB byte triple stored in the low 24 bits of a buffer
-// word; we extract by index.
-pub fn gpuShadeColor(g: *mut[] u32, idx: u32) u32 {
-    return g[idx] & 0xFFFFFF;
-}
-
 pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
     const flags: u32 = (g[0] >> 24) & 0xFF;
     const isQuad: bool = (flags & 0x08) != 0;

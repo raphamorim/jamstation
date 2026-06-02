@@ -62,9 +62,6 @@ const Cpu = struct {
     branchTaken: u8,
     halted: u8,
     cycles: u64,
-    diagDumped: u32,
-    diagExcCount: u32,
-    diagWalkCount: u32,
 };
 
 
@@ -477,6 +474,79 @@ fn tGteMvmvaNestedOvf() u32 {
     return f;
 }
 
+// IRGB/ORGB (reg 28) repacks IR1/2/3 (>>7, clamped 0..0x1F) into 15-bit RGB.
+// IR is stored zero-extended in the low 16 bits and must be sign-extended
+// before the >>7, so a negative IR clamps to 0 (psxe cpu.c:1290 / duckstation
+// gte.cpp:343). The old `(g[9] as i32)` bit-cast read IR1=-1 as +65535 → 0x1F;
+// with all three IR = -1 the packed result must be 0, not 0x7FFF.
+fn tGteIrgbNeg() u32 {
+    var g: Vec(u32) = gteAlloc();
+    gteDataWrite(g.ptr, 9, 0x0000FFFF);        // IR1 = -1
+    gteDataWrite(g.ptr, 10, 0x0000FFFF);       // IR2 = -1
+    gteDataWrite(g.ptr, 11, 0x0000FFFF);       // IR3 = -1
+    return gteDataRead(g.ptr, 28);             // each channel clamps to 0 → 0
+}
+
+// Positive packing still works after the sign-extension fix: IR1=3968→31,
+// IR2=128→1, IR3=0 ⇒ 0x1F | (1<<5) | 0 = 0x3F.
+fn tGteIrgbPos() u32 {
+    var g: Vec(u32) = gteAlloc();
+    gteDataWrite(g.ptr, 9, 0x0F80);            // IR1 = 3968 → >>7 = 31
+    gteDataWrite(g.ptr, 10, 0x0080);           // IR2 = 128  → >>7 = 1
+    gteDataWrite(g.ptr, 11, 0x0000);           // IR3 = 0
+    return gteDataRead(g.ptr, 28);
+}
+
+// RTPT runs the depth-cue (DQ) tail only on the LAST vertex (psxe
+// cpu.c:2247-2251). Construct V0/V1 with a small Z (→ large divide → the DQ's
+// IR0 = clamp(DQA*div>>12) saturates, setting FLAG bit 12) and V2 with a large
+// Z (→ small divide → no IR0 saturation). Bit 12 (IR0 sat) is set ONLY by the
+// DQ tail's gte_clamp_ir0 and is excluded from the bit-31 summary, so it
+// cleanly isolates whether intermediate vertices wrongly ran the DQ. With the
+// fix only V2's DQ runs → bit 12 clear. (Pre-fix: V0/V1 saturate it → 0x1000.)
+fn tGteRtptDqGate() u32 {
+    var g: Vec(u32) = gteAlloc();
+    gteSetIdentity(g.ptr);
+    gteCtrlWrite(g.ptr, 26, 2);                // H = 2
+    gteCtrlWrite(g.ptr, 27, 0x1000);           // DQA = 4096
+    gteCtrlWrite(g.ptr, 28, 0);                // DQB = 0
+    gteDataWrite(g.ptr, 0, 0); gteDataWrite(g.ptr, 1, 16);      // V0.z = 16   → div 0x2000, IR0 sat
+    gteDataWrite(g.ptr, 2, 0); gteDataWrite(g.ptr, 3, 16);      // V1.z = 16
+    gteDataWrite(g.ptr, 4, 0); gteDataWrite(g.ptr, 5, 0x1000);  // V2.z = 4096 → div 32, no sat
+    gteExec(g.ptr, 0x4A000030);                // RTPT, sf=0
+    return gteCtrlRead(g.ptr, 31) & 0x1000;    // FLAG bit 12 = IR0 saturation (DQ tail only)
+}
+
+// NCDS pushes the final colour via the FLAG-aware gte_clamp_rgb (psxe
+// cpu.c:1917-1919), so a channel that saturates >255 sets FLAG bit 21/20/19
+// (R/G/B). Drive only the R far-colour large and IR0 to max so stage-5
+// MAC1 = IR0*ir1f hugely overflows 255 on R alone; bits 19/20/21 masked must
+// read 0x200000 (R). The old inline clampU8 set none of these (returned 0).
+fn tGteNcdsRgbSat() u32 {
+    var g: Vec(u32) = gteAlloc();
+    gteCtrlWrite(g.ptr, 21, 0x00010000);       // RFC large → ir1f saturates high
+    gteDataWrite(g.ptr, 8, 0x7FFF);            // IR0 = max
+    gteExec(g.ptr, 0x4A000013);                // NCDS, sf=0
+    return gteCtrlRead(g.ptr, 31) & 0x00380000; // RGB-saturation FLAG bits 19/20/21
+}
+
+// DQA (control reg 27) is s16 (psxe cpu.c:138 / duckstation gte_types.h:117),
+// so the RTPS depth-cue must sign-extend its low 16 bits, not read all 32. With
+// DQA=0x00010001 the low half is 1: depth-cue MAC0 = DQB + DQA*div = 1*0x10000,
+// IR0 = clamp(0x10000>>12) = 16. The old s32 read used 65537, giving a huge
+// MAC0 that saturated IR0 to 0x1000. H=SZ3=4096 ⇒ div = 0x10000.
+fn tGteDqaWidth() u32 {
+    var g: Vec(u32) = gteAlloc();
+    gteSetIdentity(g.ptr);
+    gteCtrlWrite(g.ptr, 26, 0x1000);           // H = 4096
+    gteCtrlWrite(g.ptr, 27, 0x00010001);       // DQA: low16=1 (s16), high bits set
+    gteCtrlWrite(g.ptr, 28, 0);                // DQB = 0
+    gteDataWrite(g.ptr, 0, 0);
+    gteDataWrite(g.ptr, 1, 0x1000);            // V0.z = 4096 → SZ3 = 4096
+    gteExec(g.ptr, 0x4A000001);                // RTPS, sf=0
+    return gteDataRead(g.ptr, 8);              // IR0 = clamp((DQA_s16 * div) >> 12) = 16
+}
+
 tfn psxGteSqrFlag()    { assert(tGteSqrFlag(), 0x81000000); }
 tfn psxGteDivideFlag() { assert(tGteDivideFlag(), 0x80020000); }
 tfn psxGteNoFlag()     { assert(tGteNoFlag(), 0); }
@@ -488,6 +558,12 @@ tfn psxGteRtpsIr()    { assert(tGteRtpsIr(), 300); }
 tfn psxGteIrSext()    { assert(tGteIrSext(), 0xFFFFFFFF); }
 tfn psxGteDivide()    { assert(tGteDivide(), 0x8000); }
 tfn psxGteDivideOvf() { assert(tGteDivideOvf(), 0x1FFFF); }
+
+tfn psxGteIrgbNeg()    { assert(tGteIrgbNeg(), 0); }
+tfn psxGteIrgbPos()    { assert(tGteIrgbPos(), 0x3F); }
+tfn psxGteRtptDqGate() { assert(tGteRtptDqGate(), 0); }
+tfn psxGteNcdsRgbSat() { assert(tGteNcdsRgbSat(), 0x00200000); }
+tfn psxGteDqaWidth()   { assert(tGteDqaWidth(), 16); }
 
 // ---------- headless emulator boot tests ---------------------------------
 //
