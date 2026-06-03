@@ -7,7 +7,7 @@ Passes [JaCzekanski/ps1-tests](https://github.com/JaCzekanski/ps1-tests).
 Kindly reminder that Jam lang is experimental yet.
 
 ```bash
-# LIBRARY_PATH should be where SDL2 is located
+# LIBRARY_PATH should be where SDL2 is located, in this case is an example in MacOS
 LIBRARY_PATH=/opt/homebrew/lib jam -lSDL2 -C opt-level=3 -o jamstation main.jam
 
 # Run: jamstation <BIOS_PATH> [GAME_PATH]
@@ -49,3 +49,12 @@ Keyboard maps to a digital PSX controller in slot 1:
 | Start      | Return    |
 | Select     | Right Shift |
 | Quit       | Esc       |
+
+## References
+
+- https://github.com/allkern/psxe
+- https://github.com/stenzek/duckstation
+
+## Disclaimers
+
+"PlayStation" and "PSX" are registered trademarks of Sony Interactive Entertainment Europe Limited. This project is not affiliated in any way with Sony Interactive Entertainment.
