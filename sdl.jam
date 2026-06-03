@@ -65,7 +65,7 @@ extern fn SDL_Delay(ms: u32);
 extern fn SDL_PollEvent(event: *mut[] u8) i32;
 extern fn SDL_GetTicks() u32;
 
-// --- macOS App Nap disable (Objective-C runtime) ---
+// macOS App Nap disable (Objective-C runtime)
 // When the jam window is not focused, macOS App Nap throttles the process's
 // timers + CPU, stalling the single-threaded emulation loop ("stuck when not
 // focused"). Disable it by holding a user-initiated NSProcessInfo activity.
@@ -76,7 +76,7 @@ extern fn objc_getClass(name: *const[] u8) u64;
 extern fn sel_registerName(name: *const[] u8) u64;
 extern fn objc_msgSend(recv: u64, sel: u64, a: u64, b: u64) u64;
 
-// --- audio ---
+// audio
 //
 // Callback-mode SDL audio with an SPSC ring buffer. The SPU is NOT
 // driven by the audio thread (it's clocked CPU-synchronously inside
@@ -280,7 +280,7 @@ pub fn sdlAudioClose(dev: u32) {
     if (dev != 0) { SDL_CloseAudioDevice(dev); }
 }
 
-// ---- SPSC audio ring buffer ---------------------------------------
+// SPSC audio ring buffer
 // The CPU loop (producer) pushes the per-frame sample batch; SDL's
 // audio callback (consumer) drains it at the host rate. Layout of the
 // `userdata` blob handed to SDL (indices are byte offsets into the

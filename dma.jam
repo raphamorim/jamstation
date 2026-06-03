@@ -58,7 +58,7 @@ pub fn dmaAlloc() Vec(u32) {
 
 pub fn chBase(ch: u32) u32 { return ch * 3; }
 
-// ---------- direct RAM access (DMA never targets BIOS/scratchpad) -------
+// direct RAM access (DMA never targets BIOS/scratchpad)
 //
 // The DMA controller bypasses the bus's address-space mapping when
 // reading sources or writing destinations — addresses in the channel
@@ -90,7 +90,7 @@ pub fn ramWrite16(bus: Bus, addr: u32, val: u32) {
     p[off + 1] = ((val >> 8) & 0xFF) as u8;
 }
 
-// ---------- IO surface --------------------------------------------------
+// IO surface
 
 // Per-channel CHCR hardwiring masks (psxe dma.c lines 14-24). Channels
 // 0..5 expose the full 32-bit CHCR through these mask bits; channel 6
@@ -253,7 +253,7 @@ pub fn dmaClear(d: *mut[] u32, ch: u32) {
     d[chBase(ch) + F_BCR]  = 0;
 }
 
-// --- per-channel transfer routines ---
+// per-channel transfer routines
 
 pub fn dmaDoGpu(d: *mut[] u32, bus: Bus) {
     if (!chcrBusy(d, 2)) { return; }

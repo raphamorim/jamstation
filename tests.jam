@@ -361,7 +361,7 @@ tfn psxSyscallVector()  { assert(tSyscallVector(), 0xBFC00180); }
 tfn psxLoadDelay()      { assert(tLoadDelay(), 0x0000002A); }
 tfn psxLwlLwr()         { assert(tLwlLwr(), 0xBBCCDD11); }
 
-// ---------- GTE (COP2) unit tests ----------------------------------------
+// GTE (COP2) unit tests
 //
 // gteAlloc gives a standalone register buffer, so the math ops can be
 // exercised without a full Bus. These lock in the psxe-match fixes:
@@ -565,7 +565,7 @@ tfn psxGteRtptDqGate() { assert(tGteRtptDqGate(), 0); }
 tfn psxGteNcdsRgbSat() { assert(tGteNcdsRgbSat(), 0x00200000); }
 tfn psxGteDqaWidth()   { assert(tGteDqaWidth(), 16); }
 
-// ---------- headless emulator boot tests ---------------------------------
+// headless emulator boot tests
 //
 // These tests boot the real BIOS (and optionally a disc image) into a
 // fully-allocated Bus without SDL, then run N frames and assert state.
@@ -692,7 +692,7 @@ tfn emuDiscBootsExec() {
 // pushes an INT3/INT2/INT5 response, so a non-zero value proves the CD
 // state machine got exercised.
 
-// ---- variable per-instruction cycle model (psxe cpu.c last_cycles) -----
+// variable per-instruction cycle model (psxe cpu.c last_cycles)
 //
 // step() charges `fetchCyc + instrCyc` per instruction, matching psxe:
 // fetchCyc = 18 when the opcode is read from BIOS ROM (bios.c bus_delay)

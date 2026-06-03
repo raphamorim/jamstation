@@ -190,7 +190,7 @@ pub const Cdrom = struct {
         if (discLoaded(disc) != 0) { self.hasDisc = 1; }
     }
 
-    // ---------- FIFO ops ---------------------------------------------
+    // FIFO ops
     // Two separate FIFOs (param / resp) — methods are duplicated rather
     // than parameterized to keep the index/buffer pairing type-safe.
     // Same ring-buffer math the old `qPush`/`qPop` did, just with
@@ -246,7 +246,7 @@ pub const Cdrom = struct {
         self.respW = 0;
     }
 
-    // ---------- status byte ------------------------------------------
+    // status byte
 
     // Mirrors psxe cdrom_get_stat (cdrom.c:454): SPINDLE always, plus
     // READ while the sector pump is active, SHELLOPEN if no disc,
@@ -259,7 +259,7 @@ pub const Cdrom = struct {
         return s;
     }
 
-    // ---------- register I/O -----------------------------------------
+    // register I/O
 
     // Status register at offset 0 (always, regardless of bank).
     pub fn readStatus(self: mut Self) u32 {
@@ -359,7 +359,7 @@ pub const Cdrom = struct {
         self.write8(off + 3, (val >> 24) & 0xFF);
     }
 
-    // ---------- state-machine tick -----------------------------------
+    // state-machine tick
 
     // Handle the command response — equivalent to psxe's
     // `cdrom_cmd_table[cmd](cdrom)` running after the TX_RESP1 delay.
@@ -1043,7 +1043,7 @@ pub const Cdrom = struct {
     }
 };
 
-// ---------- free helpers (no state required) -----------------------
+// free helpers (no state required)
 
 // Binary-to-BCD encoder (psxe ITOB). Inputs 0..99.
 pub fn bcdEnc(v: u32) u32 {

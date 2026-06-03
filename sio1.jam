@@ -118,7 +118,7 @@ pub const Sio1 = struct {
         return b;
     }
 
-    pub fn rxEmpty(self: mut Self) bool {
+    pub fn rxEmpty(self: Self) bool {
         return self.rxHead == self.rxTail;
     }
 
@@ -126,7 +126,7 @@ pub const Sio1 = struct {
     // read we OR in the dynamic bits — TX_RDY1 always 1 (FIFO never
     // full since we transmit immediately), TX_RDY2 = 1 when no TX in
     // flight, RX_NE = 1 when RX FIFO has data.
-    pub fn readStat(self: mut Self) u32 {
+    pub fn readStat(self: Self) u32 {
         var stat: u32 = self.stat;
         stat = stat | STAT_TXR1;
         if (self.txPending == 0) { stat = stat | STAT_TXR2; }

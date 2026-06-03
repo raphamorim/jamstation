@@ -342,7 +342,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
         dmaTickSpu(bus.dma.ptr, delta);
         dmaUpdate(bus.dma.ptr, bus.irq.ptr, cop0);
 
-        // --- jam-only extras: psxe steps NEITHER in psx_update. Kept at the
+        // jam-only extras: psxe steps NEITHER in psx_update. Kept at the
         // end (least perturbation to the psxe device order above) and flagged
         // as divergences — SIO1 → peripherals task, SPU CPU-clock → SPU task
         // (psxe runs SPU on the audio thread; revisit once the deterministic
@@ -427,7 +427,7 @@ fn dumpVramPpm(path: []u8, vram: *mut[] u8) {
     }
 }
 
-// ---------- main --------------------------------------------------------
+// main
 
 // True if NUL-terminated `p` ends with ".exe" / ".EXE". Mirrors
 // disc.jam's pathEndsWithCue so an EXE passed as argv[2] is routed to

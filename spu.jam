@@ -208,7 +208,7 @@ pub fn adpcmNeg(f: u32) i32 {
     }
 }
 
-// ---------- noise generator (Avocado/DuckStation/nocash) ---------------
+// noise generator (Avocado/DuckStation/nocash)
 //
 // SPUCNT bits 8-13 are the noise clock: shift = bits 10-13, step = bits 8-9.
 // noiseFreqAdd is the {0,84,140,180,210} half-cycle table (index 4 = 210 is
@@ -251,7 +251,7 @@ fn spuStepNoise(s: *mut[] u8, spucnt: u32) {
     setU32(s, GLOBAL_BASE + G_NOISE_COUNT, count);
 }
 
-// ---------- allocation -------------------------------------------------
+// allocation
 
 // Owned SPU-state buffer (~29KB). Initialised via setU16 + spuGaussInit
 // (psxe's reset values: all voices ended, irq9addr = 0xFFFF). Auto-drops
@@ -270,7 +270,7 @@ pub fn spuAlloc() Vec(u8) {
 // with the Bus.
 pub fn spuRamAlloc() Vec(u8) { return Vec(u8).filled(0, SPU_RAM_SIZE); }
 
-// ---------- CD-audio FIFO ---------------------------------------------
+// CD-audio FIFO
 //
 // XA samples decoded by cdrom.jam land here as packed (left, right) i16
 // pairs. spuGetSample drains one entry per call and adds it (volume-
@@ -288,7 +288,7 @@ pub fn spuPushCdSample(s: *mut[] u8, leftI16: u32, rightI16: u32) {
     setU32(s, GLOBAL_BASE + G_CD_HEAD, head + 1);
 }
 
-// ---------- reverb -----------------------------------------------------
+// reverb
 //
 // PSX reverb is a 22-tap filter living in the tail of SPU RAM starting
 // at MBASE×8. The work-area is referenced through a rotating cursor
@@ -467,7 +467,7 @@ pub fn spuPopCdSample(s: *mut[] u8) u32 {
     return l | (r << 16);
 }
 
-// ---------- byte-buffer access helpers --------------------------------
+// byte-buffer access helpers
 
 pub fn getU16(s: *mut[] u8, off: u32) u32 {
     return (s[off] as u32) | ((s[off + 1] as u32) << 8);
@@ -553,7 +553,7 @@ pub fn clamp7fff(v: i32) i32 {
 }
 pub fn maxI(a: i32, b: i32) i32 { if (a > b) { return a; } return b; }
 
-// ---------- ADPCM block decoder (psxe spu_read_block) ----------------
+// ADPCM block decoder (psxe spu_read_block)
 
 pub fn spuReadBlock(s: *mut[] u8, ram: *mut[] u8, v: u32) {
     const base: u32 = voiceRTBase(v);
@@ -594,7 +594,7 @@ pub fn spuReadBlock(s: *mut[] u8, ram: *mut[] u8, v: u32) {
     setI32(s, base + D_H1, h1);
 }
 
-// ---------- ADSR ------------------------------------------------------
+// ADSR
 
 pub fn adsrCalcValues(s: *mut[] u8, v: u32) {
     const base: u32 = voiceRTBase(v);
@@ -723,7 +723,7 @@ pub fn spuStepAdsrCpu(s: *mut[] u8) {
     }
 }
 
-// ---------- KON / KOFF -----------------------------------------------
+// KON / KOFF
 
 pub fn spuKon(s: *mut[] u8, ram: *mut[] u8, value: u32) {
     var i: u32 = 0;
@@ -764,7 +764,7 @@ pub fn spuKoff(s: *mut[] u8, value: u32) {
     }
 }
 
-// ---------- write-side effects (psxe spu_handle_write) ----------------
+// write-side effects (psxe spu_handle_write)
 
 pub fn spuHandleWrite(s: *mut[] u8, ram: *mut[] u8, off: u32, val: u32) i32 {
     if (off == R_KONL || off == R_KONH) {
@@ -842,7 +842,7 @@ pub fn spuHandleWrite(s: *mut[] u8, ram: *mut[] u8, off: u32, val: u32) i32 {
     return 0;
 }
 
-// ---------- read TFIFO (psxe spu_read16 SPUR_TFIFO branch) ------------
+// read TFIFO (psxe spu_read16 SPUR_TFIFO branch)
 
 pub fn spuReadTfifo(s: *mut[] u8, ram: *mut[] u8) u32 {
     var ta: u32 = getU32(s, GLOBAL_BASE + G_TADDR);
@@ -852,7 +852,7 @@ pub fn spuReadTfifo(s: *mut[] u8, ram: *mut[] u8) u32 {
     return lo | (hi << 8);
 }
 
-// ---------- bus dispatch ---------------------------------------------
+// bus dispatch
 
 pub fn spuRead8(s: *mut[] u8, ram: *mut[] u8, off: u32) u32 {
     if (off >= SPU_REG_SIZE) { return 0; }
@@ -893,7 +893,7 @@ pub fn spuWrite32(s: *mut[] u8, ram: *mut[] u8, off: u32, val: u32) {
     setU16(s, off + 2, (val >> 16) & 0xFFFF);
 }
 
-// ---------- sample mixer (psxe psx_spu_get_sample) --------------------
+// sample mixer (psxe psx_spu_get_sample)
 
 pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
                     ic: *mut[] u32, cop0: *mut[] u32) u32 {
@@ -1132,7 +1132,7 @@ pub fn spuOutAvailable(s: *mut[] u8) u32 {
          - getU32(s, GLOBAL_BASE + G_OUT_TAIL);
 }
 
-// ---------- per-scanline tick ----------------------------------------
+// per-scanline tick
 //
 // PS1 CPU is 33.8688 MHz, SPU runs at 44.1 kHz, so 1 sample ≈ 768 CPU
 // cycles. We accumulate cycles and drain one spuGetSample per bucket.
@@ -1153,7 +1153,7 @@ pub fn spuUpdate(s: *mut[] u8, ram: *mut[] u8,
     setU32(s, GLOBAL_BASE + G_SAMPLE_ACC, acc);
 }
 
-// ---------- Gaussian interpolation ------------------------------------
+// Gaussian interpolation
 //
 // Replaces the previous nearest-neighbor sample lookup with the 4-tap
 // Gaussian filter PSX hardware uses. Lookup table lives at offset

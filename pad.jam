@@ -263,7 +263,7 @@ pub fn padReadStat(p: *mut[] u8) u32 {
     return padGetU16(p, P_STAT_LO) | 0x07;
 }
 
-// ---------- public IO surface ------------------------------------------
+// public IO surface
 
 pub fn padRead32(p: *mut[] u8, mcd: mut Mcd, mcdRam: *mut[] u8, off: u32) u32 {
     match (off) {

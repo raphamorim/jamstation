@@ -92,7 +92,7 @@ pub fn vramReadPixel(vram: *mut[] u8, x: u32, y: u32) u32 {
     return (vram[off] as u32) | ((vram[off + 1] as u32) << 8);
 }
 
-// ---------- GP0 / GP1 reads --------------------------------------------
+// GP0 / GP1 reads
 
 pub fn gpuRead32(g: *mut[] u32, vram: *mut[] u8, off: u32) u32 {
     if (off == 0x00) {
@@ -157,7 +157,7 @@ pub fn vramPackTwo(g: *mut[] u32, vram: *mut[] u8) u32 {
     return data;
 }
 
-// ---------- GP0 (command/data) writes ----------------------------------
+// GP0 (command/data) writes
 
 pub fn gpuWrite32(g: *mut[] u32, vram: *mut[] u8, off: u32, val: u32) {
     match (off) {
@@ -472,7 +472,7 @@ pub fn gpuVramToCpu(g: *mut[] u32, vram: *mut[] u8) {
     g[19] = GP_RECV_CMD;
 }
 
-// --- polygon / line / rect command parsing ---
+// polygon / line / rect command parsing
 //
 // We parse the variant flags (textured, gouraud, 4-vert) to compute the
 // right argument count, latch all the args, then stub the rasterization
@@ -1349,7 +1349,7 @@ pub fn gpuBlend(fore: u32, back: u32, mode: u32) u32 {
     return gpuToBgr555(cr | (cg << 8) | (cb << 16));
 }
 
-// ---------- frame pacing -----------------------------------------------
+// frame pacing
 //
 // Each call advances the GPU's scanline cycle counter. When we cross a
 // horizontal-draw / hblank boundary we tick `line`; at scanline 240 we
@@ -1365,7 +1365,7 @@ const GPU_CYC_SCANL_NTSC: u32 = 3413;
 const GPU_LINES_VDRAW:    u32 = 240;
 const GPU_LINES_TOTAL:    u32 = 263;
 
-// ---------- struct wrapper -------------------------------------------
+// struct wrapper
 //
 // `Gpu` owns the 80-u32 state buffer inline (vs the old heap alloc)
 // and exposes the public surface as methods. The internal command-

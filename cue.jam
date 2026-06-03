@@ -96,7 +96,7 @@ pub const Cue = struct {
     }
 };
 
-// ---------- helpers ----------------------------------------------------
+// helpers
 
 pub fn isAlpha(c: u32) bool {
     if (c >= 0x41 && c <= 0x5A) { return true; }
@@ -202,7 +202,7 @@ pub fn kwId(buf: *mut[] u8) u32 {
     return 0;
 }
 
-// ---------- allocator -------------------------------------------------
+// allocator
 
 // Allocate a Box(Cue) with each inner Vec sized to its MAX_/cap. The
 // Vecs are filled-with-zero so the existing index-based writes by
@@ -271,7 +271,7 @@ pub fn pathBufAppend(raw: *mut[] u8, src: *mut[] u8, len: u32) u32 {
     return off;
 }
 
-// ---------- track-range computation -----------------------------------
+// track-range computation
 //
 // After parsing all FILE/TRACK/INDEX lines, walk each file's track list
 // and compute startLba/endLba. Mirrors psxe init_tracks().
@@ -335,7 +335,7 @@ pub fn cueComputeRanges(raw: *mut[] u8) {
     }
 }
 
-// ---------- lookup helpers --------------------------------------------
+// lookup helpers
 
 pub fn cueGetTrackCount(raw: *mut[] u8) u32 {
     var c: *mut[] Cue = raw as *mut[] Cue;
@@ -430,7 +430,7 @@ pub fn cueQuery(raw: *mut[] u8, lba: u32) u32 {
     return 0;
 }
 
-// ---------- parser ----------------------------------------------------
+// parser
 //
 // Stream the .cue text char-by-char (psxe's fgetc model). Each keyword
 // dispatches to its handler; FILE pushes onto files[], TRACK pushes

@@ -694,7 +694,7 @@ pub fn satIrLm(v: i64, lm: u32) i64 {
     return v;
 }
 
-// ---- FLAG-aware clamps (psxe gte_clamp_* / gte_check_mac, cpu.c:1486-1607)
+// FLAG-aware clamps (psxe gte_clamp_* / gte_check_mac, cpu.c:1486-1607)
 // Each ORs the matching FLAG bit into g[32+C_FLAG] on saturation/overflow
 // and otherwise returns exactly what the plain sat* helpers return, so
 // MAC/IR/SXY/RGB *values* are unchanged — only FLAG gets populated. `i`

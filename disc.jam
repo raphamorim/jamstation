@@ -162,7 +162,7 @@ pub fn discLoaded(d: *mut[] Disc) i32 {
     return 1;
 }
 
-// ---- track info (for CDROM GetTN/GetTD/GetLocP/seek) -------------------
+// track info (for CDROM GetTN/GetTD/GetLocP/seek)
 // Route to the cue track table when cue-loaded; a raw .bin is a single
 // Mode2/2352 data track starting at the lead-in (LBA 150).
 

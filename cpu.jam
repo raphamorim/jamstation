@@ -89,7 +89,7 @@ const CAUSE_RI:      u32 = 0x28;
 const CAUSE_CPU:     u32 = 0x2C;
 const CAUSE_OV:      u32 = 0x30;
 
-// ---------- register file ----------------------------------------------
+// register file
 //
 // 32 GPRs + 16 COP0 registers — both live in heap-allocated `Vec(u32)`
 // buffers that auto-drop with their owning scope. Callers pass `regs.ptr`
@@ -126,7 +126,7 @@ pub fn freshCpuAt(pc: u32) Cpu {
     return c;
 }
 
-// ---------- sign-extension and signed compare helpers ------------------
+// sign-extension and signed compare helpers
 
 pub fn signExt16(v: u32) u32 {
     if ((v & 0x8000) != 0) { return v | 0xFFFF0000; }
@@ -150,7 +150,7 @@ pub fn signedGtZero(a: u32) bool { return a != 0 && (a & 0x80000000) == 0; }
 pub fn signedLeZero(a: u32) bool { return a == 0 ||  (a & 0x80000000) != 0; }
 pub fn signedGeZero(a: u32) bool { return (a & 0x80000000) == 0; }
 
-// ---------- integer division -------------------------------------------
+// integer division
 //
 // MIPS DIV / DIVU semantics: division by zero produces -1 (signed) or
 // 0xFFFFFFFF (unsigned) for the quotient; signed INT_MIN / -1 stays at
@@ -189,7 +189,7 @@ pub fn modI32(a: u32, b: u32) u32 {
     return ((a as i32) % (b as i32)) as u32;
 }
 
-// ---------- exception machinery ----------------------------------------
+// exception machinery
 
 pub fn raiseException(c: mut Cpu, cop0: *mut[] u32, cause: u32) {
     var sr: u32 = cop0Read(cop0, C0_SR);
@@ -222,7 +222,7 @@ pub fn cop0Rfe(cop0: *mut[] u32) {
     cop0Write(cop0, C0_SR, sr);
 }
 
-// ---------- instruction-field accessors --------------------------------
+// instruction-field accessors
 
 pub fn opPrim(opc: u32) u32 { return (opc >> 26) & 0x3F; }
 pub fn opRs  (opc: u32) u32 { return (opc >> 21) & 0x1F; }
@@ -250,7 +250,7 @@ pub fn commitLoad(c: mut Cpu, regs: *mut[] u32) {
     c.loadV = 0;
 }
 
-// ---------- instruction implementations --------------------------------
+// instruction implementations
 
 pub fn iLui(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     commitLoad(c, regs);
@@ -312,7 +312,7 @@ pub fn iSltiu(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     gprWrite(regs, opRt(opc), v);
 }
 
-// --- branches ---
+// branches
 
 pub fn iJ(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     commitLoad(c, regs);
@@ -388,7 +388,7 @@ pub fn iRegimm(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     if (take) { doBranch(c, opImmS(opc) << 2); }
 }
 
-// --- loads ---
+// loads
 
 pub fn iLb(c: mut Cpu, opc: u32, bus: Bus, regs: *mut[] u32) {
     const s: u32 = gprRead(regs, opRs(opc));
@@ -475,7 +475,7 @@ pub fn iLwr(c: mut Cpu, opc: u32, bus: Bus, regs: *mut[] u32) {
     c.loadV = value;
 }
 
-// --- stores ---
+// stores
 
 pub fn iSb(c: mut Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     const s: u32 = gprRead(regs, opRs(opc));
@@ -545,7 +545,7 @@ pub fn iSwr(c: mut Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) 
     busWrite32(bus, cop0, aligned, v);
 }
 
-// --- SPECIAL family ---
+// SPECIAL family
 
 pub fn iSll(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     const t: u32 = gprRead(regs, opRt(opc));
@@ -793,7 +793,7 @@ pub fn iSltu(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     gprWrite(regs, opRd(opc), v);
 }
 
-// --- COP0 ---
+// COP0
 
 pub fn iMfc0(c: mut Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) {
     const v: u32 = cop0Read(cop0, opRd(opc));
@@ -922,7 +922,7 @@ pub fn illegal(c: mut Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) {
     raiseException(c, cop0, CAUSE_RI);
 }
 
-// ---------- decode + dispatch ------------------------------------------
+// decode + dispatch
 
 pub fn dispatchSpecial(c: mut Cpu, opc: u32, bus: Bus,
                       regs: *mut[] u32, cop0: *mut[] u32) {
@@ -1242,7 +1242,7 @@ pub fn run(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
     commitLoad(c, regs);
 }
 
-// ---------- BIOS A/B-table hooks ---------------------------------------
+// BIOS A/B-table hooks
 
 // Emit one BIOS console byte. std/fmt.print's `{b}` interpolation on a
 // `[]u8` slice dispatches to a raw byte-write (same `@emitWriteBytes`
@@ -1307,7 +1307,7 @@ pub fn runHooked(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
     commitLoad(c, regs);
 }
 
-// ---------- MIPS instruction encoders (for hand-assembling tests) ------
+// MIPS instruction encoders (for hand-assembling tests)
 
 pub fn encR(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, fn_: u32) u32 {
     return ((op  & 0x3F) << 26)
