@@ -41,7 +41,7 @@ const {
 
 const {
     sdlInit, sdlQuit, sdlBlit, sdlPump, sdlDelay,
-    sdlAudioOpen, sdlAudioClose, sdlAudioPush, sdlAudioQueuedBytes
+    sdlAudioOpen, sdlAudioClose, sdlAudioRingPush, psone_audio_cb
 } = import("sdl");
 const { Vec } = import("std").collections;
 const { File, exists } = import("std/fs");
@@ -259,8 +259,12 @@ const SCANLINES_TOTAL: u32 = 263;
 // frames in a GPU scratch u32 slot (slot 37); `line` lives in slot 36.
 const FloatBits = union { i: u32, f: f32 };
 
+// Returns the number of stereo audio samples generated this frame (one
+// per 768 CPU cycles ≈ 735–737). The main loop paces the frame off this
+// count so the emulator advances at exactly the rate that yields 44.1 kHz
+// output — keeping SPU production locked to the host's playback rate.
 fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
-               audioDev: u32) {
+               audioDev: u32, ring: *mut[] u8) u32 {
     // The scanline counter and the float GPU-cycle accumulator are
     // CONTINUOUS across frames, exactly like psxe's free-running gpu->line
     // / gpu->cycles. Persist them in GPU scratch slots 36/37 (the f32 via
@@ -365,17 +369,14 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
             gpuBuf[34] = sample;
         }
     }
-    // End-of-frame: feed the SPU samples we generated to SDL. Cap the
-    // queue depth at ~4 frames (~12 KB) so a host that emulates faster
-    // than 60 Hz doesn't grow the queue unboundedly — extra samples are
-    // dropped (host audio stays smooth, the emulator just doesn't
-    // accumulate latency). SDL drains the queue at the host's audio
-    // rate (44.1 kHz).
+    // End-of-frame: push this frame's samples into the SPSC ring. SDL's
+    // audio callback (psone_audio_cb) drains it at the host 44.1 kHz
+    // rate; under/overruns are handled at sample granularity inside the
+    // ring (silence-fill / bounded drop) rather than dropping whole
+    // frames. sdlAudioRingPush locks the device so it can't race the
+    // callback.
     if (audioDev != 0 && audioLen > 0) {
-        const queued: u32 = sdlAudioQueuedBytes(audioDev);
-        if (queued < 12000) {
-            sdlAudioPush(audioDev, audioBuf.asMutPtr(), audioLen);
-        }
+        sdlAudioRingPush(audioDev, ring, audioBuf.asMutPtr(), audioLen);
     }
     // NOTE: do NOT commitLoad here — each instruction's own commitLoad
     // handles the R3000 load-delay slot.
@@ -383,6 +384,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
     var outB: FloatBits = FloatBits { f: acc };
     gpuBuf[37] = outB.i;
     gpuBuf[35] = spuAcc;
+    return audioLen / 4;     // stereo samples produced this frame
 }
 
 // Dump the full 1024x512 VRAM as a binary PPM (P6 / 24-bit RGB) at
@@ -578,19 +580,22 @@ fn main() {
         print("JAM_PSONE_FULL_VRAM set — showing full VRAM\n");
     }
     var sdl: Sdl = sdlInit(title, sdlW, sdlH);
-    // Audio device — queue mode. Since the SPU is now advanced CPU-
-    // synchronously inside runOneFrame (one sample per 768 cycles for
-    // deterministic envelope state — required for Brave Fencer's intro
-    // to not loop, see commit 51b9ad9), the audio thread doesn't drive
-    // the SPU anymore. We open without a callback (cbAddr = 0) and feed
-    // SDL via SDL_QueueAudio (sdlAudioPush) at end of each frame. SDL
-    // pulls from its internal queue at the host audio rate.
-    const cbAddr: u64 = 0 as u64;
-    var audioDev: u32 = sdlAudioOpen(1024, cbAddr, 0 as u64);
+    // Audio device — callback + SPSC ring buffer. The SPU is advanced
+    // CPU-synchronously inside runOneFrame (one sample per 768 cycles
+    // for deterministic envelope state — required for Brave Fencer's
+    // intro to not loop, see commit 51b9ad9); those samples are pushed
+    // into `audioRing`, and SDL's audio callback (psone_audio_cb) drains
+    // the ring at the host 44.1 kHz rate. This replaces queue mode,
+    // whose whole-frame drops on pacing jitter were the "robotic" gaps.
+    // Blob = 16-byte header + 16384-byte data region (see sdl.jam RING_*).
+    var audioRing: [16400]u8 = [0; 16400];
+    var ringPtr: *mut[] u8 = audioRing.asMutPtr();
+    var audioDev: u32 = sdlAudioOpen(1024, psone_audio_cb as u64,
+                                     ringPtr as u64);
     if (audioDev == 0) {
         print("WARN: SDL audio device failed to open\n");
     } else {
-        print("Audio device opened (id={audioDev}, 44.1kHz S16 stereo, queue mode)\n");
+        print("Audio device opened (id={audioDev}, 44.1kHz S16 stereo, callback+ring)\n");
     }
     print("SDL2 ready.\n");
     // VRAM was already zero-filled when the Bus was allocated; the BIOS
@@ -655,10 +660,11 @@ fn main() {
                 lastPoly = curPoly;
             }
         }
-        runOneFrame(c, bus, regs.ptr, cop0.ptr, audioDev);
-        // Audio: runOneFrame fed the per-frame sample batch to SDL via
-        // SDL_QueueAudio. SDL drains the queue at the host's 44.1 kHz
-        // pull rate; no callback path active.
+        const frameSamples: u32 = runOneFrame(c, bus, regs.ptr, cop0.ptr,
+                                              audioDev, ringPtr);
+        // Audio: runOneFrame pushed the per-frame sample batch into the
+        // ring; SDL's callback (psone_audio_cb) drains it at the host's
+        // 44.1 kHz pull rate.
         var vram: *mut[] u8 = busVramPtr(bus);
         // Read the current display origin out of the GPU state buffer
         // (g[63] disp_x, g[64] disp_y — set by GP1 0x05). The BIOS
@@ -689,11 +695,22 @@ fn main() {
         // polling runs at VBlank cadence in the BIOS.
         padSetButtons(bus.pad.ptr, buttons[0]);
 
-        // Pace this frame to ~59.94 Hz. The renderer runs WITHOUT vsync (see
+        // Pace this frame by the AUDIO it produced: frameSamples / 44100 s.
+        // The SPU emits one sample per 768 CPU cycles, so this makes the
+        // emulator advance at exactly 33.8688 MHz — the rate at which
+        // production matches the host's 44.1 kHz playback, so the audio ring
+        // never drifts full (the old fixed-59.94 Hz target emitted ~737
+        // samples/frame = 44178 Hz, a 0.18% excess that crept the ring to
+        // overrun every few seconds). The renderer runs WITHOUT vsync (see
         // sdlInit — vsync would block the present on an unfocused window), so
-        // this wall-clock limiter is the sole pacer: sleep out the rest of the
-        // 16.68 ms frame so the loop runs at the PSX rate, not flat-out.
-        nextFrameMs = nextFrameMs + FRAME_MS;
+        // this wall-clock limiter is the sole pacer. Fall back to the fixed
+        // target only if a frame somehow produced no audio (avoids a busy
+        // spin); a normal frame is ~735–737 samples ≈ 16.7 ms.
+        var frameMs: f64 = FRAME_MS;
+        if (frameSamples > 0) {
+            frameMs = (frameSamples as f64) * 1000.0 / 44100.0;
+        }
+        nextFrameMs = nextFrameMs + frameMs;
         const nowMs: u32 = SDL_GetTicks();
         if ((nowMs as f64) < nextFrameMs) {
             SDL_Delay((nextFrameMs - (nowMs as f64)) as u32);

@@ -1247,35 +1247,8 @@ pub fn spuGaussInit(s: *mut[] u8) {
     spuGaussRow(s, 504, 0x5997, 0x599E, 0x59A4, 0x59A9, 0x59AD, 0x59B0, 0x59B2, 0x59B3);
 }
 
-// ---------- SDL audio callback ----------------------------------------
-//
-// Runs on SDL's audio thread at exactly 44.1 kHz. Pulls `len` bytes
-// (4 bytes per stereo frame: i16 L + i16 R) by calling spuGetSample
-// for each output frame. Sample timing is now owned by the audio
-// device — completely decoupled from the CPU loop's wall-clock pace.
-// This mirrors psxe (main.c:11-29 / spu.c:575): SPU advances one
-// sample per callback iteration.
-//
-// `userdata` is the address of a 32-byte AudioCtx blob laid out by
-// main.jam (offsets 0/8/16/24 = spu / spuram / ic / cop0). The host
-// pointer round-trips through u64 — the new IntToPtr cast in the Jam
-// compiler is what makes that possible without a C shim.
-//
-// Thread safety: the audio thread reads SPU register state that the
-// CPU thread mutates via spuWrite16/32. Aligned 16/32-bit loads/stores
-// are atomic on AArch64, so individual fields don't tear, but voice
-// state can briefly desynchronise on KON/KOFF. psxe accepts the same
-// race — the audible effect is a one-block (~0.6 ms) glitch in the
-// worst case.
-pub export fn psone_audio_cb(userdata: u64, stream: *mut[] u8, len: i32) {
-    // The SPU is now advanced CPU-synchronously from runOneFrame (one
-    // sample per 768 CPU cycles) so the state the game polls is
-    // deterministic. The audio thread must NOT advance it (that would
-    // double-step). Output silence for now; reconnecting audio means
-    // feeding the CPU-generated samples here via a ring buffer (TODO).
-    var i: i32 = 0;
-    while (i < len) {
-        stream[i] = 0;
-        i = i + 1;
-    }
-}
+// NOTE: the SDL audio callback (psone_audio_cb) lives in sdl.jam now.
+// The SPU is clocked CPU-synchronously from runOneFrame (one sample
+// per 768 cycles) for deterministic envelope state; those samples are
+// pushed into an SPSC ring buffer that the callback drains. The SPU
+// has no audio-thread coupling anymore.

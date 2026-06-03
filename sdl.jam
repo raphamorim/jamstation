@@ -78,19 +78,22 @@ extern fn objc_msgSend(recv: u64, sel: u64, a: u64, b: u64) u64;
 
 // --- audio ---
 //
-// Callback-mode SDL audio. SDL drives the SPU clock: every ~13 ms
-// the audio thread calls back into Jam (psone_audio_cb, defined in
-// spu.jam as `pub export fn`) for `samplesPerBuffer` stereo frames.
-// Each call advances the SPU by exactly that many samples at 44.1 kHz,
-// completely decoupled from the CPU loop's wall-clock pace — same
-// architecture as psxe (psx/main.c:11-29). Voice pitch stays correct
-// even if the emulator runs at 2× or 0.5× host speed.
+// Callback-mode SDL audio with an SPSC ring buffer. The SPU is NOT
+// driven by the audio thread (it's clocked CPU-synchronously inside
+// runOneFrame, one sample per 768 cycles, so the envelope the game
+// polls stays deterministic — Brave Fencer's intro depends on this).
+// Instead the CPU loop PRODUCES samples into a ring buffer, and SDL's
+// audio callback (psone_audio_cb) CONSUMES from it at the rock-steady
+// host 44.1 kHz rate. Under/overruns are handled at sample granularity
+// (silence-fill on underrun, bounded drop on overrun) instead of the
+// whole-frame drops that queue mode (SDL_QueueAudio) produced — which
+// were the source of the "robotic" gaps/clicks.
 //
 // `cbAddr` is the address of `psone_audio_cb` (computed in main.jam
-// via Jam's fn-as-u64 coercion — the new ptrtoint cast lowering in
-// the compiler is what makes this expressible without a C shim).
-// `userdata` is the AudioCtx blob holding the bus pointers the
-// callback needs to reach SPU state.
+// via Jam's fn-as-u64 coercion — the ptrtoint cast lowering in the
+// compiler is what makes this expressible without a C shim).
+// `userdata` is the ring-buffer blob the callback drains (see the
+// RING_* layout below).
 //
 // SDL_OpenAudioDevice's first arg is `const char*`. We need to pass
 // NULL to mean "use the default playback device"; Jam can't express
@@ -103,6 +106,12 @@ extern fn SDL_CloseAudioDevice(dev: u32);
 extern fn SDL_PauseAudioDevice(dev: u32, pause_on: i32);
 extern fn SDL_QueueAudio(dev: u32, data: *const[] u8, len: u32) i32;
 extern fn SDL_GetQueuedAudioSize(dev: u32) u32;
+// Held by the producer (sdlAudioRingPush) while it touches the ring
+// header; SDL holds the SAME lock while the callback runs, so producer
+// and consumer are never concurrent. jam/std has no atomics, so this
+// is how we get cross-thread safety + the needed memory barriers.
+extern fn SDL_LockAudioDevice(dev: u32);
+extern fn SDL_UnlockAudioDevice(dev: u32);
 
 const SDL_INIT_AUDIO: u32 = 0x00000010;
 // AUDIO_S16SYS on little-endian hosts (macOS) is 0x8010 — signed,
@@ -271,16 +280,109 @@ pub fn sdlAudioClose(dev: u32) {
     if (dev != 0) { SDL_CloseAudioDevice(dev); }
 }
 
-// Push raw S16LE stereo samples to the device. Each entry is 4 bytes
-// (i16 L + i16 R). Returns 0 on success.
-pub fn sdlAudioPush(dev: u32, data: *mut[] u8, byteLen: u32) i32 {
-    if (dev == 0) { return 0; }
-    return SDL_QueueAudio(dev, data as *const[] u8, byteLen);
+// ---- SPSC audio ring buffer ---------------------------------------
+// The CPU loop (producer) pushes the per-frame sample batch; SDL's
+// audio callback (consumer) drains it at the host rate. Layout of the
+// `userdata` blob handed to SDL (indices are byte offsets into the
+// CAP-byte data region, CAP a power of two so wrap == & MASK):
+//   @0  wr      u32  producer-owned write offset  [0, CAP)
+//   @4  rd      u32  consumer-owned read offset   [0, CAP)
+//   @8  primed  u32  0 until PRIME bytes buffered; gates draining so
+//                    we don't thrash on startup / after an underrun
+//   @16 data    [CAP]u8  the ring storage
+// Total blob = RING_DATA_OFF + CAP bytes (see main.jam's audioRing).
+const RING_CAP:      u32 = 16384;     // 4096 stereo samples ≈ 93 ms
+const RING_MASK:     u32 = 16383;     // CAP - 1 (CAP is 2^14)
+const RING_DATA_OFF: u32 = 16;        // header bytes before the data
+const RING_PRIME:    u32 = 8192;      // prebuffer ≈ 46 ms before play
+
+// Little-endian u32 accessors for the ring header. Byte-wise so there
+// are no alignment assumptions on the blob.
+pub fn getU32Le(buf: *mut[] u8, off: u32) u32 {
+    return (buf[off] as u32)
+        | ((buf[off + 1] as u32) << 8)
+        | ((buf[off + 2] as u32) << 16)
+        | ((buf[off + 3] as u32) << 24);
+}
+pub fn setU32Le(buf: *mut[] u8, off: u32, v: u32) {
+    buf[off]     = (v         & 0xFF) as u8;
+    buf[off + 1] = ((v >>  8) & 0xFF) as u8;
+    buf[off + 2] = ((v >> 16) & 0xFF) as u8;
+    buf[off + 3] = ((v >> 24) & 0xFF) as u8;
 }
 
-pub fn sdlAudioQueuedBytes(dev: u32) u32 {
-    if (dev == 0) { return 0; }
-    return SDL_GetQueuedAudioSize(dev);
+// PRODUCER (CPU thread): append `n` bytes of S16LE stereo samples from
+// `src` into the ring. Locks the device so it can't race the callback.
+// On overrun (ring nearly full — rare, since the audio-paced frame
+// limiter keeps production matched to the host rate) the OLDEST whole
+// frames are dropped to make room, keeping wr/rd frame-aligned.
+pub fn sdlAudioRingPush(dev: u32, ring: *mut[] u8, src: *mut[] u8, n: u32) {
+    if (dev == 0) { return; }
+    SDL_LockAudioDevice(dev);
+    var wr: u32 = getU32Le(ring, 0);
+    var rd: u32 = getU32Le(ring, 4);
+    // `n` is always a whole number of stereo frames (4 bytes each). EVERY
+    // index movement here MUST stay a multiple of 4, or wr/rd drift off the
+    // L/R grid and the callback reads half-frames — which swaps/tears the
+    // channels into loud noise. (The old code clamped toWrite to `free`,
+    // but free = RING_CAP-1-avail is ODD, so an overrun wrote an odd byte
+    // count and permanently misaligned the ring — the "weird audio" bug.)
+    const avail: u32 = (wr - rd) & RING_MASK;
+    const free: u32 = RING_CAP - 1 - avail;   // 1-byte gap = empty/full
+    if (n > free) {
+        // Overrun: jam emits a hair above 44.1 kHz (≈+300 B/s), so the ring
+        // slowly fills. Make room by dropping the OLDEST whole frames — this
+        // keeps latency bounded and plays the freshest audio, with at worst a
+        // faint periodic skip instead of channel-tearing. Safe to move rd
+        // here: SDL holds the device lock, so the callback can't be running.
+        var need: u32 = n - free;
+        need = (need + 3) & 0xFFFFFFFC;       // round up to whole frames
+        rd = (rd + need) & RING_MASK;
+        setU32Le(ring, 4, rd);
+    }
+    // n now fits and is frame-aligned; write the whole batch.
+    var i: u32 = 0;
+    while (i < n) {
+        ring[RING_DATA_OFF + wr] = src[i];
+        wr = (wr + 1) & RING_MASK;
+        i = i + 1;
+    }
+    setU32Le(ring, 0, wr);
+    // Once enough is buffered, allow the callback to start draining.
+    const after: u32 = (wr - rd) & RING_MASK;
+    if (after >= RING_PRIME) { setU32Le(ring, 8, 1); }
+    SDL_UnlockAudioDevice(dev);
+}
+
+// CONSUMER (SDL audio thread): SDL calls this with the device lock
+// already held, so it's serialized against sdlAudioRingPush. Drains up
+// to `len` bytes from the ring into `stream`; zero-fills any shortfall.
+pub export fn psone_audio_cb(userdata: u64, stream: *mut[] u8, len: i32) {
+    var ring: *mut[] u8 = userdata as *mut[] u8;
+    const want: u32 = len as u32;
+    var i: u32 = 0;
+    // Not yet primed (startup or post-underrun rebuffer) → silence.
+    if (getU32Le(ring, 8) == 0) {
+        while (i < want) { stream[i] = 0; i = i + 1; }
+        return;
+    }
+    const wr: u32 = getU32Le(ring, 0);
+    var rd: u32 = getU32Le(ring, 4);
+    const avail: u32 = (wr - rd) & RING_MASK;
+    var toRead: u32 = want;
+    if (toRead > avail) { toRead = avail; }
+    while (i < toRead) {
+        stream[i] = ring[RING_DATA_OFF + rd];
+        rd = (rd + 1) & RING_MASK;
+        i = i + 1;
+    }
+    setU32Le(ring, 4, rd);
+    // Underrun: zero-fill the rest and re-arm priming so we rebuffer
+    // ~PRIME bytes before resuming (avoids repeated underrun thrash).
+    if (toRead < want) {
+        while (i < want) { stream[i] = 0; i = i + 1; }
+        setU32Le(ring, 8, 0);
+    }
 }
 
 // Pack an SDL_Rect (4 × i32 = 16 bytes) into a heap buffer. PSX
