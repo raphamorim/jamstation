@@ -54,6 +54,8 @@ Keyboard maps to a digital PSX controller in slot 1:
 
 - https://github.com/allkern/psxe
 - https://github.com/stenzek/duckstation
+- https://github.com/JaCzekanski/Avocado
+- https://problemkaputt.de/psx.htm
 
 ## Disclaimers
 
