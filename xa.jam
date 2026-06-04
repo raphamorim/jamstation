@@ -1,5 +1,4 @@
-// XA-ADPCM audio decoder — port of psxe/psx/dev/cdrom/audio.c.
-//
+// note:
 // XA sectors are Mode 2 / Form 2 CD-ROM sectors carrying compressed
 // 4-bit ADPCM audio. The format is:
 //
@@ -15,19 +14,8 @@
 // Each block produces 28 i16 samples via:
 //   s = (nibble << shift) + (f0 * prev1 + f1 * prev2 + 32) / 64
 // clamped to int16.
-//
-// We expose:
-//   xaDecodeBlock(buf, idx, blk, nib, dst, hist) — decode one block
-//   xaDecodeSector(secBuf, leftBuf, rightBuf, monoBuf, leftH, rightH) → bool
-//   xaSectorIsAudio(secBuf) — quick check of sub-mode byte
-//   xaSectorMatchesFilter(secBuf, xaFile, xaChannel) — file/channel match
-//
-// The decoder is wired into cdrom.jam's sector-read path so audio sectors
-// are decoded as they stream. Playback (mixing into the SPU CDIN path) is
-// not yet integrated — psxe routes XA through SDL audio in audio.c.
 
-// ADPCM predictor coefficient tables (5 entries; filter index 0..3 maps
-// to entries 0..3; entry 4 is psxe's table padding and rarely hit).
+// ADPCM predictor coefficient tables
 pub fn xaPosCoef(idx: u32) i32 {
     if (idx == 0) { return   0; }
     if (idx == 1) { return  60; }
@@ -44,9 +32,6 @@ pub fn xaNegCoef(idx: u32) i32 {
     return -60;
 }
 
-// Wrap to int16 (psxe XA reconstruction truncates, not saturates;
-// audio.c:99 assigns the sum to int16_t). xaClampI16 is kept for the
-// output-mix path which legitimately saturates.
 pub fn xaWrap16(v: i32) i32 {
     return ((v & 0xFFFF) ^ 0x8000) - 0x8000;
 }
@@ -109,7 +94,8 @@ pub fn xaDecodeBlock(secBuf: *mut[] u8,
     var shiftVal: i32 = (hdr & 0x0F) as i32;
     if (shiftVal > 12) { shiftVal = 9; }
     const shift: i32 = 12 - shiftVal;
-    const filter: u32 = (hdr >> 4) & 3;     // psxe masks to 0x30 then >>4
+     // self note: psxe masks to 0x30 then >>4
+    const filter: u32 = (hdr >> 4) & 3;
     const f0: i32 = xaPosCoef(filter);
     const f1: i32 = xaNegCoef(filter);
     var j: u32 = 0;
@@ -122,7 +108,7 @@ pub fn xaDecodeBlock(secBuf: *mut[] u8,
         const old: i32 = (t << 12) >> 12;
         const shifted: i32 = old << shift;
         const pred: i32 = (f0 * hist[0] + f1 * hist[1] + 32) / 64;
-        // psxe wraps to int16 here, not saturates (audio.c:99).
+        // self note: psxe wraps to int16 here, not saturates
         const s: i32 = xaWrap16(shifted + pred);
         hist[1] = hist[0];
         hist[0] = s;
@@ -131,7 +117,7 @@ pub fn xaDecodeBlock(secBuf: *mut[] u8,
     }
 }
 
-// Decode a full XA sector. For stereo sectors writes 18 * 4/2 = 4032
+// for stereo sectors writes 18 * 4/2 = 4032
 // samples total split across leftBuf / rightBuf (2016 each); for mono
 // writes 4032 samples into monoBuf. Returns the number of samples
 // emitted to ONE channel (4032 mono, 2016 per side for stereo).
@@ -140,7 +126,8 @@ pub fn xaDecodeSector(secBuf: *mut[] u8,
                       monoBuf: *mut[] i32,
                       leftH: *mut[] i32, rightH: *mut[] i32) u32 {
     const stereo: bool = xaSectorIsStereo(secBuf);
-    var src: u32 = 24;        // first sound group starts at byte 24
+    // first sound group starts at byte 24
+    var src: u32 = 24;
     var leftIdx: u32 = 0;
     var rightIdx: u32 = 0;
     var monoIdx: u32 = 0;
