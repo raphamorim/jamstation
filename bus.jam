@@ -401,10 +401,3 @@ pub fn busWrite8(bus: Bus, cop0: *mut[] u32, addr: u32, val: u32) {
     }
 }
 
-// Direct buffer accessors.
-pub fn busRamPtr(bus: Bus)  *mut[] u8 { return bus.ram.ptr;  }
-pub fn busBiosPtr(bus: Bus) *mut[] u8 { return bus.bios.ptr; }
-pub fn busVramPtr(bus: Bus) *mut[] u8 { return bus.vram.ptr; }
-pub fn busDmaPtr(bus: Bus) *mut[] u32 { return bus.dma.ptr; }
-pub fn busIrqPtr(bus: Bus) *mut[] u32 { return bus.irq.ptr; }
-pub fn busGtePtr(bus: Bus) *mut[] u32 { return bus.gte.ptr; }

@@ -11,8 +11,7 @@
 const {
     Bus,
     allocBus, busRead32, busRead16, busRead8,
-    busWrite32, busWrite16, busWrite8,
-    busRamPtr, busBiosPtr, busVramPtr
+    busWrite32, busWrite16, busWrite8
 } = import("bus");
 // Force device modules into main.jam's codegen context.
 const { Gpu } = import("gpu");
@@ -193,7 +192,7 @@ fn loadExe(path: []u8, bus: Bus, regs: *mut[] u32, c: mut Cpu) {
             var bp: *mut[] u8 = body.ptr;
             f.read(bp[0..fileSz]);
             const dst: u32 = ramDest & 0x001FFFFF;
-            var ram: *mut[] u8 = busRamPtr(bus);
+            var ram: *mut[] u8 = bus.ram.ptr;
             var i: u32 = 0;
             while (i < fileSz) {
                 ram[dst + i] = body[i];
@@ -224,7 +223,7 @@ fn loadExe(path: []u8, bus: Bus, regs: *mut[] u32, c: mut Cpu) {
 fn loadBios(path: []u8, bus: Bus) u64 {
     match (File.open(path)) {
         Some(f) {
-            var biosPtr: *mut[] u8 = busBiosPtr(bus);
+            var biosPtr: *mut[] u8 = bus.bios.ptr;
             var bios: []u8 = biosPtr[0..0x80000];
             const got: u64 = f.read(bios);
             f.close();
@@ -663,7 +662,7 @@ fn main() {
         // Audio: runOneFrame pushed the per-frame sample batch into the
         // ring; SDL's callback (psone_audio_cb) drains it at the host's
         // 44.1 kHz pull rate.
-        var vram: *mut[] u8 = busVramPtr(bus);
+        var vram: *mut[] u8 = bus.vram.ptr;
         // Read the current display origin out of the GPU state buffer
         // (g[63] disp_x, g[64] disp_y - set by GP1 0x05). The BIOS
         // moves these around during double-buffered animation.
