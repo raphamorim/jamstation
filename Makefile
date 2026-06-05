@@ -1,4 +1,4 @@
-JAM := ../jam/output/jam.out
+JAM ?= jam
 BIN := jamstation
 
 # SDL2 locations differ per platform. Override SDL_LIB/SDL_INC on the
@@ -20,11 +20,9 @@ else
     OBJC_LIB :=
 endif
 
-# Point at the std/ directory in the in-tree jam build. The installed
-# jam binary auto-discovers std/ via $PREFIX/lib/jam/std, but the dev
-# layout (../jam/output/jam.out + ../jam/std) needs an explicit hint.
-JAM_STD ?= ../jam/std
-BUILD_ENV := LIBRARY_PATH=$(SDL_LIB) JAM_STD_PATH=$(JAM_STD)
+# The installed `jam` auto-discovers its std/ (via $PREFIX/lib/jam/std),
+# so only SDL needs to be on the library path.
+BUILD_ENV := LIBRARY_PATH=$(SDL_LIB)
 
 .PHONY: test build run release run-release clean fmt
 
