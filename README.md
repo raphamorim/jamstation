@@ -68,6 +68,10 @@ It's a raw 128 KB image (the common headerless `.mcd` / `.mcr` format), so cards
 - https://github.com/JaCzekanski/Avocado
 - https://problemkaputt.de/psx.htm
 
+## License
+
+JamStation is released under the [MIT License](LICENSE).
+
 ## Disclaimers
 
 "PlayStation" and "PSX" are registered trademarks of Sony Interactive Entertainment Europe Limited. This project is not affiliated in any way with Sony Interactive Entertainment.
