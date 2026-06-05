@@ -531,8 +531,8 @@ const BTN_CROSS:    u32 = 0x4000;
 const BTN_SQUARE:   u32 = 0x8000;
 
 // Translate a USB-HID scancode to a PSX SDA button mask bit. Returns 0
-// for unmapped keys. Keep close to the standard PCSX / DuckStation /
-// PSXE keybinding layout so it feels familiar.
+// for unmapped keys. Keep close to the standard PCSX / DuckStation
+// keybinding layout so it feels familiar.
 pub fn scancodeToBtn(scan: u32) u32 {
     match (scan) {
         SC_UP     { return BTN_UP; }

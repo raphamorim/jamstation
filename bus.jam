@@ -1,4 +1,4 @@
-// PSX memory bus (port of psxe/psx/bus.c).
+// PSX memory bus.
 //
 // Routes word / halfword / byte reads and writes through the masked
 // physical address. Owns the RAM / BIOS / scratchpad / flat-IO / VRAM
@@ -117,14 +117,14 @@ pub fn bufWrite8(buf: *mut[] u8, off: u32, val: u32) {
     buf[off] = (val & 0xFF) as u8;
 }
 
-// Per-region routing. Same as psxe's static IO-base/size table inlined
+// Per-region routing. A static IO-base/size table inlined
 // into an address comparator. `kind` values:
 //   0 = unmapped (reads return 0)
 //   1 = RAM
 //   2 = BIOS ROM
 //   3 = scratchpad
 //   4 = I/O register file
-//   5 = EXP1 (returns 0xFF on read — psxe psx_exp1_read* with no cart loaded)
+//   5 = EXP1 (returns 0xFF on read with no cart loaded)
 //   6 = EXP2 (DTL debug-console region; only the ATC status byte matters)
 pub fn route(paddr: u32) BusRoute {
     if (paddr < 0x00800000) {
@@ -143,8 +143,8 @@ pub fn route(paddr: u32) BusRoute {
         const r = BusRoute { kind: 4, off: paddr - 0x1F801000 };
         return r;
     }
-    // EXP2 (0x1F802000–0x1F9FFFFF): psxe routes this whole range to the
-    // EXP2/DTL device (exp2.h). Previously it fell into the I/O branch and
+    // EXP2 (0x1F802000–0x1F9FFFFF): this whole range routes to the
+    // EXP2/DTL device. Previously it fell into the I/O branch and
     // read back the zero buffer; route it as kind 6 so the DTL ATC status
     // byte reads correctly.
     if (paddr >= 0x1F802000 && paddr < 0x1FA00000) {
@@ -175,7 +175,7 @@ pub fn allocBus() Bus {
     var io = Vec(u8).filled(0, IO_SIZE);
     var vram = Vec(u8).filled(0, VRAM_SIZE);
     // Pre-init MC1 (0x1F801000..0x1F801023) and MC2 (0x1F801060) with the
-    // BIOS-expected default values per psxe mc1.c/mc2.c. The BIOS reads
+    // BIOS-expected default values. The BIOS reads
     // these at boot to verify access timings and RAM mirror config; before
     // it writes them itself the values must match real hardware so the
     // self-check doesn't latch a "?" error.
@@ -332,7 +332,7 @@ pub fn busRead32(bus: Bus, addr: u32) u32 {
         2 { return bufRead32(bus.bios.ptr, r.off & (BIOS_SIZE - 1)); }
         3 { return bufRead32(bus.spad.ptr, r.off & (SPAD_SIZE - 1)); }
         4 { return ioRead32(bus, r.off); }
-        // kind 5: EXP1 (no cart loaded) — psxe exp1.c reads return 0xFF per byte.
+        // kind 5: EXP1 (no cart loaded) — reads return 0xFF per byte.
         5 { return 0xFFFFFFFF; }
         _ { return 0; }
     }
@@ -362,7 +362,7 @@ pub fn busRead8(bus: Bus, addr: u32) u32 {
         5 { return 0xFF; }
         // EXP2 DTL: ATC_STAT (off 0) reads atc_stat|8; jam never drives
         // the DTL TTY so atc_stat is 0, making it a constant 8. ATC_DATA
-        // (off 2) and the rest read 0 (psxe exp2.c psx_exp2_read8:38-48).
+        // (off 2) and the rest read 0.
         6 { if (r.off == 0) { return 8; } return 0; }
         _ { return 0; }
     }

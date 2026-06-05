@@ -1,4 +1,4 @@
-// Interrupt controller (port of psxe/psx/dev/ic.c).
+// Interrupt controller.
 //
 // Two registers live at 0x1F801070..0x1F801077:
 //   0x00 I_STAT  status — set by devices raising IRQs, cleared by
@@ -14,7 +14,7 @@
 
 const { Vec } = import("std/collections");
 
-// IRQ line bits (psxe ic.h: IC_VBLANK = 0x001, etc.).
+// IRQ line bits (IC_VBLANK = 0x001, etc.).
 pub const IC_VBLANK: u32 = 0x001;
 pub const IC_GPU:    u32 = 0x002;
 pub const IC_CDROM:  u32 = 0x004;

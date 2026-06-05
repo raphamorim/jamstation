@@ -124,8 +124,7 @@ const SCREEN_W: i32 = 640;
 const SCREEN_H: i32 = 480;
 
 // Decode the GPU's display-mode register (set by GP1 0x08) into
-// horizontal and vertical pixel counts. Mirrors psxe's
-// `psx_get_dmode_width` / `psx_get_dmode_height` so the SDL window
+// horizontal and vertical pixel counts so the SDL window
 // shows whatever resolution the BIOS or game has currently selected.
 //
 // Bit layout of GP1 0x08:
@@ -145,12 +144,12 @@ fn dmodeWidth(dm: u32) i32 {
 }
 
 fn dmodeHeight(dm: u32, gpuState: *mut[] u32) i32 {
-    // Vertical 480 requires interlace (bit 5) + bit 2 set per psxe.
+    // Vertical 480 requires interlace (bit 5) + bit 2 set.
     if ((dm & 0x04) != 0 && (dm & 0x20) != 0) { return 480; }
-    // psxe: when bit 2 alone is set, also 480.
+    // When bit 2 alone is set, also 480.
     if ((dm & 0x04) != 0) { return 480; }
     // Otherwise compute from GP1(07) vertical range. g[67]=disp_y1,
-    // g[68]=disp_y2. Mirrors psxe psx_get_dmode_height.
+    // g[68]=disp_y2.
     const y1: i32 = gpuState[67] as i32;
     const y2: i32 = gpuState[68] as i32;
     const disp: i32 = y2 - y1;
@@ -236,20 +235,19 @@ fn loadBios(path: []u8, bus: Bus) u64 {
     return 0;
 }
 
-// Run one full NTSC frame, mirroring psxe's GPU timing EXACTLY.
+// Run one full NTSC frame with cycle-accurate GPU timing.
 //
-// psxe runs the GPU on its own 53.693175 MHz clock (gpu.c psx_gpu_update):
-// a scanline is 3413 GPU cycles and HBlank spans [2560, 3413] (the last
-// ~25%). Each instruction advances a *float* accumulator by
+// The GPU runs on its own 53.693175 MHz clock: a scanline is 3413 GPU
+// cycles and HBlank spans [2560, 3413] (the last ~25%). Each instruction
+// advances a *float* accumulator by
 // `delta_cpu_cycles × (53.693175 / 33.868800)` GPU cycles. The HBlank
 // event — line++, GPUSTAT bit-31 (odd/even), VBlank IRQ — fires on the
 // crossing INTO [2560,3413]; the scanline wraps (acc -= 3413) on the
-// crossing back out. We replicate this in f32 so the sub-cycle phase
-// tracks psxe bit-for-bit: an integer cycles/scanline drifts ~0.03
+// crossing back out. The f32 accumulator preserves the sub-cycle phase:
+// an integer cycles/scanline drifts ~0.03
 // cyc/line and by ~19M instructions mistimes a VBlank IRQ enough to
-// diverge (found via REG_TRACE cmp — see jamstation-psxe-parity memory).
-// jam's f32 behaviour on these exact values is pinned in
-// ../jam/tests/unit/test_float_psxe_parity.jam.
+// diverge (found via REG_TRACE cmp).
+// jam's f32 behaviour on these exact values is pinned by a unit test.
 const GPU_CYCLES_HDRAW: f32 = 2560.0;
 const GPU_CYCLES_SCANL: f32 = 3413.0;
 const SCANLINES_VDRAW: u32 = 240;
@@ -266,14 +264,14 @@ const FloatBits = union { i: u32, f: f32 };
 fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
                audioDev: u32, ring: *mut[] u8) u32 {
     // The scanline counter and the float GPU-cycle accumulator are
-    // CONTINUOUS across frames, exactly like psxe's free-running gpu->line
-    // / gpu->cycles. Persist them in GPU scratch slots 36/37 (the f32 via
+    // CONTINUOUS across frames — they free-run rather than resetting per
+    // frame. Persist them in GPU scratch slots 36/37 (the f32 via
     // a u32 type-pun) so the sub-cycle phase doesn't reset every frame.
     var gpuBuf: *mut[] u32 = bus.gpu.bufPtr();
     var line: u32 = gpuBuf[36];
     var accB: FloatBits = FloatBits { i: gpuBuf[37] };
     var acc: f32 = accB.f;
-    // psxe gpu.c: GPU cycles per CPU cycle = 53.693175 / 33.868800 MHz.
+    // GPU cycles per CPU cycle = 53.693175 / 33.868800 MHz.
     const ratio: f32 = (53.693175 as f32) / (33.868800 as f32);
     // SPU sample accumulator: 1 sample per 768 CPU cycles (33.8688MHz/44100).
     // Drives the ADSR envelope CPU-synchronously (slot 35, persisted).
@@ -290,25 +288,24 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
         const before: u64 = c.cycles;
         step(c, bus, regs, cop0);
         const delta: u32 = (c.cycles - before) as u32;
-        // Per-instruction device order MIRRORS psxe psx_update (psx.c:95-99)
-        // EXACTLY: cdrom → gpu → pad → timer → dma. (Was timer→dma→cdrom→…→gpu;
-        // the order decides which IRQ bit lands in I_STAT first each step, and
-        // psxe fires the GPU hblank/vblank events BEFORE the sysclk timer +2.)
+        // Per-instruction device order: cdrom → gpu → pad → timer → dma.
+        // (Was timer→dma→cdrom→…→gpu; the order decides which IRQ bit lands
+        // in I_STAT first each step, and the GPU hblank/vblank events must
+        // fire BEFORE the sysclk timer +2.)
 
-        // 1. CDROM (psx.c:95)
+        // 1. CDROM
         bus.cdrom.update(bus.disc.ptrMut(), bus.spu.ptr, bus.irq.ptr, cop0, delta);
 
-        // 2. GPU (psx.c:96) — psx_gpu_update: scanline window [0,3413], HBlank
-        // [2560,3413]. The HBlank event (line++, GPUSTAT bit-31 odd/even, the
-        // hblank/vblank timer hooks + VBlank IRQ) fires on the crossing INTO
-        // [2560,3413] (~75% through the line); the scanline wraps on crossing
-        // out. This runs BEFORE the sysclk timer update, matching psxe.
+        // 2. GPU — scanline window [0,3413], HBlank [2560,3413]. The HBlank
+        // event (line++, GPUSTAT bit-31 odd/even, the hblank/vblank timer
+        // hooks + VBlank IRQ) fires on the crossing INTO [2560,3413] (~75%
+        // through the line); the scanline wraps on crossing out. This runs
+        // BEFORE the sysclk timer update.
         const prevHb: bool = acc >= GPU_CYCLES_HDRAW && acc <= GPU_CYCLES_SCANL;
         acc = acc + (delta as f32) * ratio;
         const currHb: bool = acc >= GPU_CYCLES_HDRAW && acc <= GPU_CYCLES_SCANL;
         if (currHb && !prevHb) {
-            // psxe gpu_hblank_event (gpu.c:1908-1962), fired from the
-            // HBlank-begin edge.
+            // GPU HBlank event, fired from the HBlank-begin edge.
             bus.timer.hblankBegin(bus.irq.ptr, cop0);
             if (line < SCANLINES_VDRAW) {
                 if ((line & 1) != 0) {
@@ -329,24 +326,24 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
                 frameDone = true;
             }
         } else if (prevHb && !currHb) {
-            // HBlank-end edge → wrap the scanline accumulator (psxe:
-            // gpu->cycles -= 3413).
+            // HBlank-end edge → wrap the scanline accumulator
+            // (acc -= 3413).
             bus.timer.hblankEnd();
             acc = acc - GPU_CYCLES_SCANL;
         }
-        // 3. PAD (psx.c:97)
+        // 3. PAD
         padUpdate(bus.pad.ptr, bus.irq.ptr, cop0, delta);
-        // 4. TIMER sysclk (psx.c:98) — updateCyc ignores delta, uses 2 (psxe).
+        // 4. TIMER sysclk — updateCyc ignores delta, uses 2.
         bus.timer.updateCyc(bus.irq.ptr, cop0, delta);
-        // 5. DMA (psx.c:99)
+        // 5. DMA
         dmaTickSpu(bus.dma.ptr, delta);
         dmaUpdate(bus.dma.ptr, bus.irq.ptr, cop0);
 
-        // jam-only extras: psxe steps NEITHER in psx_update. Kept at the
-        // end (least perturbation to the psxe device order above) and flagged
-        // as divergences — SIO1 → peripherals task, SPU CPU-clock → SPU task
-        // (psxe runs SPU on the audio thread; revisit once the deterministic
-        // CPU surface matches psxe).
+        // jam-only extras: neither of these belongs in the per-instruction
+        // device update above. Kept at the end (least perturbation to the
+        // device order above) and flagged as divergences — SIO1 →
+        // peripherals task, SPU CPU-clock → SPU task (revisit once the
+        // deterministic CPU surface settles).
         bus.sio1.update(bus.irq.ptr, cop0, delta);
         spuAcc = spuAcc + delta;
         while (spuAcc >= 768) {
@@ -460,14 +457,13 @@ fn main() {
 
     // Memory card slot 1 — pull saved data from ./slot1.mcd if it
     // exists. On exit we write the (possibly modified) 128 KB buffer
-    // back to the same file so saves survive across runs. Mirrors
-    // psxe's psx_mcd_init / psx_mcd_destroy lifecycle.
+    // back to the same file so saves survive across runs.
     var mcdPath: []u8 = "./slot1.mcd";
     if (mcdRamLoad(bus.mcdRam.ptr, mcdPath)) {
         print("Loaded memcard: ./slot1.mcd\n");
     }
 
-    // Match psxe's initial COP0 state. The 0x10900000 value seeds COP0
+    // Initial COP0 state. The 0x10900000 value seeds COP0
     // SR with CU0 enabled, BEV set, and a few breakpoint controls.
     cop0Write(cop0.ptr, C0_SR,   0x10900000);
     cop0Write(cop0.ptr, C0_PRID, 0x00000002);
@@ -510,7 +506,7 @@ fn main() {
     // that depend on the BIOS kernel being set up, drop the EXE at
     // `./game.exe` instead: we boot the BIOS first and only sideload
     // when PC reaches 0x80030000 (the standard "kernel ready" address
-    // psxe uses for the same handoff).
+    // for this handoff).
     var demoPath = "./demo.exe";
     var gamePath = "./game.exe";
     var cuePath:  []u8 = "./game.cue";
@@ -721,8 +717,7 @@ fn main() {
         }
     }
 
-    // Persist memcard slot 1 to disk before freeing the bus. psxe does
-    // the equivalent in psx_mcd_destroy.
+    // Persist memcard slot 1 to disk before freeing the bus.
     mcdRamSave(bus.mcdRam.ptr, mcdPath);
 
     sdlAudioClose(audioDev);

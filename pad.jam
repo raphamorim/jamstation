@@ -1,5 +1,5 @@
-// SIO0 joypad controller (port of psxe/psx/dev/pad.c + the SDA digital
-// pad protocol). Register file at 0x1F801040..0x1F80104F:
+// SIO0 joypad controller (SDA digital pad protocol). Register file at
+// 0x1F801040..0x1F80104F:
 //   0x40  JOY_TX_FIFO (write) / JOY_RX_FIFO (read)
 //   0x44  JOY_STAT  (read)
 //   0x48  JOY_MODE
@@ -155,8 +155,8 @@ pub fn sdaWrite(p: *mut[] u8, data: u32) {
     }
 }
 
-// pad_read_rx: returns the next byte the controller has staged in
-// response to the last TX. Mirrors psxe — when CTRL.JOUT and RXEN are
+// padReadRx: returns the next byte the controller has staged in
+// response to the last TX. When CTRL.JOUT and RXEN are
 // both clear, the line is high-Z and reads return 0xFFFFFFFF.
 pub fn padReadRx(p: *mut[] u8, mcd: mut Mcd, mcdRam: *mut[] u8) u32 {
     const ctrl: u32 = padGetU16(p, P_CTRL_LO);
@@ -187,7 +187,7 @@ pub fn padWriteTx(p: *mut[] u8, mcd: mut Mcd, data: u32) {
     if ((ctrl & CTRL_TXEN) == 0) { return; }
     if (p[P_DEST] == 0) {
         // First TX byte selects the destination (0x01 = joy, 0x81 = mcd).
-        // psxe pad.c:66-78: sets dest, schedules the ACK-pulse countdown
+        // Sets dest, schedules the ACK-pulse countdown
         // if CTRL_ACIE — but does NOT set irq_bit on the first byte. The
         // BIOS expects IC_JOY to assert while STAT.IRQ7 stays 0 until a
         // *subsequent* byte writes through.
@@ -209,12 +209,12 @@ pub fn padWriteTx(p: *mut[] u8, mcd: mut Mcd, data: u32) {
     }
     if (p[P_DEST] == DEST_JOY as u8) {
         sdaWrite(p, data);
-        // psxe pad.c:90-91: if the controller has nothing more to send,
+        // If the controller has nothing more to send,
         // drop the slot so the next first byte re-selects.
         if (p[P_SDA_TXR] == 0) { p[P_DEST] = 0; }
     } else if (p[P_DEST] == DEST_MCD as u8) {
         mcd.write(data);
-        // psxe pad.c:103-108: MCD always sets irq_bit and uses a 1024-
+        // MCD always sets irq_bit and uses a 1024-
         // cycle delay (vs JOY's 512). The longer ACK reflects the MCD's
         // slower response time.
         if ((ctrl & CTRL_ACIE) != 0) {
@@ -233,7 +233,7 @@ pub fn padWriteTx(p: *mut[] u8, mcd: mut Mcd, data: u32) {
     }
 }
 
-// pad_handle_ctrl_write: write to JOY_CTRL. Per psxe: when JOUT is
+// padHandleCtrlWrite: write to JOY_CTRL. When JOUT is
 // cleared, also clear the slot bit; bit 4 (ACKN) is a one-shot that
 // clears STAT bits 3, 4, 5, 9 and self-clears.
 pub fn padHandleCtrlWrite(p: *mut[] u8, mcd: mut Mcd, value: u32) {
@@ -242,7 +242,7 @@ pub fn padHandleCtrlWrite(p: *mut[] u8, mcd: mut Mcd, value: u32) {
         var ctrl: u32 = padGetU16(p, P_CTRL_LO);
         ctrl = ctrl & (~CTRL_SLOT);
         padSetU16(p, P_CTRL_LO, ctrl);
-        // psxe pad.c:134-135: !JOUT also resets the slot's MCD state so
+        // !JOUT also resets the slot's MCD state so
         // the next 0x81 select starts a fresh transaction. Without this
         // the memcard stays in mid-protocol after a chip-deselect.
         mcd.reset();
@@ -313,7 +313,7 @@ pub fn padUpdate(p: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
         return;
     }
     padSetU32(p, P_CYC_LO, 0);
-    // psxe pad.c:329-343: raises IC_JOY unconditionally on countdown
+    // Raises IC_JOY unconditionally on countdown
     // expiry, and ONLY sets STAT.IRQ7 (bit 9) if irq_bit was set by
     // a subsequent-byte TX. The first byte raises IC_JOY without
     // latching IRQ7 — BIOS sees the ACK pulse but no data-IRQ yet.

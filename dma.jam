@@ -1,4 +1,4 @@
-// DMA controller (port of psxe/psx/dev/dma.c).
+// DMA controller.
 //
 // Seven 32-bit channels share a 0x80-byte register file at 0x1F801080.
 // Channel writes that flip the CHCR busy/trigger bits kick off a
@@ -7,7 +7,7 @@
 // channels are stubbed enough to not stall the BIOS.
 //
 // dma.jam does NOT import bus.jam (that would form a cycle through
-// bus.jam ↦ dma.jam ↦ bus.jam). Instead the Bus type is redeclared
+// bus.jam -> dma.jam -> bus.jam). Instead the Bus type is redeclared
 // structurally and we reach into bus.ram.ptr / bus.gpu directly, calling
 // gpuGp0 / vram helpers from gpu.jam where necessary.
 
@@ -48,8 +48,8 @@ const DICR_FLAGS: u32 = 0x7F000000;
 const DICR_IRQEN: u32 = 0x00800000;
 const DICR_IRQSI: u32 = 0x80000000;
 
-// Owned DMA-state buffer. d[21] = DPCR is pre-set to the psxe default
-// (psxe dma.c). Auto-drops with the Bus.
+// Owned DMA-state buffer. d[21] = DPCR is pre-set to its reset default
+// (0x07654321). Auto-drops with the Bus.
 pub fn dmaAlloc() Vec(u32) {
     var b: Vec(u32) = Vec(u32).filled(0, DMA_STATE_WORDS);
     b[21] = 0x07654321;
@@ -92,7 +92,7 @@ pub fn ramWrite16(bus: Bus, addr: u32, val: u32) {
 
 // IO surface
 
-// Per-channel CHCR hardwiring masks (psxe dma.c lines 14-24). Channels
+// Per-channel CHCR hardwiring masks. Channels
 // 0..5 expose the full 32-bit CHCR through these mask bits; channel 6
 // (OTC) hardwires bit 1 to 1 and only allows bits 24, 28, 30 to be set
 // via writes — everything else reads back as zero. ps1-tests dma/otc-test
@@ -128,8 +128,8 @@ pub fn dmaRead32(d: *mut[] u32, off: u32) u32 {
 }
 
 // Sub-offset byte/halfword reads must extract from the aligned 32-bit
-// register, mirroring psxe psx_dma_read16/read8 (which special-case 0x75/0x76
-// = DICR bytes). The old `dmaRead32(off) & mask` returned 0 for any offset not
+// register, special-casing 0x75/0x76
+// = DICR bytes. The old `dmaRead32(off) & mask` returned 0 for any offset not
 // 0x70/0x74 (dmaRead32's default) — so a `lbu`/`lhu` of the DICR enable bits
 // at 0x1F8010F5/F6 read 0, and Brave Fencer's per-frame DICR-enable RMW then
 // wrote the per-channel IRQ enables back as 0 → DMA-completion IRQs stopped
@@ -146,9 +146,9 @@ pub fn dmaRead8(d: *mut[] u32, off: u32) u32 {
 }
 
 pub fn dmaWriteDicr(d: *mut[] u32, val: u32) {
-    // Mirror psxe dma_write_dicr (dma.c:108-118) exactly. Preserve only
-    // bit 31 (IRQSI master flag) from the prior state, write-1-to-clear
-    // the channel flags, and copy the rest of the new value verbatim.
+    // Preserve only bit 31 (IRQSI master flag) from the prior state,
+    // write-1-to-clear the channel flags, and copy the rest of the new
+    // value verbatim.
     // Do NOT pre-recompute IRQSI here — dmaUpdate's edge detector
     // requires `prev = old IRQSI` to fire a 0->1 transition.
     const ack: u32 = val & DICR_FLAGS;
@@ -205,7 +205,7 @@ pub fn dmaWrite8(d: *mut[] u32, bus: Bus, cop0: *mut[] u32, off: u32, val: u32) 
 // Trigger a channel's transfer when CHCR is written with the busy bit
 // set. After the burst completes we immediately call dmaUpdate to fold
 // the per-channel d[23..28] "done" flags into DICR.FLAG bits and raise
-// IC_DMA if enabled — psxe does this every CPU cycle via psx_dma_update,
+// IC_DMA if enabled — this folding ideally happens every CPU cycle,
 // but our scanline-granularity update missed the window where the game
 // polls DICR right after CHCR (Brave Fencer's audio bank loader does
 // exactly this around 0x80042510).
@@ -219,13 +219,13 @@ pub fn dmaTrigger(d: *mut[] u32, bus: Bus, cop0: *mut[] u32, ch: u32) {
         6 { dmaDoOtc(d, bus); }
         _ {}
     }
-    // No store-time dmaUpdate: psxe's psx_dma_write32 only runs the transfer
-    // and defers all IRQ folding to the per-instruction psx_dma_update. The
+    // No store-time dmaUpdate: the CHCR write only runs the transfer and
+    // defers all IRQ folding to the per-instruction dmaUpdate. The
     // old store-time call here was a workaround for the obsolete per-scanline
     // update granularity; with per-instruction dmaUpdate (main.jam) it's
     // redundant and caused DMA IRQs to fire re-entrantly mid-store, ahead of
-    // psxe. The next instruction's dmaUpdate folds the done-flag in the same
-    // iteration psxe would (DICR polls one instruction later still see it).
+    // the per-instruction update. The next instruction's dmaUpdate folds the
+    // done-flag one instruction later, which DICR polls still see.
 }
 
 pub fn chcrBusy(d: *mut[] u32, ch: u32) bool {
@@ -280,9 +280,9 @@ pub fn dmaDoGpuRequest(d: *mut[] u32, bus: Bus) {
         }
     } else {
         // GPU→RAM (C0 transfer): drain GPUREAD per word into RAM.
-        // psxe dma.c:281-289: `data = psx_bus_read32(bus, 0x1F801810)` —
-        // GPUREAD pulls from VRAM via the active C0 state machine
-        // (gpu.c:69-114). Our previous stub wrote zeros, which broke
+        // Each word reads GPUREAD at 0x1F801810, which
+        // pulls from VRAM via the active C0 state machine.
+        // Our previous stub wrote zeros, which broke
         // games that DMA-copy VRAM back to RAM (font caches, frame
         // composites, etc.).
         var i: u32 = 0;
@@ -321,7 +321,7 @@ pub fn dmaDoGpuLinked(d: *mut[] u32, bus: Bus) {
 // data port (0x1F801820), which buffers it as command parameters or
 // command body. When all words for the active MDEC command are
 // delivered, MDEC's internal state machine runs the decode and fills
-// its output buffer (mdec.jam:mdecWrite32). Matches psxe dma.c:179-205.
+// its output buffer (mdec.jam:mdecWrite32).
 pub fn dmaDoMdecIn(d: *mut[] u32, bus: Bus) {
     if (!chcrBusy(d, 0)) { return; }
     const size: u32 = bcrSize(d, 0) * bcrBlocks(d, 0);
@@ -340,7 +340,7 @@ pub fn dmaDoMdecIn(d: *mut[] u32, bus: Bus) {
     d[23] = size;
 }
 
-// DMA1: MDEC output port → RAM. Match psxe exactly (dma.c:208-235).
+// DMA1: MDEC output port → RAM.
 pub fn dmaDoMdecOut(d: *mut[] u32, bus: Bus) {
     if (!chcrBusy(d, 1)) { return; }
     const size: u32 = bcrSize(d, 1) * bcrBlocks(d, 1);
@@ -360,8 +360,8 @@ pub fn dmaDoMdecOut(d: *mut[] u32, bus: Bus) {
 }
 
 // CD-ROM → RAM transfer. Each "word" in BCR.size is 4 bytes from the
-// data FIFO at 0x1F801802. psxe streams via psx_cdrom_read32 which is
-// our cdromReadData() popping one byte at a time and packing into a
+// data FIFO at 0x1F801802. Streaming goes through
+// cdromReadData(), popping one byte at a time and packing into a
 // little-endian word. After the transfer, ack via the d[26] flag so
 // dmaUpdate raises the channel-3 IRQ if enabled.
 pub fn dmaDoCdrom(d: *mut[] u32, bus: Bus) {
@@ -369,10 +369,11 @@ pub fn dmaDoCdrom(d: *mut[] u32, bus: Bus) {
     // CD->RAM is SyncMode 0 (burst: BCR low 16 = word count) or SyncMode 1
     // (block: low = block size in words, high = block count; total =
     // size*blocks). The old code used only bcrSize, so a SyncMode-1 read
-    // transferred ONE block instead of all of them — matching psxe but
-    // diverging from all four reference emulators (and the SPU channel here,
-    // which already multiplies). Under-reading made the game re-kick DMA3 per
-    // block, draining a partially-consumed FIFO into zero words.
+    // transferred ONE block instead of all of them — matching the original
+    // port but diverging from all four reference emulators (and the SPU
+    // channel here, which already multiplies). Under-reading made the game
+    // re-kick DMA3 per block, draining a partially-consumed FIFO into zero
+    // words.
     var size: u32 = 0;
     match (chcrSync(d, 3)) {
         0 { size = bcrSize(d, 3); if (size == 0) { size = 0x10000; } }
@@ -398,7 +399,7 @@ pub fn dmaDoCdrom(d: *mut[] u32, bus: Bus) {
     d[26] = 1;
 }
 
-// SPU DMA (channel 4). psxe dma.c:375-437 pipes each 32-bit word through
+// SPU DMA (channel 4). Each 32-bit word is piped through
 // the SPU TFIFO register at 0x1F801DA8 as two 16-bit halves, low first.
 // Reverse direction reads two halves from TFIFO and packs them. Previously
 // we drop the data — meaning Musashi/HM ADPCM banks were never reaching
@@ -441,8 +442,8 @@ pub fn dmaDoSpu(d: *mut[] u32, bus: Bus) {
         }
     }
     d[chBase(4) + F_MADR] = addr;
-    // psxe psx_dma_do_spu completes the transfer instantly, FULLY clears CHCR
-    // (BUSY off), and raises the ch4 completion IRQ on the NEXT psx_dma_update
+    // The SPU transfer completes instantly, FULLY clears CHCR
+    // (BUSY off), and raises the ch4 completion IRQ on the NEXT dmaUpdate
     // (spu_irq_delay is set then immediately zeroed → IC_DMA ~1 instr later).
     // The old jam model kept BUSY for `words*8` cycles (d[F_SPU_REMAIN]) and
     // only THEN raised the IRQ — an in-flight-DMA nicety for ps1-tests
@@ -451,9 +452,8 @@ pub fn dmaDoSpu(d: *mut[] u32, bus: Bus) {
     // 0x01000201) then polls I_STAT a few instructions later expecting that
     // IC_DMA; the deferral made jam miss the poll, so the game never dispatched
     // its DMA-IRQ handler — which is what advances the FMV's STR frame clock
-    // (0x800d24d0) — and the video stayed black. (Trace-diff vs psxe-strict
-    // pinned this as the FIRST jam<->psxe divergence, instr 280,834,781.)
-    // Match psxe: clear CHCR now + raise the ch4 done flag immediately so
+    // (0x800d24d0) — and the video stayed black.
+    // The fix: clear CHCR now + raise the ch4 done flag immediately so
     // dmaUpdate folds it into DICR.DMA4FL → IC_DMA on the next instruction.
     d[chBase(4) + F_CHCR] = 0;
     d[chBase(4) + F_BCR]  = 0;
@@ -500,14 +500,14 @@ pub fn dmaTickSpu(d: *mut[] u32, delta: u32) {
     }
 }
 
-// Called once per CPU instruction (main.jam), exactly like psxe's
-// psx_dma_update (psx.c:99). MDEC-in/out (ch0/ch1) are the only channels
-// psxe genuinely DELAYS: it decrements mdec_in/out_irq_delay by 1 per call
-// and raises the completion flag only when it reaches 0 — so the MDEC
-// DMA-done IRQ fires `size` instructions AFTER the transfer (dma.c:525-539).
+// Called once per CPU instruction (main.jam). MDEC-in/out (ch0/ch1) are
+// the only channels that genuinely DELAY: the mdec-in/out irq-delay
+// decrements by 1 per call and raises the completion flag only when it
+// reaches 0 — so the MDEC DMA-done IRQ fires `size` instructions AFTER
+// the transfer.
 // d[23]/d[24] hold that remaining-instruction COUNT (set to `size` by the
-// transfer). All other channels fire on the next update (psxe zeroes their
-// delay before the !delay test = immediate). Brave Fencer's FMV chains the
+// transfer). All other channels fire on the next update (their delay is
+// zeroed before the !delay test = immediate). Brave Fencer's FMV chains the
 // next MDEC frame-decode off this IRQ; jam's old immediate fire landed it
 // before the handler was ready, so the decode pipeline never re-fed the
 // MDEC → black video.

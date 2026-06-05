@@ -1,6 +1,5 @@
 // SIO1 serial port (link cable / serial-port) at 0x1F801050..0x1F80105F.
-// psxe has no real implementation — only two hardcoded reads in bus.c
-// (STAT=0x05, CTRL=0). We build the real device per psx-spx so games
+// We build the real device per psx-spx so games
 // that wait on its events (Harvest Moon opens class 0xF0000009 spec 0x20
 // = SIO COMMAND_COMPLETE) can complete the SIO transaction loop.
 //

@@ -46,8 +46,8 @@ pub const Timer = struct {
     vblank:     u32,
     channels:   [3]TimerChannel,
     // Timer 0 dot-clock ticks per sysclk cycle = (11/7)/hdiv, refreshed from
-    // the GPU display mode each frame (setDotclock). Mirrors psxe
-    // timer_get_dotclock_div. Default = 320-wide (hdiv 8).
+    // the GPU display mode each frame (setDotclock).
+    // Default = 320-wide (hdiv 8).
     dotDiv:     f32,
 
     pub fn init() Self {
@@ -64,8 +64,7 @@ pub const Timer = struct {
 
     // Refresh the Timer 0 dot-clock divisor from the GPU display mode
     // (GP1 08h, low 24 bits). hdiv table {256:10, 320:8, 512:5, 640:4},
-    // or 7 for the 368-wide (bit 6) mode — same as psxe's
-    // dmode_dotclk_div_table.
+    // or 7 for the 368-wide (bit 6) mode.
     pub fn setDotclock(self: mut Self, dm: u32) {
         if ((dm & 0x40) != 0) {
             self.dotDiv = 11.0 / 7.0 / 7.0;
@@ -79,8 +78,8 @@ pub const Timer = struct {
         self.dotDiv = 11.0 / 7.0 / div;
     }
 
-    // Compose the mode register from individual flag fields, per
-    // psxe `timer_get_mode()`. Side effect: clears
+    // Compose the mode register from individual flag fields.
+    // Side effect: clears
     // `targetReached` and `maxReached` (they latch until read).
     pub fn getMode(self: mut Self, idx: u32) u32 {
         var v: u32 = 0;
@@ -101,8 +100,8 @@ pub const Timer = struct {
     }
 
     // Mode write — decompose the value into the per-flag fields,
-    // then reset side-state (counter, irq, fired, etc.) per psxe
-    // semantics. Also seeds `paused` from hblank/vblank for sync
+    // then reset side-state (counter, irq, fired, etc.).
+    // Also seeds `paused` from hblank/vblank for sync
     // modes.
     pub fn setMode(self: mut Self, idx: u32, val: u32) {
         self.channels[idx].syncEnable   = (val >> 0) & 1;
@@ -153,11 +152,10 @@ pub const Timer = struct {
     // on target-hit if resetTarget is set.
     pub fn handleIrq(self: mut Self, idx: u32,
                      ic: *mut[] u32, cop0: *mut[] u32) {
-        // psxe timer_handle_irq compares the FLOAT counter directly to the
-        // target and to 65535.0f with strict `>` (timer.c:236-237). jam had
-        // used `>=` (toward hardware/duckstation), but that fires the timer
-        // IRQ one tick earlier than psxe on every exact landing — a per-IRQ
-        // delivery-timing divergence from the FMV's parity reference. Match psxe.
+        // Compare the FLOAT counter directly to the target and to 65535.0f
+        // with strict `>`. Using `>=` (toward hardware/DuckStation) would
+        // fire the timer IRQ one tick earlier on every exact landing — a
+        // per-IRQ delivery-timing divergence. Stick with `>`.
         const counter: f32 = self.channels[idx].counter;
         const target:  u32 = self.channels[idx].target;
         var fireIrq: u32 = 0;
@@ -258,13 +256,12 @@ pub const Timer = struct {
 
     pub fn updateCyc(self: mut Self, ic: *mut[] u32, cop0: *mut[] u32,
                  cyc: u32) {
-        // psxe's psx_timer_update (timer.c:338-345) IGNORES its cyc arg and
-        // advances all three timers by a hardcoded 2 per instruction —
-        // NOT the real per-instruction cycle count. (timer_update_timer0/1/2
-        // do `+= (float)cyc`, but cyc is always 2.) Feeding the real `cyc`
-        // (fetchCyc+2 = 20 for BIOS-resident code) made jam's sysclk timers
-        // run ~10× too fast in BIOS/kernel loops, drifting any timer value the
-        // game reads. Match psxe: pass 2. (`cyc` kept for signature parity.)
+        // IGNORE the cyc arg and advance all three timers by a hardcoded 2
+        // per instruction — NOT the real per-instruction cycle count.
+        // Feeding the real `cyc` (fetchCyc+2 = 20 for BIOS-resident code)
+        // makes the sysclk timers run ~10× too fast in BIOS/kernel loops,
+        // drifting any timer value the game reads. Pass 2. (`cyc` kept for
+        // signature parity.)
         self.updateOne(0, 2, ic, cop0);
         self.updateOne(1, 2, ic, cop0);
         self.updateOne(2, 2, ic, cop0);
@@ -276,14 +273,13 @@ pub const Timer = struct {
         // Timer 1 sourced from hblank is incremented in hblankBegin.
         if (idx == 1 && (self.channels[idx].clkSource & 1) != 0) { return; }
         const cf: f32 = cyc as f32;
-        // Mirror psxe timer_update_timer* (timer.c:300-333) on the float
-        // counter. Timer 2 with clk_source>=2 ticks at sysclk/8 (`+= cyc/8`).
-        // Timer 0 with clk_source bit0 set ticks at the GPU dot-clock
-        // (`+= cyc * dotDiv`, dotDiv = (11/7)/hdiv) instead of full sysclk —
-        // matches all four reference emulators (the dot-clock is slower than
-        // sysclk, so the old `+= cyc` ran T0 several× too fast). The old jam
-        // integer subtick + leap-past-target adjustment is dropped: psxe does
-        // neither, and matching its exact float overshoot/reset is the point.
+        // Advance the float counter. Timer 2 with clk_source>=2 ticks at
+        // sysclk/8 (`+= cyc/8`). Timer 0 with clk_source bit0 set ticks at
+        // the GPU dot-clock (`+= cyc * dotDiv`, dotDiv = (11/7)/hdiv) instead
+        // of full sysclk — matches the reference emulators (the dot-clock is
+        // slower than sysclk, so a plain `+= cyc` would run T0 several× too
+        // fast). No integer subtick or leap-past-target adjustment: the float
+        // overshoot/reset is handled directly by handleIrq.
         if (idx == 2 && self.channels[idx].clkSource >= 2) {
             self.channels[idx].counter = self.channels[idx].counter + cf / 8.0;
         } else if (idx == 0 && (self.channels[idx].clkSource & 1) != 0) {
@@ -301,7 +297,7 @@ pub const Timer = struct {
 
         if ((self.channels[1].clkSource & 1) != 0 &&
             self.channels[1].paused == 0) {
-            // psxe increments the hblank-sourced T1 counter by 1.0 each
+            // Increment the hblank-sourced T1 counter by 1.0 each
             // hblank; handleIrq's float overflow/target checks reset it.
             self.channels[1].counter = self.channels[1].counter + 1.0;
             self.handleIrq(1, ic, cop0);

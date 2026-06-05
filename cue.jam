@@ -1,4 +1,4 @@
-// CUE-sheet parser — port of psxe/psx/dev/cdrom/cue.c.
+// CUE-sheet parser.
 //
 // A .cue text file describes how one or more .bin files map to CD-ROM
 // tracks. The minimum we need to parse is:
@@ -13,7 +13,7 @@
 // AUDIO, etc.) and one or two INDEX entries (00 = pregap start, 01 =
 // track data start, MSF format).
 //
-// We use fixed-size tables (max 16 files, 99 tracks) instead of psxe's
+// We use fixed-size tables (max 16 files, 99 tracks) instead of
 // linked lists — Jam's stdlib doesn't ship one and a CD can't have more
 // than 99 tracks anyway. Each track stores absolute LBA start/end so the
 // disc-read path can look up by LBA.
@@ -23,7 +23,7 @@ const { File, exists, canonicalize } = import("std/fs");
 const { Vec } = import("std/collections");
 const { Box } = import("std/box");
 
-// Track-mode enum (psxe cue.h subset we actually use).
+// Track-mode enum (subset we actually use).
 pub const TRACK_MODE_UNKNOWN: u32 = 0;
 pub const TRACK_MODE_AUDIO:    u32 = 1;
 pub const TRACK_MODE_MODE1_2048: u32 = 2;
@@ -72,7 +72,7 @@ pub const Cue = struct {
     pathBuf:   Vec(u8),
     pathBufLen: u32,
     pathBufCap: u32,
-    // Parser scratch state (psxe-style readByte loop).
+    // Parser scratch state (readByte loop).
     file:      File,
     cur:       u32,         // current character (sentinel-extended)
     rootPath:  Vec(u8),     // directory of the .cue, used to resolve BIN paths
@@ -274,7 +274,7 @@ pub fn pathBufAppend(raw: *mut[] u8, src: *mut[] u8, len: u32) u32 {
 // track-range computation
 //
 // After parsing all FILE/TRACK/INDEX lines, walk each file's track list
-// and compute startLba/endLba. Mirrors psxe init_tracks().
+// and compute startLba/endLba.
 pub fn cueComputeRanges(raw: *mut[] u8) {
     var c: *mut[] Cue = raw as *mut[] Cue;
     // Initial LBA is 150 (00:02:00 lead-in).
@@ -364,8 +364,8 @@ pub fn cueGetTrackNumber(raw: *mut[] u8, lba: u32) u32 {
     return 1;
 }
 
-// Locate the track owning `lba`. Returns trackCount on "past-end" (psxe's
-// TS_FAR signal); a value < trackCount with mode=AUDIO means CDDA.
+// Locate the track owning `lba`. Returns trackCount on "past-end"; a
+// value < trackCount with mode=AUDIO means CDDA.
 pub fn cueFindTrack(raw: *mut[] u8, lba: u32) u32 {
     var c: *mut[] Cue = raw as *mut[] Cue;
     var i: u32 = 0;
@@ -379,7 +379,7 @@ pub fn cueFindTrack(raw: *mut[] u8, lba: u32) u32 {
 }
 
 // Pregap sector layout: byte 0 = 0x00, bytes 1..10 = 0xFF (sync pattern),
-// byte 11 = 0x00, the rest zero. Matches psxe cue.c:535-536. Local
+// byte 11 = 0x00, the rest zero. Local
 // duplicate of disc.fillPregapSector — keeps cue.jam acyclic (disc
 // imports cue, not the other way around).
 fn fillPregap(buf: *mut[] u8) {
@@ -399,7 +399,7 @@ pub fn cueRead(raw: *mut[] u8, lba: u32, buf: *mut[] u8) i32 {
         if (c[0].trackCount > 0 && lba >= c[0].tracks.ptr[c[0].trackCount - 1].endLba) {
             return 0;
         }
-        // Pregap: psxe cue.c:535-536 fills zero + sync at bytes [1..10].
+        // Pregap: fill zero + sync at bytes [1..10].
         fillPregap(buf);
         return 1;
     }
@@ -432,7 +432,7 @@ pub fn cueQuery(raw: *mut[] u8, lba: u32) u32 {
 
 // parser
 //
-// Stream the .cue text char-by-char (psxe's fgetc model). Each keyword
+// Stream the .cue text char-by-char (fgetc model). Each keyword
 // dispatches to its handler; FILE pushes onto files[], TRACK pushes
 // onto tracks[] with the most recent file, INDEX records its MSF.
 pub fn cueParse(raw: *mut[] u8, path: []u8) i32 {

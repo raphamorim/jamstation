@@ -1,4 +1,4 @@
-// GPU (partial port of psxe/psx/dev/gpu.c).
+// GPU (partial implementation).
 //
 // Implements the GP0/GP1 command machinery and the polygon, line,
 // rectangle, fill, and CPU↔VRAM blit commands. Triangles are
@@ -25,7 +25,7 @@
 //   [46]      gpustat
 //   [47]      display_mode
 //   [48..51]  draw_x1, draw_y1, draw_x2, draw_y2
-//   [52..53]  off_x, off_y (sign-bit set per psxe)
+//   [52..53]  off_x, off_y (11-bit signed, sign-extended)
 //   [54..57]  texw_mx, texw_my, texw_ox, texw_oy
 //   [58..59]  clut_x, clut_y
 //   [60..62]  texp_x, texp_y, texp_d
@@ -116,7 +116,7 @@ pub fn gpuRead32(g: *mut[] u32, vram: *mut[] u8, off: u32) u32 {
         return data;
     }
     if (off == 0x04) {
-        // psxe ORs GPUSTAT with 0x1C000000 to keep BIOS happy.
+        // OR GPUSTAT with 0x1C000000 to keep the BIOS happy.
         return g[46] | 0x1C000000;
     }
     return 0;
@@ -199,7 +199,7 @@ pub fn gpuGp0(g: *mut[] u32, vram: *mut[] u8, val: u32) {
 // GP1 (control) — display enable, DMA direction, display area, etc.
 pub fn gpuGp1(g: *mut[] u32, val: u32) {
     match ((val >> 24) & 0xFF) {
-        // GP1(0x00): psxe ignores it (gpu.c:1841-1874 switch has no case 0).
+        // GP1(0x00): leave gpustat untouched here.
         // A previous clobber of gpustat wiped texpage / display-enable bits
         // accumulated from prior GP0 commands; diff-trace showed Musashi
         // reading GPUSTAT and getting the wrong value at PC=0x8005C204.
@@ -212,18 +212,16 @@ pub fn gpuGp1(g: *mut[] u32, val: u32) {
         }
         // Acknowledge GPU IRQ (clear bit 24 of GPUSTAT).
         0x02 { g[46] = g[46] & (~0x01000000); }
-        // Display enable: bit 23 of GPUSTAT = 1 when disabled (psxe).
+        // Display enable: bit 23 of GPUSTAT = 1 when disabled.
         0x03 {
             g[46] = g[46] & (~0x00800000);
             g[46] = g[46] | ((val << 23) & 0x00800000);
         }
-        // GP1(04h) DMA direction. psxe IGNORES this command entirely
-        // (gpu.c:1850 `case 0x04: {} break;`) — it never reflects the
-        // direction into GPUSTAT bits 29-30, so they stay 0. Real hardware
-        // *does* set them, but matching psxe is the goal: storing the
-        // direction here made GPUSTAT bit 30 read 1 (dir 2) where psxe
-        // reads 0, and a game branch on that bit diverged the two
-        // (REG_TRACE cmp, L≈19.477M). Keep it a no-op.
+        // GP1(04h) DMA direction. Handled as a no-op here: the direction is
+        // never reflected into GPUSTAT bits 29-30, so they stay 0. Real
+        // hardware *does* set them, but reflecting the direction here made
+        // GPUSTAT bit 30 read 1 (dir 2), and a game branch on that bit then
+        // diverged (REG_TRACE cmp, L≈19.477M). Keep it a no-op.
         0x04 { }
         0x05 {
             g[63] = val & 0x3FF;
@@ -250,7 +248,7 @@ pub fn gpuGp1(g: *mut[] u32, val: u32) {
 
 // GP0 command parser — branches on the top three bits of buf[0] for
 // the polygon / line / rect families, and falls through to a per-byte
-// switch for everything else. Mirrors psxe gpu.c psx_gpu_update_cmd.
+// switch for everything else.
 pub fn gpuUpdateCmd(g: *mut[] u32, vram: *mut[] u8) {
     const cmd: u32 = (g[0] >> 24) & 0xFF;
     const family: u32 = (g[0] >> 29) & 7;
@@ -343,7 +341,7 @@ pub fn gpuUpdateCmd(g: *mut[] u32, vram: *mut[] u8) {
 }
 
 // 0x02 fill rect in VRAM. The colour is taken straight from buf[0]
-// (no dither), and the area is masked to a 16-pixel grid per psxe.
+// (no dither), and the area is masked to a 16-pixel grid.
 pub fn gpuFillRect(g: *mut[] u32, vram: *mut[] u8) {
     if (g[19] == GP_RECV_CMD) {
         g[19] = GP_RECV_ARGS;
@@ -368,7 +366,7 @@ pub fn gpuFillRect(g: *mut[] u32, vram: *mut[] u8) {
     g[19] = GP_RECV_CMD;
 }
 
-// 0x80 VRAM-to-VRAM copy (psxe gpu_cmd_80).
+// 0x80 VRAM-to-VRAM copy.
 pub fn gpuVramToVram(g: *mut[] u32, vram: *mut[] u8) {
     if (g[19] == GP_RECV_CMD) {
         g[19] = GP_RECV_ARGS;
@@ -419,13 +417,13 @@ pub fn gpuCpuToVram(g: *mut[] u32, vram: *mut[] u8) {
         g[19] = GP_RECV_DATA;
         return;
     }
-    // RECV_DATA — one 32-bit word delivers two VRAM pixels. psxe's
-    // gpu_cmd_a0 (gpu.c:1122-1137) writes the destination directly,
-    // bypassing the GP0(0xE6) mask bits — same as all of its other
-    // draw commands. Mirror that here so Musashi's FMV (which leaves
-    // check-mask set when uploading decoded frames) doesn't silently
-    // drop writes to pixels that previously had bit 15 set. The strict
-    // spec says masks SHOULD apply, but no real game relies on it.
+    // RECV_DATA — one 32-bit word delivers two VRAM pixels. GP0(0xA0)
+    // writes the destination directly, bypassing the GP0(0xE6) mask
+    // bits — same as all the other draw commands here. This is done so
+    // Musashi's FMV (which leaves check-mask set when uploading decoded
+    // frames) doesn't silently drop writes to pixels that previously had
+    // bit 15 set. The strict spec says masks SHOULD apply, but no real
+    // game relies on it.
     const x0: u32 = (g[22] + g[28]) & 0x3FF;
     const y0: u32 = (g[23] + g[29]) & 0x1FF;
     vramWritePixel(vram, x0, y0, g[20] & 0xFFFF);
@@ -617,7 +615,6 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
     //   tex flat        buf[0]=cmd+col, then per-vert (xy, page/clut+uv)
     //   mono shaded     buf[0]=col0+cmd, then per-vert (xy, colN+pad)
     //   tex shaded      buf[0]=col0+cmd, then per-vert (xy, page/clut+uv, colN)
-    // The shaded textured layout matches psxe gpu_cmd_3c.
     if (isTex && isGour) {
         // texture + gouraud (cmd 0x34, 0x3C, 0x3E)
         v0x = gpuVertX(g[1]); v0y = gpuVertY(g[1]);
@@ -632,11 +629,10 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
         tpx = (page & 0xF) << 6;
         tpy = (page & 0x10) << 4;
         depth = (page >> 7) & 3;
-        // psxe gpu.c:971-977 "Undocumented behavior — fixes Mortal Kombat
-        // II, Bubble Bobble, Driver 1 & 2". Textured polys update gpustat
-        // bits 0-8 from the polygon's tpage byte. Without this, GPUSTAT
-        // texpage bits drift from psxe's value (diff trace at instruction
-        // 470014 confirmed this is the source).
+        // Undocumented behaviour (fixes Mortal Kombat II, Bubble Bobble,
+        // Driver 1 & 2): textured polys update GPUSTAT bits 0-8 from the
+        // polygon's tpage byte. Without this, the GPUSTAT texpage bits
+        // drift from the expected value.
         // Undocumented behaviour: textured polys also update GPUSTAT
         // bits 0-8 from the tpage byte, and (when GP1(0x09) "allow
         // texture disable" is on) also drive bit 15 from tpage bit 11.
@@ -644,8 +640,8 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
         g[46] = (g[46] & 0xFFFFFE00) | (page & 0x1FF);
         g[70] = (page >> 11) & 1;
         g[46] = (g[46] & 0xFFFF7FFF) | ((g[71] & g[70]) << 15);
-        // psxe gpu.c:972-974 — the polygon's tpage byte also rewrites
-        // the GLOBAL texp_x/y/d (the derived fields textured rectangles
+        // The polygon's tpage byte also rewrites the GLOBAL texp_x/y/d
+        // (the derived fields textured rectangles
         // read from). Without this, FMVs that draw the decoded frame
         // as a texture-mapped polygon then composite it with a
         // textured rect end up sampling the wrong VRAM region for the
@@ -681,9 +677,9 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
         g[46] = (g[46] & 0xFFFFFE00) | (page & 0x1FF);
         g[70] = (page >> 11) & 1;
         g[46] = (g[46] & 0xFFFF7FFF) | ((g[71] & g[70]) << 15);
-        // psxe gpu.c:969-977 "Undocumented behavior? Fixes Mortal
-        // Kombat II, Bubble Bobble, Driver 1 & 2" — and Musashi FMV.
-        // Propagate the polygon's tpage into the derived globals so a
+        // Undocumented behaviour (fixes Mortal Kombat II, Bubble Bobble,
+        // Driver 1 & 2 — and Musashi FMV):
+        // propagate the polygon's tpage into the derived globals so a
         // following textured RECTANGLE (which carries clut but no
         // tpage) inherits this state instead of stale values. Without
         // it, the rect samples the wrong VRAM region → texel 0 →
@@ -720,12 +716,12 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
 
     const baseColor: u32 = g[0] & 0xFFFFFF;
 
-    // Per psxe: textured polys read transparency mode from the texture
-    // page register's bits 5-6 (overrides GPUSTAT for this primitive);
+    // Textured polys read transparency mode from the texture page
+    // register's bits 5-6 (overrides GPUSTAT for this primitive);
     // untextured / shaded polys read it from GPUSTAT bits 5-6.
     const isTransp: bool = (flags & 0x02) != 0;
     var transpMode: u32 = (g[46] >> 5) & 3;
-    // psxe uses the texture-page transp mode for ALL textured polys, not
+    // Use the texture-page transp mode for ALL textured polys, not
     // just flat ones. The tpage word sits at buf[4] for flat-textured and
     // at buf[5] for shaded-textured (the extra per-vertex colour words
     // shift it), so pick the right word by isGour.
@@ -770,7 +766,7 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
     var cx: u32 = cx0 + ox;
     var cy: u32 = cy0 + oy;
     // UV and per-vertex colour stay paired with their vertex when we
-    // flip winding (per psxe).
+    // flip winding.
     var bu2: u32 = bu;  var bv2: u32 = bv;
     var cu2: u32 = cu;  var cv2: u32 = cv;
     var bc2: u32 = bc;
@@ -793,8 +789,7 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
     const xmax: u32 = gpuMax3(ax, bx, cx);
     const ymax: u32 = gpuMax3(ay, by, cy);
     // Reject only triangles wider/taller than the GPU's real limits
-    // (psxe gpu.c:265 uses 2048 / 1024). The earlier 1024/512 dropped
-    // valid large polygons.
+    // (2048 / 1024). The earlier 1024/512 dropped valid large polygons.
     if (sext32(xmax - xmin) > 2048 || sext32(ymax - ymin) > 1024) { return; }
 
     const absArea: i64 = gpuAbsI64(gpuEdge(ax, ay, bx, by, cx, cy));
@@ -841,9 +836,8 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
                             color = texel;
                         } else {
                             // Modulate by the per-vertex gouraud colour
-                            // when shaded (psxe gpu_render_triangle uses
-                            // the interpolated colour as the modulator,
-                            // gpu.c:299-327,348-354), else the flat base.
+                            // when shaded (the interpolated colour is the
+                            // modulator), else the flat base.
                             var modc: u32 = baseColor;
                             if (isGour) {
                                 const ar: i64 = (ac as i64) & 0xFF;
@@ -876,10 +870,9 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
                     } else {
                         // Untextured: gouraud-interpolate the three
                         // per-vertex colours by barycentric weights, or
-                        // use the base colour if not shaded. Matches
-                        // psxe `gpu_render_triangle` shaded path, with
-                        // the same 4x4 ordered dither kernel applied
-                        // pre-clamp for gradient banding suppression.
+                        // use the base colour if not shaded. A 4x4 ordered
+                        // dither kernel is applied pre-clamp for gradient
+                        // banding suppression.
                         var rgb: u32 = baseColor;
                         if (isGour) {
                             const ar: i64 = (ac as i64) & 0xFF;
@@ -895,7 +888,7 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
                             const nr: i64 = z0 * ar + z1 * br + z2 * cr;
                             const ng: i64 = z0 * ag + z1 * bg + z2 * cg;
                             const nb: i64 = z0 * ab + z1 * bb + z2 * cb;
-                            // psxe dither offset from a 4x4 kernel indexed by
+                            // dither offset from a 4x4 kernel indexed by
                             // (x - xmin) & 3 and (y - ymin) & 3.
                             const dx: u32 = (x - xmin) & 3;
                             const dy: u32 = (y - ymin) & 3;
@@ -926,7 +919,7 @@ pub fn gpuAbsI64(v: i64) i64 {
     return v;
 }
 
-// 4x4 ordered dither kernel from psxe (`g_psx_gpu_dither_kernel`).
+// 4x4 ordered dither kernel.
 // Indexed by `dy * 4 + dx` where `dx = (x - xmin) & 3`, `dy = (y - ymin) & 3`.
 // Values added to each interpolated channel before clamping reduce visible
 // banding on gouraud gradients (the BIOS's diamond logo uses this heavily).
@@ -953,7 +946,7 @@ pub fn gpuDitherKernel(idx: u32) i64 {
 
 // Saturate one shaded channel: divide the barycentric numerator by the
 // triangle area, apply the dither offset, then clamp to [0, 0xFF].
-// Match psxe's order: divide first, dither, clamp.
+// Order matters: divide first, dither, clamp.
 pub fn gpuSatChan(num: i64, area: i64, dith: i64) u32 {
     if (area == 0) { return 0; }
     var quot: i64 = num / area;
@@ -981,11 +974,10 @@ pub fn gpuLineCmd(g: *mut[] u32, vram: *mut[] u8) {
     const isPoly: bool = (flags & 0x08) != 0;
     if (g[19] == GP_RECV_CMD) {
         g[19] = GP_RECV_ARGS;
-        // psxe gpu_line (gpu.c:1019-1031): poly-lines (bit 0x08) set
-        // cmd_args_remaining = -1 and drain words until a vertex word
-        // masks to 0x50005000; single segments take 2 verts (3 if
-        // gouraud). g[17] is unused on the poly-line path — it ends on
-        // the terminator below, not on an arg count.
+        // Poly-lines (bit 0x08) drain words until a vertex word masks to
+        // 0x50005000; single segments take 2 verts (3 if gouraud). g[17]
+        // is unused on the poly-line path — it ends on the terminator
+        // below, not on an arg count.
         if (isPoly) { g[17] = 2; return; }
         var args: u32 = 2;
         if (isGour) { args = args + 1; }
@@ -994,13 +986,12 @@ pub fn gpuLineCmd(g: *mut[] u32, vram: *mut[] u8) {
     }
     // RECV_ARGS.
     if (isPoly) {
-        // Match psxe: a poly-line ends when the most-recently received
-        // word masks to 0x50005000, and it draws NOTHING (psxe's render
-        // loop is commented out, gpu.c:1033-1065). Bound the FIFO write
-        // index so we don't overflow the 16-word buffer — psxe lets
-        // buf_index grow (a latent overflow), but with no draw the words
-        // are never read back, so overwriting one slot is observably the
-        // same while keeping jam's state intact.
+        // A poly-line ends when the most-recently received word masks to
+        // 0x50005000, and it draws NOTHING (the poly-line render path is
+        // not implemented). Bound the FIFO write index so we don't
+        // overflow the 16-word buffer — with no draw the words are never
+        // read back, so overwriting one slot is observably the same while
+        // keeping jam's state intact.
         const last: u32 = g[g[16] - 1];
         if ((last & 0xF000F000) == 0x50005000) {
             g[19] = GP_RECV_CMD;
@@ -1028,8 +1019,7 @@ pub fn gpuLineCmd(g: *mut[] u32, vram: *mut[] u8) {
     g[19] = GP_RECV_CMD;
 }
 
-// Bresenham line rasterizer. Mirrors psxe's plotLine / plotLineLow /
-// plotLineHigh in src/dev/gpu.c — split on whether dx or dy dominates
+// Bresenham line rasterizer — split on whether dx or dy dominates
 // (i.e. shallow vs. steep slope) and on direction, so the inner loop
 // always increments by 1 in the dominant axis and uses Bresenham's
 // error term to step in the minor axis.
@@ -1156,16 +1146,15 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
         }
         _ {}
     }
-    // psxe order: add the drawing offset first, *then* sign-extend
+    // Order matters: add the drawing offset first, *then* sign-extend
     // the 11-bit screen-space position. SE-after-offset is what the
     // hardware does — anything that overflows 11 bits wraps.
     var x: u32 = gpuSe11((xy & 0xFFFF) + g[52]);
     var y: u32 = gpuSe11(((xy >> 16) & 0xFFFF) + g[53]);
 
     // Drawing-area bounds. Pixels outside the (draw_x1..draw_x2,
-    // draw_y1..draw_y2) box are skipped; mirrors psxe's
-    // gpu_render_flat_rectangle which clamps the iteration limits
-    // against the drawing area.
+    // draw_y1..draw_y2) box are skipped: the iteration limits are
+    // clamped against the drawing area.
     const dx1: i64 = sext32(g[48]);
     const dy1: i64 = sext32(g[49]);
     const dx2: i64 = sext32(g[50]);
@@ -1222,9 +1211,9 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
                         if (!isRaw) {
                             color = gpuModulate(texel, g[0] & 0xFFFFFF);
                         }
-                        // Per psxe: when the rect's transparency flag is
-                        // set, texel bit 15 selects whether THIS pixel
-                        // blends. When the flag isn't set, no blending.
+                        // When the rect's transparency flag is set, texel
+                        // bit 15 selects whether THIS pixel blends. When
+                        // the flag isn't set, no blending.
                         var thisTransp: bool = false;
                         if (isTransp) {
                             thisTransp = (texel & 0x8000) != 0;
@@ -1247,7 +1236,7 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
 }
 
 // Apply the GP0(0xE2) texture window to a texel coordinate, then wrap to
-// the 256x256 page. Mirrors psxe gpu_fetch_texel (gpu.c:150-153):
+// the 256x256 page:
 //   t = (t & ~mask) | (offset & mask); t &= 0xff
 // The window regs are pre-shifted to pixel units in g[54..57]
 // (mask_x, mask_y, off_x, off_y). With no window set (mask 0) this is a
@@ -1293,8 +1282,8 @@ pub fn gpuModulate(texel: u32, mod: u32) u32 {
     const mr: u32 = mod & 0xFF;
     const mg: u32 = (mod >> 8) & 0xFF;
     const mb: u32 = (mod >> 16) & 0xFF;
-    // psxe rounds: roundf((tex * mod) / 128) (gpu.c:352-362). +0x40
-    // before >>7 gives round-half-up, which matches for non-negative
+    // Modulation rounds to nearest: round((tex * mod) / 128). +0x40
+    // before >>7 gives round-half-up, which is correct for non-negative
     // channels (tex, mod are unsigned here).
     var cr: u32 = ((tr * mr) + 0x40) >> 7;
     var cg: u32 = ((tg * mg) + 0x40) >> 7;
@@ -1305,7 +1294,7 @@ pub fn gpuModulate(texel: u32, mod: u32) u32 {
     return gpuToBgr555(cr | (cg << 8) | (cb << 16));
 }
 
-// Semi-transparency blend (port of psxe's `if (transp)` block).
+// Semi-transparency blend.
 // `fore` is a BGR555 foreground colour, `back` the existing VRAM pixel;
 // `mode` is the 2-bit semi-transparency mode out of GPUSTAT bits 5-6
 // (or for textured polys, out of the texture-page register):
@@ -1334,7 +1323,7 @@ pub fn gpuBlend(fore: u32, back: u32, mode: u32) u32 {
         cg = bg + fg;
         cb = bb + fb;
     } else if (mode == 2) {
-        // psxe uses `br - fr`; we'd underflow in u32, so clamp at 0.
+        // The blend is `br - fr`; we'd underflow in u32, so clamp at 0.
         if (br > fr) { cr = br - fr; } else { cr = 0; }
         if (bg > fg) { cg = bg - fg; } else { cg = 0; }
         if (bb > fb) { cb = bb - fb; } else { cb = 0; }
@@ -1382,7 +1371,7 @@ pub const Gpu = struct {
     pub fn init() Self {
         var s: Self = Self { buf: [0; 80] };
         s.buf[19] = GP_RECV_CMD;
-        // psxe init (gpu.c:59): only sets bit 23 (display disabled).
+        // Initial GPUSTAT: only bit 23 set (display disabled).
         // Reads OR 0x1C000000 on the fly.
         s.buf[46] = 0x00800000;
         s.buf[47] = 1;            // default display_mode

@@ -1,4 +1,4 @@
-// CD-ROM controller — minimal port of psxe `psx/dev/cdrom/*.c` covering
+// CD-ROM controller — a minimal implementation covering
 // the BIOS-boot subset of commands plus the FIFO + IRQ + state-machine
 // plumbing every command depends on. Audio (CDDA) is stubbed; XA-ADPCM
 // streams through to the SPU CD-audio FIFO when MODE.XA is set.
@@ -6,7 +6,7 @@
 // Register map at 0x1F801800..0x1F801803 — every register is bank-
 // selected: writes to address 0x800 set bits 0-1 of the bank index,
 // then addresses 0x801..0x803 take different meanings per bank. The
-// dispatch table mirrors psxe (psx_cdrom_write8 / cdrom_read8):
+// dispatch table:
 //
 //   bank read 0x800  status (busy/parm-empty/resp-empty/...)
 //   bank read 0x801  pop one byte from the response FIFO
@@ -38,15 +38,15 @@ const { spuPushCdSample } = import("spu");
 
 const SECTOR_BYTES: u32 = 2352;
 
-// State machine states (psxe enum: IDLE/TX_RESP1/TX_RESP2/READ/PLAY).
+// State machine states (IDLE/TX_RESP1/TX_RESP2/READ/PLAY).
 const CD_STATE_IDLE:      u32 = 0;
 const CD_STATE_TX_RESP1:  u32 = 1;
 const CD_STATE_TX_RESP2:  u32 = 2;
 const CD_STATE_READ:      u32 = 3;
 const CD_STATE_PLAY:      u32 = 4;
 
-// psxe's CD_DELAY_FR / CD_DELAY_INIT_FR / CD_DELAY_READ_* (CPU cycles).
-const CD_DELAY_1MS:       u32 = 33869;       // psxe CD_DELAY_1MS
+// Response / read scheduling delays (CPU cycles).
+const CD_DELAY_1MS:       u32 = 33869;       // 1ms at 33.8688MHz
 const CD_DELAY_FR:        u32 = 50401;
 const CD_DELAY_INIT_FR:   u32 = 81102;
 const CD_DELAY_READ_SS:   u32 = 451584;     // 33_868_800 / 75
@@ -140,7 +140,7 @@ pub const Cdrom = struct {
     delay:       u32,
     lba:         u32,
     pendingLba:  u32,
-    pendingSpeedSwitch: u32,  // psxe pending_speed_switch_delay (1x<->2x resync)
+    pendingSpeedSwitch: u32,  // 1x<->2x speed-change resync delay
     dataRidx:    u32,
     dataWidx:    u32,
     // XA-ADPCM per-channel history (2 i32 each). Persists across
@@ -148,7 +148,7 @@ pub const Cdrom = struct {
     xaLh:        [2]i32,
     xaRh:        [2]i32,
     // Last resampled OUTPUT sample per channel — the `ls` seed for the next
-    // sector's XA→44.1kHz rate conversion (psxe xa_prev_left/right_sample).
+    // sector's XA→44.1kHz rate conversion.
     xaPrevL:     i32,
     xaPrevR:     i32,
     // Parameter / response FIFOs. Each is a 32-byte ring with u8
@@ -171,8 +171,8 @@ pub const Cdrom = struct {
             seekPrec: 1, prevSpeed: 0,
             paramR: 0, paramW: 0,
             respR: 0, respW: 0,
-            // Start at LBA 150 (00:02:00, first data sector) like psxe
-            // (psx_cdrom_init). jam's LBA is pregap-inclusive — cueRead
+            // Start at LBA 150 (00:02:00, first data sector).
+            // jam's LBA is pregap-inclusive — cueRead
             // maps off=(lba-startLba)*SECTOR with track1 startLba=150 —
             // so 0 would read a negative offset (zero pregap), not sector 0.
             delay: 0, lba: 150, pendingLba: 150, pendingSpeedSwitch: 0,
@@ -248,7 +248,7 @@ pub const Cdrom = struct {
 
     // status byte
 
-    // Mirrors psxe cdrom_get_stat (cdrom.c:454): SPINDLE always, plus
+    // Status byte: SPINDLE always, plus
     // READ while the sector pump is active, SHELLOPEN if no disc,
     // IDERROR if mode bit 4 is set.
     pub fn getStat(self: mut Self) u32 {
@@ -264,8 +264,8 @@ pub const Cdrom = struct {
     // Status register at offset 0 (always, regardless of bank).
     pub fn readStatus(self: mut Self) u32 {
         var r: u32 = (self.index as u32) & 0x3;
-        // bit 2 (ADPBUSY): XA-ADPCM streaming active — psxe cdrom_read_status
-        // returns `xa_playing << 2`. Set when a ReadN/ReadS runs in XA mode.
+        // bit 2 (ADPBUSY): XA-ADPCM streaming active. Set when a ReadN/ReadS
+        // runs in XA mode.
         // (Brave Fencer's FMV polls this; jam hardcoding 0 made the game
         // branch away from the decode path — the SECOND trace-diff divergence,
         // instr ~368.37M.)
@@ -323,14 +323,14 @@ pub const Cdrom = struct {
                 var delay: u32 = CD_DELAY_FR;
                 if ((val & 0xFF) == CDL_INIT) { delay = CD_DELAY_INIT_FR; }
                 self.delay = delay;
-                // psxe's cdrom_write_cmd checks `if (state == CD_STATE_READ) busy=1`
-                // (cdrom.c:683) but `state` was just set to TX_RESP1 two lines above
-                // (cdrom.c:669), so that branch is ALWAYS FALSE — psxe never raises
-                // BUSYSTS from a command write. We must not either: asserting busy on
-                // the mid-read GetlocL/Getstat polls that the BFM/Suikoden FMV loader
-                // spams makes the game see the drive busy where psxe shows it idle, so
-                // it re-reads the resource sectors forever and never triggers the MDEC
-                // decode (FMV black-screen).
+                // A command write does NOT raise BUSYSTS: `state` was just set
+                // to TX_RESP1 two lines above, so any "if reading, mark busy"
+                // check sees TX_RESP1, not READ, and never fires. We must not
+                // assert busy either: doing so on the mid-read GetlocL/Getstat
+                // polls that the BFM/Suikoden FMV loader spams makes the game
+                // see the drive busy when it should be idle, so it re-reads the
+                // resource sectors forever and never triggers the MDEC decode
+                // (FMV black-screen).
             }
             // Push parameter byte.
             2 { self.pushParam(val); }
@@ -361,17 +361,17 @@ pub const Cdrom = struct {
 
     // state-machine tick
 
-    // Handle the command response — equivalent to psxe's
-    // `cdrom_cmd_table[cmd](cdrom)` running after the TX_RESP1 delay.
+    // Handle the command response — dispatch the queued command
+    // after the TX_RESP1 delay elapses.
     pub fn executeCommand(self: mut Self, disc: *mut[] Disc,
                           ic: *mut[] u32, cop0: *mut[] u32) {
         const cmd: u32 = self.pendingCmd as u32;
         self.busy = 0;
 
-        // psxe cdrom_handle_resp1 prechecks (cdrom.c:271-447), before
-        // dispatch: (1) disc-required commands with no disc → INT5(11h,80h),
+        // Response-1 prechecks, before dispatch:
+        // (1) disc-required commands with no disc → INT5(11h,80h),
         // (3) wrong parameter count → INT5(03h,20h), unknown command →
-        // INT5(03h,40h). (Stage 2 version checks are omitted — jam models a
+        // INT5(03h,40h). (Version checks are omitted — jam models a
         // single CD-ROM revision.) `pcnt` = parameters queued for this cmd.
         const pcnt: u32 = ((self.paramW as u32) - (self.paramR as u32)) & 0xFF;
         const c0: bool = cmd == CDL_GETSTAT || cmd == CDL_FORWARD ||
@@ -431,7 +431,7 @@ pub const Cdrom = struct {
         if (cmd == CDL_GETSTAT || cmd == CDL_MUTE || cmd == CDL_DEMUTE ||
             cmd == CDL_SETMODE || cmd == CDL_RESET || cmd == CDL_SETLOC) {
             if (cmd == CDL_SETMODE) {
-                // psxe cmd_setmode (impl.c:355-361): a 1x<->2x speed change
+                // SetMode: a 1x<->2x speed change
                 // costs a big ~650ms drive resync, charged to the next read.
                 // FMV setup (SetMode double-speed -> ReadN) relies on it;
                 // without it the first STR sector arrives too early.
@@ -445,7 +445,7 @@ pub const Cdrom = struct {
                 const m: u32 = self.popParam();
                 const s: u32 = self.popParam();
                 const f: u32 = self.popParam();
-                // psxe validates VALID_MSF before accepting (impl.c:138-158):
+                // Validate the MSF before accepting:
                 // BCD-valid nibbles, seconds < 0x60, frame < 0x75. Invalid
                 // MSF → INT5(stat, 0x10) instead of an INT3 success.
                 const bcdOk: bool = ((m & 0x0F) <= 9) && ((m >> 4) <= 9) &&
@@ -463,7 +463,7 @@ pub const Cdrom = struct {
             self.ifr = 3;
             self.pushResp(self.getStat());
             if (cmd == CDL_SETMODE) {
-                // psxe impl.c:363 — SetMode hard-resets to IDLE.
+                // SetMode hard-resets the state machine to IDLE.
                 self.state        = CD_STATE_IDLE as u8;
                 self.prevState    = CD_STATE_IDLE as u8;
                 self.readOngoing  = 0;
@@ -493,7 +493,7 @@ pub const Cdrom = struct {
             self.ifr = 3;
             self.pushResp(self.getStat());
             self.state = CD_STATE_TX_RESP2 as u8;
-            // psxe cdrom_cmd_init (impl.c:308) sets the 2nd-response delay to
+            // Init's 2nd-response delay is
             // CD_DELAY_1MS (33869), NOT CD_DELAY_INIT_FR (81102). The 47233-cyc
             // gap made jam's Init INT2 fire late, slipping the CD IRQ at ~164.8M
             // (the next trace divergence after the GPU-acc/-ffast-math one).
@@ -504,9 +504,9 @@ pub const Cdrom = struct {
             self.ifr = 3;
             self.pushResp(self.getStat());
             self.state = CD_STATE_TX_RESP2 as u8;
-            // seek_precision is set in resp2 on success, like psxe — not
-            // here in resp1. psxe cdrom_cmd_seekl sets the 2nd-response delay
-            // to CD_DELAY_1MS (NOT FR) — the FR=50401 vs 1MS=33869 gap (16532
+            // seek precision is set in resp2 on success, not
+            // here in resp1. SeekL's 2nd-response delay is
+            // CD_DELAY_1MS (NOT FR) — the FR=50401 vs 1MS=33869 gap (16532
             // cyc) made jam's SeekL INT2 fire ~8266 instrs late, the root of
             // the FMV CD-INT divergence at ~102.7M.
             self.delay = CD_DELAY_1MS;
@@ -530,7 +530,7 @@ pub const Cdrom = struct {
             self.state        = CD_STATE_READ as u8;
             self.prevState    = CD_STATE_READ as u8;
             self.readOngoing  = 1;
-            // psxe impl.c:229/683 — a read in XA-ADPCM mode marks the drive
+            // A read in XA-ADPCM mode marks the drive
             // as XA-streaming (status bit2 ADPBUSY). The game polls this.
             if ((self.mode as u32 & MODE_XA_ADPCM) != 0) { self.xaPlaying = 1; }
             self.delay = self.readDelay();
@@ -566,7 +566,7 @@ pub const Cdrom = struct {
         }
         if (cmd == CDL_GETLOCP) {
             self.ifr = 3;
-            // psxe cdrom_cmd_getlocp (impl.c:418-459): track/index from
+            // GetLocP: track/index from
             // the disc; subtract the 25-sector seek slop FIRST, then derive
             // both the relative (within-track) and absolute MSF from it.
             const lbaRaw: u32 = self.lba;
@@ -598,7 +598,7 @@ pub const Cdrom = struct {
             return;
         }
         if (cmd == CDL_GETTN) {
-            // psxe: stat, first-track = 1 (raw), last = ITOB(track count).
+            // GetTN: stat, first-track = 1 (raw), last = BCD(track count).
             self.ifr = 3;
             self.pushResp(self.getStat());
             self.pushResp(1);
@@ -612,7 +612,7 @@ pub const Cdrom = struct {
                 self.errorOut(CD_STAT_SPINDLE, CD_ERR_INVALID_SUBFUNC);
                 return;
             }
-            // psxe cdrom_cmd_gettd: look up the track's absolute LBA →
+            // GetTD: look up the track's absolute LBA →
             // MM:SS; INT5 if past the last track (TS_FAR = 0xFFFFFFFF here).
             const track: u32 = (bcd & 0x0F) + ((bcd >> 4) & 0x0F) * 10;
             const f: u32 = discTrackLba(disc, track);
@@ -657,7 +657,7 @@ pub const Cdrom = struct {
             self.ifr = 3;
             self.pushResp(self.getStat());
             self.state = CD_STATE_TX_RESP2 as u8;
-            self.delay = CD_DELAY_1MS;   // psxe cdrom_cmd_seekp: 1MS, not FR
+            self.delay = CD_DELAY_1MS;   // SeekP: 1MS, not FR
             return;
         }
 
@@ -722,10 +722,10 @@ pub const Cdrom = struct {
             return;
         }
         if (cmd == CDL_SEEKL) {
-            // psxe (impl.c:541-569): query the seek TARGET (pending_lba)
+            // Query the seek TARGET (pendingLba)
             // FIRST; TS_FAR → INVALID_SUBFUNC, TS_AUDIO → SEEK_FAILED, and
             // the seek is NOT committed on error. On success commit and
-            // set seek_precision = 1.
+            // set seek precision = 1.
             const tsl: u32 = discQuery(disc, self.pendingLba);
             if (tsl == 3) {
                 self.errorOut(CD_STAT_SPINDLE | CD_STAT_SEEKERROR,
@@ -749,8 +749,8 @@ pub const Cdrom = struct {
             return;
         }
         if (cmd == CDL_SEEKP) {
-            // psxe cdrom_cmd_seekp (impl.c:577-587): INT2(stat), commit
-            // the seek, seek_precision = 0. No seek-error check (SeekP is
+            // SeekP: INT2(stat), commit
+            // the seek, seek precision = 0. No seek-error check (SeekP is
             // the audio-seek command and may land on CDDA tracks).
             self.ifr = 2;
             self.pushResp(self.getStat());
@@ -764,7 +764,7 @@ pub const Cdrom = struct {
             return;
         }
         if (cmd == CDL_STOP) {
-            // psxe cdrom_cmd_stop (impl.c:267-278): rewind to LBA 150 and
+            // Stop: rewind to LBA 150 and
             // pause, then INT2(stat).
             self.pendingLba = 150;
             self.processSetloc();
@@ -777,7 +777,7 @@ pub const Cdrom = struct {
             return;
         }
         if (cmd == CDL_MOTORON || cmd == CDL_SETSESSION || cmd == CDL_READTOC) {
-            // psxe: each sends a second INT2(stat) (impl.c:250,471,725).
+            // Each sends a second INT2(stat).
             self.ifr = 2;
             self.pushResp(self.getStat());
             self.state = CD_STATE_IDLE as u8;
@@ -841,7 +841,7 @@ pub const Cdrom = struct {
         self.busy       = 0;
     }
 
-    // Per-scanline tick. Mirror of psxe's psx_cdrom_update.
+    // Per-scanline tick. Advances the response/read state machine.
     pub fn update(self: mut Self, disc: *mut[] Disc, spu: *mut[] u8,
                   ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
         var delay: u32 = self.delay;
@@ -870,15 +870,15 @@ pub const Cdrom = struct {
         }
         if (self.state == CD_STATE_TX_RESP1 as u8) {
             self.executeCommand(disc, ic, cop0);
-            // psxe cdrom.c:548-554: switching to READ after a non-read
+            // Switching to READ after a non-read
             // command in TX_RESP1 incurs a delay.
             if (self.state == CD_STATE_READ as u8) {
                 self.processSetloc();
-                // First sector after a command uses psxe's CD_DELAY_ONGOING_READ
-                // (= readDelay + 4ms). psxe COMPUTES a speed-switch resync delay
-                // but then OVERWRITES it with CD_DELAY_ONGOING_READ (cdrom.c:567),
+                // First sector after a command uses the ongoing-read delay
+                // (= readDelay + 4ms). The speed-switch resync delay is
+                // computed but then overwritten by this ongoing-read delay,
                 // so it never applies; adding pendingSpeedSwitch (~650ms once)
-                // delayed the first FMV sector vs psxe. Drop it; just consume it.
+                // delayed the first FMV sector. Drop it; just consume it.
                 self.delay = self.readDelay() + 4 * 33869;
                 self.pendingSpeedSwitch = 0;
             }
@@ -886,11 +886,11 @@ pub const Cdrom = struct {
             self.executeResp2(disc);
             if (self.state == CD_STATE_READ as u8) {
                 self.processSetloc();
-                // First sector after a command uses psxe's CD_DELAY_ONGOING_READ
-                // (= readDelay + 4ms). psxe COMPUTES a speed-switch resync delay
-                // but then OVERWRITES it with CD_DELAY_ONGOING_READ (cdrom.c:567),
+                // First sector after a command uses the ongoing-read delay
+                // (= readDelay + 4ms). The speed-switch resync delay is
+                // computed but then overwritten by this ongoing-read delay,
                 // so it never applies; adding pendingSpeedSwitch (~650ms once)
-                // delayed the first FMV sector vs psxe. Drop it; just consume it.
+                // delayed the first FMV sector. Drop it; just consume it.
                 self.delay = self.readDelay() + 4 * 33869;
                 self.pendingSpeedSwitch = 0;
             }
@@ -905,8 +905,8 @@ pub const Cdrom = struct {
     pub fn handleRead(self: mut Self, disc: *mut[] Disc, spu: *mut[] u8) {
         self.processSetloc();
         if (self.hasDisc == 0) {
-            // psxe reports no-disc as SHELLOPEN (0x10), giving INT5(11h,80h)
-            // (cdrom_handle_resp1:300) — not SPINDLE (which gave 03h,80h).
+            // Report no-disc as SHELLOPEN (0x10), giving INT5(11h,80h)
+            // — not SPINDLE (which would give 03h,80h).
             self.errorOut(CD_STAT_SHELLOPEN, CD_ERR_NO_DISC);
             return;
         }
@@ -917,9 +917,9 @@ pub const Cdrom = struct {
             return;
         }
         // XA-ADPCM audio sectors are decoded to the SPU, but we STILL deliver
-        // the sector via INT1 + the data FIFO. psxe's cdrom_handle_read raises
-        // INT1 for EVERY data-track sector regardless of submode (it decodes
-        // XA on a separate parallel xa_lba path), and so does real hardware
+        // the sector via INT1 + the data FIFO. INT1 fires for EVERY data-track
+        // sector regardless of submode (XA is decoded on a separate parallel
+        // path), as on real hardware
         // when no audio filter is set. Suppressing audio-sector INT1s here
         // (the previous "filter" behaviour, ported from Avocado's filtered
         // model) desynced games that do SOFTWARE de-interleaving — they expect
@@ -944,7 +944,7 @@ pub const Cdrom = struct {
         self.ifr = 1;
         self.pushResp(self.getStat());
 
-        self.pendingLba = lba + 1;   // psxe cdrom_handle_read: deferred via pending_lba, lba promoted on next process_setloc (GetLocL/P returns current sector, not next)
+        self.pendingLba = lba + 1;   // advance deferred via pendingLba; lba promoted on the next processSetloc (so GetLocL/P returns the current sector, not the next)
         self.delay = self.readDelay();
     }
 
@@ -980,13 +980,13 @@ pub const Cdrom = struct {
         // f18khz sector) to the SPU's 44100 Hz output rate before pushing. The
         // SPU CD FIFO is drained one entry per 44100 Hz output sample, so
         // pushing native-rate samples 1:1 plays XA ~17% too fast and overruns
-        // the FIFO (most samples dropped → warble). Faithful port of psxe
-        // cdrom_resample_xa_buf (audio.c:52-86): conceptually a 7×-upsample —
+        // the FIFO (most samples dropped → warble). The resampler is
+        // conceptually a 7×-upsample —
         // whose `(k+1)/8` integer-divides to 0, making it a sample-and-hold of
         // the previous source sample — then decimate by m=f18khz?3:6, yielding
         // `resampleCount` samples at 44100 Hz. Output j samples source index
         // q-1 where q=(j*m)/7; q==0 uses the previous sector's last output
-        // sample (psxe's `ls`, carried in xaPrevL/R). n (2016 stereo / 4032
+        // sample (the `ls` seed, carried in xaPrevL/R). n (2016 stereo / 4032
         // mono) bounds the source; q-1 never reaches it for any valid j.
         const f18: bool = xaSectorIs18kHz(scratch.asPtr());
         var m: u32 = 6;
@@ -1045,19 +1045,19 @@ pub const Cdrom = struct {
 
 // free helpers (no state required)
 
-// Binary-to-BCD encoder (psxe ITOB). Inputs 0..99.
+// Binary-to-BCD encoder. Inputs 0..99.
 pub fn bcdEnc(v: u32) u32 {
     const lo: u32 = v % 10;
     const hi: u32 = (v / 10) % 10;
     return (hi << 4) | lo;
 }
 
-// BCD validity check (psxe VALID_BCD): both nibbles must be 0..9.
+// BCD validity check: both nibbles must be 0..9.
 pub fn bcdValid(b: u32) bool {
     return ((b & 0x0F) <= 9) && (((b >> 4) & 0x0F) <= 9);
 }
 
-// cdrom_version_id table (psxe), 4 bytes per version. Index 1 = C0A.
+// CD-ROM controller version-ID table, 4 bytes per version. Index 1 = C0A.
 // `version` is unused for v1 — would index a table for other versions.
 pub fn versionByteForIdx(version: u32, n: u32) u32 {
     if (n == 0) { return 0x94; }

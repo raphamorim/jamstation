@@ -48,7 +48,7 @@ pub fn xaSectorIsAudio(secBuf: *mut[] u8) bool {
 }
 
 // Form-2 bit (sub-mode byte bit 0) — form-2 sectors don't have ECC and
-// always carry audio/video. psxe fetch_xa_sector skips non-form-2 sectors
+// always carry audio/video. The XA fetch path skips non-form-2 sectors
 // even when MODE_XA_ADPCM is set.
 pub fn xaSectorIsForm2(secBuf: *mut[] u8) bool {
     return (secBuf[0x12] & 0x01) != 0;
@@ -79,8 +79,9 @@ pub fn xaSector4Bit(secBuf: *mut[] u8) bool {
 }
 
 // Decode one 28-sample block. `idx` is the byte offset to the start of
-// the 128-byte sound group inside the sector buffer (psxe walks idx=24,
-// 152, 280, ...). `blk` is the block index within the group (0..3).
+// the 128-byte sound group inside the sector buffer (idx walks 24,
+// 152, 280, ... in steps of 128). `blk` is the block index within the
+// group (0..3).
 // `nib` is the nibble half (0 = low, 1 = high). `dst` receives 28 i16
 // samples; `hist` is a 2-entry signed-16 history (hist[0] = previous
 // sample, hist[1] = sample-before-previous).
@@ -88,13 +89,14 @@ pub fn xaDecodeBlock(secBuf: *mut[] u8,
                      idx: u32, blk: u32, nib: u32,
                      dst: *mut[] i32, hist: *mut[] i32) {
     const hdr: u32 = secBuf[idx + 4 + blk * 2 + nib] as u32;
-    // Reserved ADPCM shift values 13..15 act as 9 on hardware (duckstation
-    // cdrom.cpp:285-289). psxe's naive `12 - (hdr&0xF)` leaves shift negative
-    // and the `old << shift` below is then an undefined negative shift; clamp.
+    // Reserved ADPCM shift values 13..15 act as 9 on hardware (DuckStation
+    // cdrom.cpp:285-289). A naive `12 - (hdr&0xF)` would leave shift negative
+    // and the `old << shift` below would then be an undefined negative shift;
+    // clamp.
     var shiftVal: i32 = (hdr & 0x0F) as i32;
     if (shiftVal > 12) { shiftVal = 9; }
     const shift: i32 = 12 - shiftVal;
-     // self note: psxe masks to 0x30 then >>4
+     // self note: mask to 0x30 then >>4
     const filter: u32 = (hdr >> 4) & 3;
     const f0: i32 = xaPosCoef(filter);
     const f1: i32 = xaNegCoef(filter);
@@ -108,7 +110,7 @@ pub fn xaDecodeBlock(secBuf: *mut[] u8,
         const old: i32 = (t << 12) >> 12;
         const shifted: i32 = old << shift;
         const pred: i32 = (f0 * hist[0] + f1 * hist[1] + 32) / 64;
-        // self note: psxe wraps to int16 here, not saturates
+        // self note: wrap to int16 here, do not saturate
         const s: i32 = xaWrap16(shifted + pred);
         hist[1] = hist[0];
         hist[0] = s;

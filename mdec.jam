@@ -1,4 +1,4 @@
-// MDEC — Motion Decoder. Port of psxe/psx/dev/mdec.c (~470 lines).
+// MDEC — Motion Decoder.
 //
 // PSX intros (Musashi SQUARESOFT logo, Harvest Moon opening, BIOS PS-X
 // startup splash, etc.) decompress YUV macroblock data through this
@@ -34,7 +34,7 @@ const DEPTH_8BIT:  u32 = 1;
 const DEPTH_24BIT: u32 = 2;
 const DEPTH_15BIT: u32 = 3;
 
-// psxe's `int zagzig[]` — index into yblk in iDCT-input order (mdec.c:19-28).
+// Zig-zag table — index into yblk in iDCT-input order.
 const ZAGZIG_INIT: [64]u8 = [
      0,  1,  8, 16,  9,  2,  3, 10,
     17, 24, 32, 25, 18, 11,  4,  5,
@@ -52,7 +52,7 @@ const ZAGZIG_INIT: [64]u8 = [
 //
 // yBlk / crBlk / cbBlk are 128-element i16 arrays — the iDCT
 // ping-pongs between the first 64 entries (live block) and the next
-// 64 (scratch). That matches psxe's "blk + 128" scratch offset.
+// 64 (scratch), using a "blk + 128" scratch offset.
 pub const Mdec = struct {
     cmd:            u32,
     wordsRem:       u32,
@@ -129,7 +129,7 @@ pub const Mdec = struct {
         };
     }
 
-    // iDCT (mdec.c:45 real_idct)
+    // iDCT
     //
     // Two-pass 8×8 transform. The block (blk) provides both the input
     // and final output; we ping-pong through the scratch slot at
@@ -137,12 +137,12 @@ pub const Mdec = struct {
     pub fn realIdct(self: mut Self, blk: *mut[] i16) {
         idctPassPtr(blk, blk, 64, self.scale.asMutPtr());
         idctPassPtr(blk, blk, 64, self.scale.asMutPtr());
-        // Note: real_idct ping-pongs blk↔scratch via 64-entry offset.
+        // Note: the iDCT ping-pongs blk↔scratch via 64-entry offset.
         // Our 128-entry block holds both. After the two passes the
         // final result lives in blk[0..64].
     }
 
-    // RLE block decode (mdec.c:72 rl_decode_block)
+    // RLE block decode
     //
     // Reads 16-bit words from `input` starting at `inIdx`. Decodes one
     // block into `blk` (a 128-entry i16 array; lower 64 are the live
@@ -195,7 +195,7 @@ pub const Mdec = struct {
         return idx;
     }
 
-    // YUV → RGB (mdec.c:135 yuv_to_rgb)
+    // YUV → RGB
     pub fn yuvToRgb(self: mut Self, output: *mut[] u8, outBase: u32,
                     xx: u32, yy: u32) {
         const depth: u32 = self.outputDepth;
@@ -210,8 +210,8 @@ pub const Mdec = struct {
                 const rRaw: i32 = self.crBlk[cri] as i32;
                 const bRaw: i32 = self.cbBlk[cri] as i32;
 
-                // psxe uses floats: g = -0.3437*b + -0.7143*r;
-                //                   r = 1.402*r;  b = 1.772*b.
+                // YUV→RGB coefficients (float): g = -0.3437*b + -0.7143*r;
+                //                               r = 1.402*r;  b = 1.772*b.
                 const rf: f64 = rRaw as f64;
                 const bf: f64 = bRaw as f64;
                 const gFloat: f64 = (0.0 - 0.3437) * bf + (0.0 - 0.7143) * rf;
@@ -253,7 +253,7 @@ pub const Mdec = struct {
         }
     }
 
-    // decode macroblock (mdec.c:180)
+    // decode macroblock
     pub fn decodeMacroblock(self: mut Self,
                             input: *mut[] u8, output: *mut[] u8) {
         const depth: u32 = self.outputDepth;
@@ -362,7 +362,7 @@ pub const Mdec = struct {
         }
     }
 
-    // bus dispatch (mdec.c:287/348)
+    // bus dispatch
     pub fn read32(self: mut Self, output: *mut[] u8, off: u32) u32 {
         if (off == 0) {
             // Data port — drain one word from the output buffer.
@@ -380,11 +380,11 @@ pub const Mdec = struct {
             return 0xAAAAAAAA;
         }
         if (off == 4) {
-            // Status register — psxe mdec.c:316.
+            // Status register.
             // Bits 0-15 = "number of parameter words remaining MINUS 1"
             // (nocash: FFFFh = none). DuckStation `(remaining/2)-1`, Avocado
             // `(paramCount-1)&0xffff`, mednafen's 0xFFFF sentinel all agree;
-            // psxe (and the old jam code) reported the raw count, so a game
+            // the old jam code reported the raw count, so a game
             // that polls for (status & 0xFFFF)==0xFFFF after a SET_QT/SET_ST
             // upload to confirm "no params pending" never saw it and never
             // advanced to DECODE. wordsRem is u32, so 0-1 wraps to 0xFFFF here.
@@ -397,10 +397,11 @@ pub const Mdec = struct {
             // recomputed here, NOT latched: bit 27 = DMA1 enabled AND output
             // has data; bit 28 = DMA0 enabled AND more input wanted; bit 31 =
             // output drained. Matches nocash psx-spx, DuckStation
-            // (`enable_dma_out && !out_fifo.empty()`) and Avocado. psxe latches
-            // outputReq at the final decode word, so a game that enables DMA1
-            // AFTER the decode reads bit 27 = 0 forever and never DMAs the MDEC
-            // output back out -- the frame decodes but is never read (FMV skip).
+            // (`enable_dma_out && !out_fifo.empty()`) and Avocado. Latching
+            // outputReq at the final decode word instead would mean a game that
+            // enables DMA1 AFTER the decode reads bit 27 = 0 forever and never
+            // DMAs the MDEC output back out -- the frame decodes but is never
+            // read (FMV skip).
             if (self.enableDma1 != 0 && self.outputWords > 0) { st = st | (1 << 27); }
             if (self.enableDma0 != 0 && self.wordsRem  > 0) { st = st | (1 << 28); }
             if (self.busy         != 0) { st = st | (1 << 29); }
@@ -541,10 +542,10 @@ pub fn clampS10(v: i32) i32 {
     return v;
 }
 
-// Wrap an i32 to int16. psxe rl_decode_block holds the dequant product
-// in an int16_t, so it TRUNCATES before the CLAMP(-0x400,0x3ff)
-// (mdec.c:90,96,114). For products past int16 range the wrap can flip
-// the sign and clamp to the opposite bound — must be applied pre-clamp.
+// Wrap an i32 to int16. The RLE dequant product is held in an int16_t,
+// so it TRUNCATES before the CLAMP(-0x400,0x3ff). For products past
+// int16 range the wrap can flip the sign and clamp to the opposite
+// bound — must be applied pre-clamp.
 pub fn mdecTrunc16(v: i32) i32 {
     return ((v & 0xFFFF) ^ 0x8000) - 0x8000;
 }
@@ -579,8 +580,8 @@ pub fn writeU32(buf: *mut[] u8, off: u32, v: u32) {
 // secondary pass. We pingpong by indexing through that offset.
 pub fn idctPassPtr(blk: *mut[] i16, _dst: *mut[] i16,
                    _scratchOff: u32, scale: *mut[] i16) {
-    // Pass: write into the scratch half, then copy back. Mirrors
-    // psxe's two-pass iDCT via a 64-entry temp.
+    // Pass: write into the scratch half, then copy back. This is the
+    // two-pass iDCT via a 64-entry temp.
     var scratch: [64]i16 = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
                             0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
                             0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,

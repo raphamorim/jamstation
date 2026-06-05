@@ -11,7 +11,7 @@
 // audio/data type tagging. With raw .bin we treat the whole file as a
 // single Mode2/2352 data track.
 //
-// LBA convention follows the PSX BIOS / psxe:
+// LBA convention follows the PSX BIOS:
 //   LBA = 150 → start of track 1 data (00:02:00 on the disc)
 //   LBA = 150 + N → Nth sector of the data track in the .bin file
 // We subtract the 150-sector lead-in when seeking inside the .bin —
@@ -131,7 +131,7 @@ pub fn discOpen(d: *mut[] Disc, path: []u8) i32 {
 // `buf`. Returns 1 on success, 0 on out-of-range or no-disc.
 // Fill a 2352-byte buffer with the PSX CD-ROM pregap sector layout:
 // byte 0 = 0x00, bytes 1..10 = 0xFF (sync pattern), byte 11 = 0x00, rest
-// zero. Matches psxe cue.c:535-536. Some games inspect the sync pattern
+// zero. Some games inspect the sync pattern
 // when reading pregap sectors and would otherwise see all-zero data.
 pub fn fillPregapSector(buf: *mut[] u8) {
     var i: u32 = 0;

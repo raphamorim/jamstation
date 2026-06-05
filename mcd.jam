@@ -1,4 +1,4 @@
-// Memory Card (PSX BU01) — port of psxe/psx/dev/mcd.c.
+// Memory Card (PSX BU01).
 //
 // Memory cards live on SIO0 as a second device alongside the joypad.
 // When the host writes 0x81 to SIO0_DATA the bus selects the memcard;
@@ -6,7 +6,7 @@
 // 128 bytes per frame. Our pad.jam handles slot selection — it routes
 // 0x81 dest writes through here.
 //
-// State machine (psxe mcd.c MCD_STATE_*):
+// State machine (MCD_STATE_*):
 //
 //   TX_HIZ          → 0xFF on first read (line high-Z)
 //   TX_FLG          → flag byte (0x08 = "first access since power-on")
@@ -27,7 +27,7 @@ const { File } = import("std/fs");
 
 const MCD_MEMORY_SIZE: u64 = 0x20000;       // 128 KB
 
-// MCD state-machine states (mirrors psxe enum).
+// MCD state-machine states.
 const MCD_TX_HIZ:        u32 = 0;
 const MCD_TX_FLG:        u32 = 1;
 const MCD_TX_ID1:        u32 = 2;
@@ -104,7 +104,7 @@ pub const Mcd = struct {
         return self.txReady != 0;
     }
 
-    // Read one byte from the card (psxe psx_mcd_read). The state
+    // Read one byte from the card. The state
     // advances after each byte; the host clocks 8 bits per call.
     // Returns the byte the host should latch into SIO0's RX register.
     pub fn read(self: mut Self, ram: *mut[] u8) u32 {
@@ -112,7 +112,7 @@ pub const Mcd = struct {
         match (st) {
             MCD_TX_HIZ { self.txData = 0xFF; }
             MCD_TX_FLG {
-                // psxe patch: if the host's last RX was 0x81/0x01 the card
+                // If the host's last RX was 0x81/0x01 the card
                 // bails out — game-side probe code expects 0xFF when it
                 // tries to ping us by sending the dest byte twice.
                 const rx: u32 = self.rxData as u32;

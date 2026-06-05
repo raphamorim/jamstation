@@ -339,7 +339,7 @@ tfn psxLwlLwr()         { assert(tLwlLwr(), 0xBBCCDD11); }
 // GTE (COP2) unit tests
 //
 // gteAlloc gives a standalone register buffer, so the math ops can be
-// exercised without a full Bus. These lock in the psxe-match fixes:
+// exercised without a full Bus. These lock in the GTE fixes:
 // RTPS stores MAC >> sf (not the raw 44-bit sum), MFC2 sign-extends the
 // 16-bit registers, and the perspective divide uses the UNR LUT.
 
@@ -451,7 +451,7 @@ fn tGteMvmvaNestedOvf() u32 {
 
 // IRGB/ORGB (reg 28) repacks IR1/2/3 (>>7, clamped 0..0x1F) into 15-bit RGB.
 // IR is stored zero-extended in the low 16 bits and must be sign-extended
-// before the >>7, so a negative IR clamps to 0 (psxe cpu.c:1290 / duckstation
+// before the >>7, so a negative IR clamps to 0 (DuckStation
 // gte.cpp:343). The old `(g[9] as i32)` bit-cast read IR1=-1 as +65535 → 0x1F;
 // with all three IR = -1 the packed result must be 0, not 0x7FFF.
 fn tGteIrgbNeg() u32 {
@@ -472,8 +472,8 @@ fn tGteIrgbPos() u32 {
     return gteDataRead(g.ptr, 28);
 }
 
-// RTPT runs the depth-cue (DQ) tail only on the LAST vertex (psxe
-// cpu.c:2247-2251). Construct V0/V1 with a small Z (→ large divide → the DQ's
+// RTPT runs the depth-cue (DQ) tail only on the LAST vertex.
+// Construct V0/V1 with a small Z (→ large divide → the DQ's
 // IR0 = clamp(DQA*div>>12) saturates, setting FLAG bit 12) and V2 with a large
 // Z (→ small divide → no IR0 saturation). Bit 12 (IR0 sat) is set ONLY by the
 // DQ tail's gte_clamp_ir0 and is excluded from the bit-31 summary, so it
@@ -492,8 +492,8 @@ fn tGteRtptDqGate() u32 {
     return gteCtrlRead(g.ptr, 31) & 0x1000;    // FLAG bit 12 = IR0 saturation (DQ tail only)
 }
 
-// NCDS pushes the final colour via the FLAG-aware gte_clamp_rgb (psxe
-// cpu.c:1917-1919), so a channel that saturates >255 sets FLAG bit 21/20/19
+// NCDS pushes the final colour via the FLAG-aware RGB clamp,
+// so a channel that saturates >255 sets FLAG bit 21/20/19
 // (R/G/B). Drive only the R far-colour large and IR0 to max so stage-5
 // MAC1 = IR0*ir1f hugely overflows 255 on R alone; bits 19/20/21 masked must
 // read 0x200000 (R). The old inline clampU8 set none of these (returned 0).
@@ -505,7 +505,7 @@ fn tGteNcdsRgbSat() u32 {
     return gteCtrlRead(g.ptr, 31) & 0x00380000; // RGB-saturation FLAG bits 19/20/21
 }
 
-// DQA (control reg 27) is s16 (psxe cpu.c:138 / duckstation gte_types.h:117),
+// DQA (control reg 27) is s16 (DuckStation gte_types.h:117),
 // so the RTPS depth-cue must sign-extend its low 16 bits, not read all 32. With
 // DQA=0x00010001 the low half is 1: depth-cue MAC0 = DQB + DQA*div = 1*0x10000,
 // IR0 = clamp(0x10000>>12) = 16. The old s32 read used 65537, giving a huge
@@ -667,14 +667,14 @@ tfn emuDiscBootsExec() {
 // pushes an INT3/INT2/INT5 response, so a non-zero value proves the CD
 // state machine got exercised.
 
-// variable per-instruction cycle model (psxe cpu.c last_cycles)
+// variable per-instruction cycle model
 //
-// step() charges `fetchCyc + instrCyc` per instruction, matching psxe:
-// fetchCyc = 18 when the opcode is read from BIOS ROM (bios.c bus_delay)
+// step() charges `fetchCyc + instrCyc` per instruction:
+// fetchCyc = 18 when the opcode is read from BIOS ROM (BIOS bus delay)
 // else 0; instrCyc = 2 except COP2 math ops, which cost their GTE op time.
-// These deltas drive device timing (CDROM/DMA/timers) at psxe's rate.
+// These deltas drive device timing (CDROM/DMA/timers) at the right rate.
 
-// gteOpCycles mirrors psxe's GTE cycle switch (cpu.c). Low 6 bits select.
+// gteOpCycles selects the GTE op cycle count from the low 6 bits.
 fn tGteCycRtps() u32 { return gteOpCycles(0x4A000001); }   // RTPS → 15
 fn tGteCycNcdt() u32 { return gteOpCycles(0x4A000016); }   // NCDT → 44
 fn tGteCycRtpt() u32 { return gteOpCycles(0x4A000030); }   // RTPT → 23
