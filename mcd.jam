@@ -8,14 +8,14 @@
 //
 // State machine (MCD_STATE_*):
 //
-//   TX_HIZ          → 0xFF on first read (line high-Z)
-//   TX_FLG          → flag byte (0x08 = "first access since power-on")
-//   TX_ID1 / TX_ID2 → 0x5A / 0x5D identification bytes
-//   R_*             → READ subprotocol: take MSB/LSB → addr<<7, then
+//   TX_HIZ          -> 0xFF on first read (line high-Z)
+//   TX_FLG          -> flag byte (0x08 = "first access since power-on")
+//   TX_ID1 / TX_ID2 -> 0x5A / 0x5D identification bytes
+//   R_*             -> READ subprotocol: take MSB/LSB -> addr<<7, then
 //                     ACK + 128 data bytes + checksum + 'G' end marker
-//   W_*             → WRITE subprotocol: take MSB/LSB + 128 data bytes
+//   W_*             -> WRITE subprotocol: take MSB/LSB + 128 data bytes
 //                     + checksum, then ACK + 'G' end marker
-//   S_*             → STATUS subprotocol (rarely used)
+//   S_*             -> STATUS subprotocol (rarely used)
 //
 // We model a single-slot card with an in-memory 128 KB buffer; the
 // buffer is kept as a separate heap allocation (Bus.mcdRam) so callers

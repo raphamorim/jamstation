@@ -61,8 +61,8 @@ pub const CueTrack = struct {
 
 pub const Cue = struct {
     // Vec instead of raw `*mut[] T` so each backing buffer auto-drops
-    // when the enclosing Box(Cue) is destroyed (Box.drop → @dropInPlace
-    // → field walk → Vec.drop). Cue's own `cfn drop` is the iterate-and-
+    // when the enclosing Box(Cue) is destroyed (Box.drop -> @dropInPlace
+    // -> field walk -> Vec.drop). Cue's own `cfn drop` is the iterate-and-
     // close-files cleanup that Vec can't synthesize for a File handle.
     files:     Vec(CueFile),
     tracks:    Vec(CueTrack),
@@ -208,9 +208,9 @@ pub fn kwId(buf: *mut[] u8) u32 {
 // Vecs are filled-with-zero so the existing index-based writes by
 // cueParse (`c.files.ptr[fi].sectors = ...`) land on valid slots —
 // matches the old memset-after-malloc semantics. When the owning Bus
-// goes out of scope, Box(Disc).drop → @dropInPlace → Disc.cuePtr Box
-// drop → @dropInPlace on Cue → Cue's cfn drop closes open files →
-// Cue's field-walk drops each Vec → libc free.
+// goes out of scope, Box(Disc).drop -> @dropInPlace -> Disc.cuePtr Box
+// drop -> @dropInPlace on Cue -> Cue's cfn drop closes open files ->
+// Cue's field-walk drops each Vec -> libc free.
 // Close every open per-cue-file handle and zero the counters so the
 // same Box(Cue) can be repopulated by a fresh cueParse. The Vec backings
 // stay live — only the user-visible "we have N tracks/files loaded"
@@ -507,7 +507,7 @@ pub fn cueParse(raw: *mut[] u8, path: []u8) i32 {
     return 0;
 }
 
-// FILE "path" BINARY → push a CueFile, open + size it.
+// FILE "path" BINARY -> push a CueFile, open + size it.
 pub fn cueParseFile(raw: *mut[] u8) {
     var c: *mut[] Cue = raw as *mut[] Cue;
     skipWs(raw);
@@ -553,7 +553,7 @@ pub fn cueParseFile(raw: *mut[] u8) {
     // nameBuf auto-drops on function-scope exit.
 }
 
-// TRACK NN MODE → push a CueTrack tagged with the current file.
+// TRACK NN MODE -> push a CueTrack tagged with the current file.
 pub fn cueParseTrack(raw: *mut[] u8) {
     var c: *mut[] Cue = raw as *mut[] Cue;
     skipWs(raw);
@@ -580,7 +580,7 @@ pub fn cueParseTrack(raw: *mut[] u8) {
     c[0].trackCount = ti + 1;
 }
 
-// INDEX NN MM:SS:FF → record the MSF into the most-recent track.
+// INDEX NN MM:SS:FF -> record the MSF into the most-recent track.
 pub fn cueParseIndex(raw: *mut[] u8) {
     var c: *mut[] Cue = raw as *mut[] Cue;
     if (c[0].trackCount == 0) { return; }

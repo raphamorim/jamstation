@@ -132,8 +132,8 @@ pub fn dmaRead32(d: *mut[] u32, off: u32) u32 {
 // = DICR bytes. The old `dmaRead32(off) & mask` returned 0 for any offset not
 // 0x70/0x74 (dmaRead32's default) — so a `lbu`/`lhu` of the DICR enable bits
 // at 0x1F8010F5/F6 read 0, and Brave Fencer's per-frame DICR-enable RMW then
-// wrote the per-channel IRQ enables back as 0 → DMA-completion IRQs stopped
-// firing → the FMV's STR clock callback never ran → black screen. (3rd
+// wrote the per-channel IRQ enables back as 0 -> DMA-completion IRQs stopped
+// firing -> the FMV's STR clock callback never ran -> black screen. (3rd
 // trace-diff divergence, instr 368,822,179; the write side already handled
 // these sub-offsets, only the read side was broken.)
 pub fn dmaRead16(d: *mut[] u32, off: u32) u32 {
@@ -279,7 +279,7 @@ pub fn dmaDoGpuRequest(d: *mut[] u32, bus: Bus) {
             i = i + 1;
         }
     } else {
-        // GPU→RAM (C0 transfer): drain GPUREAD per word into RAM.
+        // GPU->RAM (C0 transfer): drain GPUREAD per word into RAM.
         // Each word reads GPUREAD at 0x1F801810, which
         // pulls from VRAM via the active C0 state machine.
         // Our previous stub wrote zeros, which broke
@@ -317,7 +317,7 @@ pub fn dmaDoGpuLinked(d: *mut[] u32, bus: Bus) {
     }
 }
 
-// DMA0: RAM → MDEC input port. Each word from RAM is sent to the MDEC
+// DMA0: RAM -> MDEC input port. Each word from RAM is sent to the MDEC
 // data port (0x1F801820), which buffers it as command parameters or
 // command body. When all words for the active MDEC command are
 // delivered, MDEC's internal state machine runs the decode and fills
@@ -340,7 +340,7 @@ pub fn dmaDoMdecIn(d: *mut[] u32, bus: Bus) {
     d[23] = size;
 }
 
-// DMA1: MDEC output port → RAM.
+// DMA1: MDEC output port -> RAM.
 pub fn dmaDoMdecOut(d: *mut[] u32, bus: Bus) {
     if (!chcrBusy(d, 1)) { return; }
     const size: u32 = bcrSize(d, 1) * bcrBlocks(d, 1);
@@ -359,7 +359,7 @@ pub fn dmaDoMdecOut(d: *mut[] u32, bus: Bus) {
     d[24] = size;
 }
 
-// CD-ROM → RAM transfer. Each "word" in BCR.size is 4 bytes from the
+// CD-ROM -> RAM transfer. Each "word" in BCR.size is 4 bytes from the
 // data FIFO at 0x1F801802. Streaming goes through
 // cdromReadData(), popping one byte at a time and packing into a
 // little-endian word. After the transfer, ack via the d[26] flag so
@@ -444,7 +444,7 @@ pub fn dmaDoSpu(d: *mut[] u32, bus: Bus) {
     d[chBase(4) + F_MADR] = addr;
     // The SPU transfer completes instantly, FULLY clears CHCR
     // (BUSY off), and raises the ch4 completion IRQ on the NEXT dmaUpdate
-    // (spu_irq_delay is set then immediately zeroed → IC_DMA ~1 instr later).
+    // (spu_irq_delay is set then immediately zeroed -> IC_DMA ~1 instr later).
     // The old jam model kept BUSY for `words*8` cycles (d[F_SPU_REMAIN]) and
     // only THEN raised the IRQ — an in-flight-DMA nicety for ps1-tests
     // (testDMAWriteTiming), but it DEFERRED the completion IC_DMA by the whole
@@ -454,7 +454,7 @@ pub fn dmaDoSpu(d: *mut[] u32, bus: Bus) {
     // its DMA-IRQ handler — which is what advances the FMV's STR frame clock
     // (0x800d24d0) — and the video stayed black.
     // The fix: clear CHCR now + raise the ch4 done flag immediately so
-    // dmaUpdate folds it into DICR.DMA4FL → IC_DMA on the next instruction.
+    // dmaUpdate folds it into DICR.DMA4FL -> IC_DMA on the next instruction.
     d[chBase(4) + F_CHCR] = 0;
     d[chBase(4) + F_BCR]  = 0;
     d[27] = 1;
@@ -510,7 +510,7 @@ pub fn dmaTickSpu(d: *mut[] u32, delta: u32) {
 // zeroed before the !delay test = immediate). Brave Fencer's FMV chains the
 // next MDEC frame-decode off this IRQ; jam's old immediate fire landed it
 // before the handler was ready, so the decode pipeline never re-fed the
-// MDEC → black video.
+// MDEC -> black video.
 pub fn dmaUpdate(d: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32) {
     if (d[23] != 0) {
         d[23] = d[23] - 1;

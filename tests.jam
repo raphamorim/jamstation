@@ -376,19 +376,19 @@ fn tGteRtpsIr() u32 {
 fn tGteIrSext() u32 {
     var g: Vec(u32) = gteAlloc();
     gteDataWrite(g.ptr, 9, 0x0000FFFF);            // IR1 = -1 (16-bit)
-    const v: u32 = gteDataRead(g.ptr, 9);          // MFC2 sign-extends → -1
+    const v: u32 = gteDataRead(g.ptr, 9);          // MFC2 sign-extends -> -1
     return v;
 }
 
 fn tGteDivide() u32 {
     var g: Vec(u32) = gteAlloc();
-    const q: u32 = gteDivide(g.ptr, 0x800, 0x1000); // 2048/4096 → 0x8000
+    const q: u32 = gteDivide(g.ptr, 0x800, 0x1000); // 2048/4096 -> 0x8000
     return q;
 }
 
 fn tGteDivideOvf() u32 {
     var g: Vec(u32) = gteAlloc();
-    const q: u32 = gteDivide(g.ptr, 0x2000, 0x1000); // n >= 2d → saturates
+    const q: u32 = gteDivide(g.ptr, 0x2000, 0x1000); // n >= 2d -> saturates
     return q;
 }
 
@@ -398,14 +398,14 @@ fn tGteDivideOvf() u32 {
 fn tGteSqrFlag() u32 {
     var g: Vec(u32) = gteAlloc();
     gteDataWrite(g.ptr, 9, 0x7FFF);            // IR1 = 32767
-    gteExec(g.ptr, 0x4A080028);                // SQR, sf=12 → MAC1=262143, IR1 saturates
+    gteExec(g.ptr, 0x4A080028);                // SQR, sf=12 -> MAC1=262143, IR1 saturates
     const f: u32 = gteCtrlRead(g.ptr, 31);     // bit 24 (IR1 sat) + bit 31 summary
     return f;
 }
 
 fn tGteDivideFlag() u32 {
     var g: Vec(u32) = gteAlloc();
-    const q: u32 = gteDivide(g.ptr, 0x2000, 0x1000);  // n>=2d → bit 17 (divide ovf)
+    const q: u32 = gteDivide(g.ptr, 0x2000, 0x1000);  // n>=2d -> bit 17 (divide ovf)
     const f: u32 = gteCtrlRead(g.ptr, 31);            // bit 17 + bit 31 summary
     return f;
 }
@@ -413,14 +413,14 @@ fn tGteDivideFlag() u32 {
 fn tGteNoFlag() u32 {
     var g: Vec(u32) = gteAlloc();
     gteDataWrite(g.ptr, 9, 100);               // IR1 = 100
-    gteExec(g.ptr, 0x4A080028);                // SQR sf=12 → MAC1=2, no saturation
+    gteExec(g.ptr, 0x4A080028);                // SQR sf=12 -> MAC1=2, no saturation
     const f: u32 = gteCtrlRead(g.ptr, 31);     // FLAG must be clean
     return f;
 }
 
 // RTPS IR3 via gte_clamp_ir_z: with sf=0, MAC3 = 4096*256 = 0x100000.
 // clamp_ir_z keys FLAG bit 22 off macRaw3>>12 = 256 (in IR range) so it
-// stays clear, even though the returned IR3 clamps 0x100000 → 0x7FFF. The
+// stays clear, even though the returned IR3 clamps 0x100000 -> 0x7FFF. The
 // old plain IR clamp keyed bit 22 off the unshifted 0x100000 and wrongly
 // set it (FLAG = 0x400000; bit 22 is excluded from the bit-31 summary).
 fn tGteRtpsClampIrZ() u32 {
@@ -452,42 +452,42 @@ fn tGteMvmvaNestedOvf() u32 {
 // IRGB/ORGB (reg 28) repacks IR1/2/3 (>>7, clamped 0..0x1F) into 15-bit RGB.
 // IR is stored zero-extended in the low 16 bits and must be sign-extended
 // before the >>7, so a negative IR clamps to 0 (DuckStation
-// gte.cpp:343). The old `(g[9] as i32)` bit-cast read IR1=-1 as +65535 → 0x1F;
+// gte.cpp:343). The old `(g[9] as i32)` bit-cast read IR1=-1 as +65535 -> 0x1F;
 // with all three IR = -1 the packed result must be 0, not 0x7FFF.
 fn tGteIrgbNeg() u32 {
     var g: Vec(u32) = gteAlloc();
     gteDataWrite(g.ptr, 9, 0x0000FFFF);        // IR1 = -1
     gteDataWrite(g.ptr, 10, 0x0000FFFF);       // IR2 = -1
     gteDataWrite(g.ptr, 11, 0x0000FFFF);       // IR3 = -1
-    return gteDataRead(g.ptr, 28);             // each channel clamps to 0 → 0
+    return gteDataRead(g.ptr, 28);             // each channel clamps to 0 -> 0
 }
 
-// Positive packing still works after the sign-extension fix: IR1=3968→31,
-// IR2=128→1, IR3=0 ⇒ 0x1F | (1<<5) | 0 = 0x3F.
+// Positive packing still works after the sign-extension fix: IR1=3968->31,
+// IR2=128->1, IR3=0 ⇒ 0x1F | (1<<5) | 0 = 0x3F.
 fn tGteIrgbPos() u32 {
     var g: Vec(u32) = gteAlloc();
-    gteDataWrite(g.ptr, 9, 0x0F80);            // IR1 = 3968 → >>7 = 31
-    gteDataWrite(g.ptr, 10, 0x0080);           // IR2 = 128  → >>7 = 1
+    gteDataWrite(g.ptr, 9, 0x0F80);            // IR1 = 3968 -> >>7 = 31
+    gteDataWrite(g.ptr, 10, 0x0080);           // IR2 = 128  -> >>7 = 1
     gteDataWrite(g.ptr, 11, 0x0000);           // IR3 = 0
     return gteDataRead(g.ptr, 28);
 }
 
 // RTPT runs the depth-cue (DQ) tail only on the LAST vertex.
-// Construct V0/V1 with a small Z (→ large divide → the DQ's
+// Construct V0/V1 with a small Z (-> large divide -> the DQ's
 // IR0 = clamp(DQA*div>>12) saturates, setting FLAG bit 12) and V2 with a large
-// Z (→ small divide → no IR0 saturation). Bit 12 (IR0 sat) is set ONLY by the
+// Z (-> small divide -> no IR0 saturation). Bit 12 (IR0 sat) is set ONLY by the
 // DQ tail's gte_clamp_ir0 and is excluded from the bit-31 summary, so it
 // cleanly isolates whether intermediate vertices wrongly ran the DQ. With the
-// fix only V2's DQ runs → bit 12 clear. (Pre-fix: V0/V1 saturate it → 0x1000.)
+// fix only V2's DQ runs -> bit 12 clear. (Pre-fix: V0/V1 saturate it -> 0x1000.)
 fn tGteRtptDqGate() u32 {
     var g: Vec(u32) = gteAlloc();
     gteSetIdentity(g.ptr);
     gteCtrlWrite(g.ptr, 26, 2);                // H = 2
     gteCtrlWrite(g.ptr, 27, 0x1000);           // DQA = 4096
     gteCtrlWrite(g.ptr, 28, 0);                // DQB = 0
-    gteDataWrite(g.ptr, 0, 0); gteDataWrite(g.ptr, 1, 16);      // V0.z = 16   → div 0x2000, IR0 sat
+    gteDataWrite(g.ptr, 0, 0); gteDataWrite(g.ptr, 1, 16);      // V0.z = 16   -> div 0x2000, IR0 sat
     gteDataWrite(g.ptr, 2, 0); gteDataWrite(g.ptr, 3, 16);      // V1.z = 16
-    gteDataWrite(g.ptr, 4, 0); gteDataWrite(g.ptr, 5, 0x1000);  // V2.z = 4096 → div 32, no sat
+    gteDataWrite(g.ptr, 4, 0); gteDataWrite(g.ptr, 5, 0x1000);  // V2.z = 4096 -> div 32, no sat
     gteExec(g.ptr, 0x4A000030);                // RTPT, sf=0
     return gteCtrlRead(g.ptr, 31) & 0x1000;    // FLAG bit 12 = IR0 saturation (DQ tail only)
 }
@@ -499,7 +499,7 @@ fn tGteRtptDqGate() u32 {
 // read 0x200000 (R). The old inline clampU8 set none of these (returned 0).
 fn tGteNcdsRgbSat() u32 {
     var g: Vec(u32) = gteAlloc();
-    gteCtrlWrite(g.ptr, 21, 0x00010000);       // RFC large → ir1f saturates high
+    gteCtrlWrite(g.ptr, 21, 0x00010000);       // RFC large -> ir1f saturates high
     gteDataWrite(g.ptr, 8, 0x7FFF);            // IR0 = max
     gteExec(g.ptr, 0x4A000013);                // NCDS, sf=0
     return gteCtrlRead(g.ptr, 31) & 0x00380000; // RGB-saturation FLAG bits 19/20/21
@@ -517,7 +517,7 @@ fn tGteDqaWidth() u32 {
     gteCtrlWrite(g.ptr, 27, 0x00010001);       // DQA: low16=1 (s16), high bits set
     gteCtrlWrite(g.ptr, 28, 0);                // DQB = 0
     gteDataWrite(g.ptr, 0, 0);
-    gteDataWrite(g.ptr, 1, 0x1000);            // V0.z = 4096 → SZ3 = 4096
+    gteDataWrite(g.ptr, 1, 0x1000);            // V0.z = 4096 -> SZ3 = 4096
     gteExec(g.ptr, 0x4A000001);                // RTPS, sf=0
     return gteDataRead(g.ptr, 8);              // IR0 = clamp((DQA_s16 * div) >> 12) = 16
 }
@@ -675,11 +675,11 @@ tfn emuDiscBootsExec() {
 // These deltas drive device timing (CDROM/DMA/timers) at the right rate.
 
 // gteOpCycles selects the GTE op cycle count from the low 6 bits.
-fn tGteCycRtps() u32 { return gteOpCycles(0x4A000001); }   // RTPS → 15
-fn tGteCycNcdt() u32 { return gteOpCycles(0x4A000016); }   // NCDT → 44
-fn tGteCycRtpt() u32 { return gteOpCycles(0x4A000030); }   // RTPT → 23
-fn tGteCycNcct() u32 { return gteOpCycles(0x4A00003F); }   // NCCT → 39
-fn tGteCycDflt() u32 { return gteOpCycles(0x4A000000); }   // non-math → 2
+fn tGteCycRtps() u32 { return gteOpCycles(0x4A000001); }   // RTPS -> 15
+fn tGteCycNcdt() u32 { return gteOpCycles(0x4A000016); }   // NCDT -> 44
+fn tGteCycRtpt() u32 { return gteOpCycles(0x4A000030); }   // RTPT -> 23
+fn tGteCycNcct() u32 { return gteOpCycles(0x4A00003F); }   // NCCT -> 39
+fn tGteCycDflt() u32 { return gteOpCycles(0x4A000000); }   // non-math -> 2
 
 // A plain instruction fetched from cached RAM costs 2 (0 fetch + 2 base).
 fn tCycRam() u32 {

@@ -376,7 +376,7 @@ pub fn iRegimm(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     }
 
     // REGIMM default: branch type is decided by bit 16
-    // (= rt & 1). Even-numbered rt → BLTZ semantics, odd → BGEZ.
+    // (= rt & 1). Even-numbered rt -> BLTZ semantics, odd -> BGEZ.
     // (An earlier version only matched 0x00/0x10 for BLTZ and treated
     // 0x02 / 0x12 as BGEZ, which was wrong.)
     var take: bool = false;
@@ -650,8 +650,8 @@ pub fn iMtlo(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     c.lo = s;
 }
 
-// MULT — signed 32×32 → 64. Sign-flip the operands to positive, do an
-// unsigned 32×32 → 64 with Jam's native u64, then sign-flip the result.
+// MULT — signed 32×32 -> 64. Sign-flip the operands to positive, do an
+// unsigned 32×32 -> 64 with Jam's native u64, then sign-flip the result.
 pub fn umul64(a: u32, b: u32) u64 {
     return (a as u64) * (b as u64);
 }
@@ -839,10 +839,10 @@ pub fn iRfe(c: mut Cpu, regs: *mut[] u32, cop0: *mut[] u32) {
 // register-move; otherwise it's a math operation whose body lives in
 // `gteExec`.
 //
-//   rs = 0x00  MFC2  data register → CPU register (delayed load)
-//   rs = 0x02  CFC2  control register → CPU register (delayed load)
-//   rs = 0x04  MTC2  CPU register → data register
-//   rs = 0x06  CTC2  CPU register → control register
+//   rs = 0x00  MFC2  data register -> CPU register (delayed load)
+//   rs = 0x02  CFC2  control register -> CPU register (delayed load)
+//   rs = 0x04  MTC2  CPU register -> data register
+//   rs = 0x06  CTC2  CPU register -> control register
 //   rs >= 0x10 COP2 imm — math op (RTPS, NCLIP, NCDS, ...)
 pub fn iCop2Unimpl(c: mut Cpu, opc: u32, bus: Bus,
                    regs: *mut[] u32, cop0: *mut[] u32) {
@@ -960,7 +960,7 @@ pub fn dispatchSpecial(c: mut Cpu, opc: u32, bus: Bus,
 pub fn dispatchCop0(c: mut Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) {
     // Dispatch purely on rs (the CO/CT/MFC/MTC selector); the
     // R3000 fn field is ignored for RFE since TLB ops don't exist on
-    // PSX. rs=0x10 → RFE regardless of fn.
+    // PSX. rs=0x10 -> RFE regardless of fn.
     const rs: u32 = opRs(opc);
     if (rs == 0x00) { iMfc0(c, opc, regs, cop0); return; }
     if (rs == 0x04) { iMtc0(c, opc, regs, cop0); return; }
@@ -999,7 +999,7 @@ pub fn dispatch(c: mut Cpu, opc: u32, bus: Bus,
     if (p == 0x10) {
         const sr10: u32 = cop0Read(cop0, C0_SR);
         if ((sr10 & 0x10000000) == 0 && (sr10 & 0x02) != 0) {
-            // User mode without CU0 → coprocessor unusable.
+            // User mode without CU0 -> coprocessor unusable.
             commitLoad(c, regs);
             raiseException(c, cop0, CAUSE_CPU);
             return;

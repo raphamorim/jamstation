@@ -154,7 +154,7 @@ fn disableAppNap() {
         var reason: []u8 = "jamstation emulation running";
         const nsstr: u64 = objc_msgSend(objc_getClass(nmStr.ptr),
             sel_registerName(selStr.ptr), reason.ptr as u64, 0);
-        // NSActivityUserInitiated (0x00FFFFFF) → App Nap disabled while held.
+        // NSActivityUserInitiated (0x00FFFFFF) -> App Nap disabled while held.
         var selBegin: []u8 = "beginActivityWithOptions:reason:";
         const token: u64 = objc_msgSend(pi, sel_registerName(selBegin.ptr),
             0x00FFFFFF, nsstr);
@@ -361,7 +361,7 @@ pub export fn psone_audio_cb(userdata: u64, stream: *mut[] u8, len: i32) {
     var ring: *mut[] u8 = userdata as *mut[] u8;
     const want: u32 = len as u32;
     var i: u32 = 0;
-    // Not yet primed (startup or post-underrun rebuffer) → silence.
+    // Not yet primed (startup or post-underrun rebuffer) -> silence.
     if (getU32Le(ring, 8) == 0) {
         while (i < want) { stream[i] = 0; i = i + 1; }
         return;
@@ -468,7 +468,7 @@ pub fn sdlBlit(s: Sdl, pixels: *mut[] u8,
                     const lo: u32 = pixels[sb]     as u32;
                     const hi: u32 = pixels[sb + 1] as u32;
                     const px: u32 = lo | (hi << 8);
-                    // BGR555 → 8888 (5→8 by left-shift + replicate high
+                    // BGR555 -> 8888 (5->8 by left-shift + replicate high
                     // bits; cheap "x<<3 | x>>2" expansion).
                     const r5: u32 =  px        & 0x1F;
                     const g5: u32 = (px >> 5)  & 0x1F;

@@ -2,7 +2,7 @@
 //
 // Implements the GP0/GP1 command machinery and the polygon, line,
 // rectangle, fill, and CPU↔VRAM blit commands. Triangles are
-// point-sampled with texture + gouraud support (gpuRasterPoly →
+// point-sampled with texture + gouraud support (gpuRasterPoly ->
 // gpuRasterTri); together with the GTE this renders real game geometry.
 //
 // State buffer layout (80 u32 entries):
@@ -19,7 +19,7 @@
 //   [34..37]  OWNED BY main.jam's frame loop, NOT the GPU: [34]=last CPU-clocked
 //             SPU sample, [35]=SPU sample accumulator, [36]=scanline,
 //             [37]=f32 GPU-cycle accumulator (type-punned). Do NOT reuse here.
-//   [38..43]  C0 (VRAM→CPU) state: xcnt, ycnt, xsiz, ysiz, tsiz, addr
+//   [38..43]  C0 (VRAM->CPU) state: xcnt, ycnt, xsiz, ysiz, tsiz, addr
 //   [44]      gp1_10h_req
 //   [45]      gpuread
 //   [46]      gpustat
@@ -98,7 +98,7 @@ pub fn gpuRead32(g: *mut[] u32, vram: *mut[] u8, off: u32) u32 {
     if (off == 0x00) {
         var data: u32 = 0;
         if (g[42] != 0) {
-            // C0 (VRAM→CPU) transfer in progress — drain two pixels.
+            // C0 (VRAM->CPU) transfer in progress — drain two pixels.
             data = vramPackTwo(g, vram);
             g[42] = g[42] - 2;
         }
@@ -177,7 +177,7 @@ pub fn gpuWrite8(g: *mut[] u32, vram: *mut[] u8, off: u32, val: u32) {
 
 // GP0 dispatch — state machine: RECV_CMD latches a new command word
 // into buf[0], RECV_ARGS appends additional words, RECV_DATA streams
-// pixels for CPU→VRAM.
+// pixels for CPU->VRAM.
 pub fn gpuGp0(g: *mut[] u32, vram: *mut[] u8, val: u32) {
     const st: u32 = g[19];
     if (st == GP_RECV_CMD) {
@@ -393,7 +393,7 @@ pub fn gpuVramToVram(g: *mut[] u32, vram: *mut[] u8) {
     g[19] = GP_RECV_CMD;
 }
 
-// 0xA0 CPU→VRAM transfer. Header is 3 words (cmd, dest XY, size XY)
+// 0xA0 CPU->VRAM transfer. Header is 3 words (cmd, dest XY, size XY)
 // then `size` 16-bit words come over GP0 packed two per u32.
 pub fn gpuCpuToVram(g: *mut[] u32, vram: *mut[] u8) {
     if (g[19] == GP_RECV_CMD) {
@@ -442,7 +442,7 @@ pub fn gpuCpuToVram(g: *mut[] u32, vram: *mut[] u8) {
     }
 }
 
-// 0xC0 VRAM→CPU transfer. Sets up the source rectangle; the data comes
+// 0xC0 VRAM->CPU transfer. Sets up the source rectangle; the data comes
 // out via gpuRead32 / vramPackTwo over subsequent reads.
 pub fn gpuVramToCpu(g: *mut[] u32, vram: *mut[] u8) {
     if (g[19] == GP_RECV_CMD) {
@@ -645,7 +645,7 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
         // read from). Without this, FMVs that draw the decoded frame
         // as a texture-mapped polygon then composite it with a
         // textured rect end up sampling the wrong VRAM region for the
-        // rect — texel 0 on every pixel → black FMV.
+        // rect — texel 0 on every pixel -> black FMV.
         g[60] = tpx;
         g[61] = tpy;
         g[62] = depth;
@@ -682,8 +682,8 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
         // propagate the polygon's tpage into the derived globals so a
         // following textured RECTANGLE (which carries clut but no
         // tpage) inherits this state instead of stale values. Without
-        // it, the rect samples the wrong VRAM region → texel 0 →
-        // texel-0 skip → entire FMV frame is black.
+        // it, the rect samples the wrong VRAM region -> texel 0 ->
+        // texel-0 skip -> entire FMV frame is black.
         g[60] = tpx;
         g[61] = tpy;
         g[62] = depth;
@@ -859,7 +859,7 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
                             }
                             color = gpuModulate(texel, modc);
                         }
-                        // Texel bit 15 → blend per transparency mode.
+                        // Texel bit 15 -> blend per transparency mode.
                         // For untextured polys, transparency applies
                         // unconditionally when isTransp is set.
                         if (isTransp && (texel & 0x8000) != 0) {

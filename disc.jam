@@ -12,8 +12,8 @@
 // single Mode2/2352 data track.
 //
 // LBA convention follows the PSX BIOS:
-//   LBA = 150 → start of track 1 data (00:02:00 on the disc)
-//   LBA = 150 + N → Nth sector of the data track in the .bin file
+//   LBA = 150 -> start of track 1 data (00:02:00 on the disc)
+//   LBA = 150 + N -> Nth sector of the data track in the .bin file
 // We subtract the 150-sector lead-in when seeking inside the .bin —
 // real discs prefix the data with 2 seconds (150 sectors) of pregap
 // that's not part of the image file.
@@ -37,9 +37,9 @@ pub const Disc = struct {
     pad2: u8,
     // Always-allocated Box(Cue). For non-cue discs it sits empty
     // (fileCount=0). For cue discs, cueParse writes into it in place.
-    // Auto-drop chain: Box(Disc).drop → @dropInPlace → field walk →
-    // Box(Cue).drop → @dropInPlace on Cue → Cue.cfn drop closes files
-    // → field walk drops each Vec backing. Holding the Box here (vs a
+    // Auto-drop chain: Box(Disc).drop -> @dropInPlace -> field walk ->
+    // Box(Cue).drop -> @dropInPlace on Cue -> Cue.cfn drop closes files
+    // -> field walk drops each Vec backing. Holding the Box here (vs a
     // raw `*mut[] u8`) is what makes the cleanup chain self-sufficient.
     cuePtr: Box(Cue),
 };

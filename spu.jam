@@ -131,7 +131,7 @@ const D_S1:         u32 = 0x18;
 const D_S2:         u32 = 0x1C;
 const D_S3:         u32 = 0x20;
 const D_BFLAGS:     u32 = 0x24;
-const D_BUF0:       u32 = 0x28;   // 28 × i16 → 56 bytes through 0x60
+const D_BUF0:       u32 = 0x28;   // 28 × i16 -> 56 bytes through 0x60
 const D_H0:         u32 = 0x60;
 const D_H1:         u32 = 0x64;
 const D_LVOL:       u32 = 0x68;   // kept as i32 (volumel); a float would also work
@@ -150,7 +150,7 @@ const D_ENVCTL:     u32 = 0x98;
 
 // Global runtime offsets (added to GLOBAL_BASE).
 const G_TADDR:      u32 = 0x00;
-const G_TFIFO:      u32 = 0x04;   // 32 × u16 = 64 bytes → through 0x44
+const G_TFIFO:      u32 = 0x04;   // 32 × u16 = 64 bytes -> through 0x44
 const G_TFIFO_IDX:  u32 = 0x44;
 const G_EVEN_CYC:   u32 = 0x48;
 const G_REVBADDR:   u32 = 0x4C;
@@ -158,7 +158,7 @@ const G_LRSL:       u32 = 0x50;
 const G_LRSR:       u32 = 0x54;
 // CD-audio FIFO head/tail. 32-bit ring indices that mod-mask down to
 // CD_FIFO_MASK for the slot. Producer-only writes head; consumer-only
-// writes tail. Equal head == tail → empty.
+// writes tail. Equal head == tail -> empty.
 const G_CD_HEAD:    u32 = 0x60;
 const G_CD_TAIL:    u32 = 0x64;
 // Final mixed-output FIFO head/tail. Producer = spuGetSample.
@@ -281,7 +281,7 @@ pub fn spuRamAlloc() Vec(u8) { return Vec(u8).filled(0, SPU_RAM_SIZE); }
 pub fn spuPushCdSample(s: *mut[] u8, leftI16: u32, rightI16: u32) {
     const head: u32 = getU32(s, GLOBAL_BASE + G_CD_HEAD);
     const tail: u32 = getU32(s, GLOBAL_BASE + G_CD_TAIL);
-    if ((head - tail) >= CD_FIFO_CAP) { return; }      // full → drop
+    if ((head - tail) >= CD_FIFO_CAP) { return; }      // full -> drop
     const slot: u32 = CD_FIFO_BASE + ((head & CD_FIFO_MASK) << 2);
     setU16(s, slot,     leftI16  & 0xFFFF);
     setU16(s, slot + 2, rightI16 & 0xFFFF);
@@ -384,7 +384,7 @@ pub fn spuGetReverbSample(s: *mut[] u8, ram: *mut[] u8,
     const lin: i32 = mulVol(inL, vlin);
     const rin: i32 = mulVol(inR, vrin);
 
-    // Same-side reflection (L→L, R→R).
+    // Same-side reflection (L->L, R->R).
     const sLsamePrev: i32 = spuReadReverb(s, ram, mlsame - 2);
     const sRsamePrev: i32 = spuReadReverb(s, ram, mrsame - 2);
     const sLsameNow: i32 = sat16i32(lin
@@ -398,7 +398,7 @@ pub fn spuGetReverbSample(s: *mut[] u8, ram: *mut[] u8,
     spuWriteReverb(s, ram, mlsame, sLsameNow);
     spuWriteReverb(s, ram, mrsame, sRsameNow);
 
-    // Cross-side reflection (L→R, R→L).
+    // Cross-side reflection (L->R, R->L).
     const sLdiffPrev: i32 = spuReadReverb(s, ram, mldiff - 2);
     const sRdiffPrev: i32 = spuReadReverb(s, ram, mrdiff - 2);
     const sLdiffNow: i32 = sat16i32(lin
@@ -711,7 +711,7 @@ pub fn spuHandleAdsr(s: *mut[] u8, v: u32) {
 // so the envelope level the game POLLS at voice reg 0xC (ENVCVOL) is
 // deterministic and matches hardware — instead of advancing on the
 // wall-clock audio thread (which desyncs from the CPU and made Brave Fencer
-// read a wrong envelope level, looping the intro resource-load → black FMV).
+// read a wrong envelope level, looping the intro resource-load -> black FMV).
 // The audio thread no longer steps the envelope (removed from spuGetSample).
 pub fn spuStepAdsrCpu(s: *mut[] u8) {
     var v: u32 = 0;
@@ -1097,7 +1097,7 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
 pub fn spuPushOutSample(s: *mut[] u8, packed: u32) {
     const head: u32 = getU32(s, GLOBAL_BASE + G_OUT_HEAD);
     const tail: u32 = getU32(s, GLOBAL_BASE + G_OUT_TAIL);
-    if ((head - tail) >= OUT_FIFO_CAP) { return; }     // full → drop
+    if ((head - tail) >= OUT_FIFO_CAP) { return; }     // full -> drop
     const slot: u32 = OUT_FIFO_BASE + ((head & OUT_FIFO_MASK) << 2);
     setU32(s, slot, packed);
     setU32(s, GLOBAL_BASE + G_OUT_HEAD, head + 1);

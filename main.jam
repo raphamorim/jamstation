@@ -288,8 +288,8 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
         const before: u64 = c.cycles;
         step(c, bus, regs, cop0);
         const delta: u32 = (c.cycles - before) as u32;
-        // Per-instruction device order: cdrom → gpu → pad → timer → dma.
-        // (Was timer→dma→cdrom→…→gpu; the order decides which IRQ bit lands
+        // Per-instruction device order: cdrom -> gpu -> pad -> timer -> dma.
+        // (Was timer->dma->cdrom->…->gpu; the order decides which IRQ bit lands
         // in I_STAT first each step, and the GPU hblank/vblank events must
         // fire BEFORE the sysclk timer +2.)
 
@@ -326,7 +326,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
                 frameDone = true;
             }
         } else if (prevHb && !currHb) {
-            // HBlank-end edge → wrap the scanline accumulator
+            // HBlank-end edge -> wrap the scanline accumulator
             // (acc -= 3413).
             bus.timer.hblankEnd();
             acc = acc - GPU_CYCLES_SCANL;
@@ -341,8 +341,8 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
 
         // jam-only extras: neither of these belongs in the per-instruction
         // device update above. Kept at the end (least perturbation to the
-        // device order above) and flagged as divergences — SIO1 →
-        // peripherals task, SPU CPU-clock → SPU task (revisit once the
+        // device order above) and flagged as divergences — SIO1 ->
+        // peripherals task, SPU CPU-clock -> SPU task (revisit once the
         // deterministic CPU surface settles).
         bus.sio1.update(bus.irq.ptr, cop0, delta);
         spuAcc = spuAcc + delta;
@@ -385,7 +385,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
 }
 
 // Dump the full 1024x512 VRAM as a binary PPM (P6 / 24-bit RGB) at
-// `path`. BGR555 → RGB888 expansion is done inline so the output is
+// `path`. BGR555 -> RGB888 expansion is done inline so the output is
 // viewable with any image viewer. Used as an end-of-run diagnostic so
 // we can confirm what the BIOS/game actually rendered without staring
 // at the SDL window.

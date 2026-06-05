@@ -11,7 +11,7 @@
 //   bank read 0x800  status (busy/parm-empty/resp-empty/...)
 //   bank read 0x801  pop one byte from the response FIFO
 //   bank read 0x802  pop one byte from the data FIFO (sector buffer)
-//   bank read 0x803  index 0/2 → IER, index 1/3 → IFR | 0xE0
+//   bank read 0x803  index 0/2 -> IER, index 1/3 -> IFR | 0xE0
 //
 //   bank 0 write 0x801  command byte (triggers state machine)
 //   bank 0 write 0x802  push parameter byte
@@ -148,7 +148,7 @@ pub const Cdrom = struct {
     xaLh:        [2]i32,
     xaRh:        [2]i32,
     // Last resampled OUTPUT sample per channel — the `ls` seed for the next
-    // sector's XA→44.1kHz rate conversion.
+    // sector's XA->44.1kHz rate conversion.
     xaPrevL:     i32,
     xaPrevR:     i32,
     // Parameter / response FIFOs. Each is a 32-byte ring with u8
@@ -369,8 +369,8 @@ pub const Cdrom = struct {
         self.busy = 0;
 
         // Response-1 prechecks, before dispatch:
-        // (1) disc-required commands with no disc → INT5(11h,80h),
-        // (3) wrong parameter count → INT5(03h,20h), unknown command →
+        // (1) disc-required commands with no disc -> INT5(11h,80h),
+        // (3) wrong parameter count -> INT5(03h,20h), unknown command ->
         // INT5(03h,40h). (Version checks are omitted — jam models a
         // single CD-ROM revision.) `pcnt` = parameters queued for this cmd.
         const pcnt: u32 = ((self.paramW as u32) - (self.paramR as u32)) & 0xFF;
@@ -447,7 +447,7 @@ pub const Cdrom = struct {
                 const f: u32 = self.popParam();
                 // Validate the MSF before accepting:
                 // BCD-valid nibbles, seconds < 0x60, frame < 0x75. Invalid
-                // MSF → INT5(stat, 0x10) instead of an INT3 success.
+                // MSF -> INT5(stat, 0x10) instead of an INT3 success.
                 const bcdOk: bool = ((m & 0x0F) <= 9) && ((m >> 4) <= 9) &&
                                     ((s & 0x0F) <= 9) && ((s >> 4) <= 9) &&
                                     ((f & 0x0F) <= 9) && ((f >> 4) <= 9);
@@ -612,7 +612,7 @@ pub const Cdrom = struct {
                 self.errorOut(CD_STAT_SPINDLE, CD_ERR_INVALID_SUBFUNC);
                 return;
             }
-            // GetTD: look up the track's absolute LBA →
+            // GetTD: look up the track's absolute LBA ->
             // MM:SS; INT5 if past the last track (TS_FAR = 0xFFFFFFFF here).
             const track: u32 = (bcd & 0x0F) + ((bcd >> 4) & 0x0F) * 10;
             const f: u32 = discTrackLba(disc, track);
@@ -723,7 +723,7 @@ pub const Cdrom = struct {
         }
         if (cmd == CDL_SEEKL) {
             // Query the seek TARGET (pendingLba)
-            // FIRST; TS_FAR → INVALID_SUBFUNC, TS_AUDIO → SEEK_FAILED, and
+            // FIRST; TS_FAR -> INVALID_SUBFUNC, TS_AUDIO -> SEEK_FAILED, and
             // the seek is NOT committed on error. On success commit and
             // set seek precision = 1.
             const tsl: u32 = discQuery(disc, self.pendingLba);
@@ -980,7 +980,7 @@ pub const Cdrom = struct {
         // f18khz sector) to the SPU's 44100 Hz output rate before pushing. The
         // SPU CD FIFO is drained one entry per 44100 Hz output sample, so
         // pushing native-rate samples 1:1 plays XA ~17% too fast and overruns
-        // the FIFO (most samples dropped → warble). The resampler is
+        // the FIFO (most samples dropped -> warble). The resampler is
         // conceptually a 7×-upsample —
         // whose `(k+1)/8` integer-divides to 0, making it a sample-and-hold of
         // the previous source sample — then decimate by m=f18khz?3:6, yielding

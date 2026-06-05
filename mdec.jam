@@ -5,13 +5,13 @@
 // chip. The game's flow per frame:
 //
 //   1. CdlReadS streams compressed sectors into RAM.
-//   2. DMA channel 0 copies input → MDEC's input FIFO (0x1F801820).
-//   3. MDEC runs RLE-decode → inverse-quantisation → iDCT → YUV→RGB.
-//   4. DMA channel 1 reads decoded RGB → RAM.
+//   2. DMA channel 0 copies input -> MDEC's input FIFO (0x1F801820).
+//   3. MDEC runs RLE-decode -> inverse-quantisation -> iDCT -> YUV->RGB.
+//   4. DMA channel 1 reads decoded RGB -> RAM.
 //   5. GPU display VRAM blit of the decoded frame.
 //
 // Without MDEC, step 4 hands the game zeros / never fires the DMA-done
-// IRQ → game stalls on its FMV-wait loop.
+// IRQ -> game stalls on its FMV-wait loop.
 //
 // Layout: state is a flat struct of typed fields. Input/output buffers
 // stay heap-allocated separately (256KB + 1MB) so we avoid per-command
@@ -195,7 +195,7 @@ pub const Mdec = struct {
         return idx;
     }
 
-    // YUV → RGB
+    // YUV -> RGB
     pub fn yuvToRgb(self: mut Self, output: *mut[] u8, outBase: u32,
                     xx: u32, yy: u32) {
         const depth: u32 = self.outputDepth;
@@ -210,7 +210,7 @@ pub const Mdec = struct {
                 const rRaw: i32 = self.crBlk[cri] as i32;
                 const bRaw: i32 = self.cbBlk[cri] as i32;
 
-                // YUV→RGB coefficients (float): g = -0.3437*b + -0.7143*r;
+                // YUV->RGB coefficients (float): g = -0.3437*b + -0.7143*r;
                 //                               r = 1.402*r;  b = 1.772*b.
                 const rf: f64 = rRaw as f64;
                 const bf: f64 = bRaw as f64;
@@ -281,7 +281,7 @@ pub const Mdec = struct {
 
         var idx: u32 = 0;          // word index into input buffer
         var outBytes: u32 = 0;
-        // Each macroblock: Cr, Cb, Y0, Y1, Y2, Y3 → 16×16 RGB.
+        // Each macroblock: Cr, Cb, Y0, Y1, Y2, Y3 -> 16×16 RGB.
         while (idx * 2 < inputBytes) {
             const outBase: u32 = outBytes;
             idx = self.rlDecodeBlock(input, idx,

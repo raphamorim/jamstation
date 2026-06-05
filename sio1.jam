@@ -29,7 +29,7 @@
 //   1    DTR_LVL   DTR output level
 //   2    RX_EN     receive enable
 //   3    SO_LVL    TX manual output level (loopback)
-//   4    ACK_IRQ   write 1 → clear STAT[3,4,5,9]; self-clears
+//   4    ACK_IRQ   write 1 -> clear STAT[3,4,5,9]; self-clears
 //   5    RTS_LVL   RTS output level
 //   6    RESET     master reset
 //   7    reserved
