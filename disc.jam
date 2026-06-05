@@ -14,7 +14,7 @@
 // LBA convention follows the PSX BIOS:
 //   LBA = 150 -> start of track 1 data (00:02:00 on the disc)
 //   LBA = 150 + N -> Nth sector of the data track in the .bin file
-// We subtract the 150-sector lead-in when seeking inside the .bin —
+// We subtract the 150-sector lead-in when seeking inside the .bin -
 // real discs prefix the data with 2 seconds (150 sectors) of pregap
 // that's not part of the image file.
 
@@ -22,7 +22,7 @@ const { Cue, cueAlloc, cueReset, cueParse, cueRead, cueQuery,
         cueGetTrackCount, cueGetTrackLba, cueGetTrackNumber } = import("cue");
 
 const { Box } = import("std/box");
-// File I/O exclusively via std.fs — no raw libc file ABI in this module.
+// File I/O exclusively via std.fs - no raw libc file ABI in this module.
 const { File, exists } = import("std/fs");
 const { print } = import("std/fmt");
 
@@ -30,7 +30,7 @@ const SECTOR_SIZE: u32 = 2352;
 const LEAD_IN_SECTORS: u32 = 150;
 
 pub const Disc = struct {
-    file: File,        // std.fs.File — valid when a raw .bin is loaded
+    file: File,        // std.fs.File - valid when a raw .bin is loaded
     loaded: u8,        // 1 once discOpen succeeds
     isCue: u8,         // 1 if cue-loaded (cuePtr is valid)
     pad1: u8,
@@ -63,7 +63,7 @@ pub fn discAlloc() Box(Disc) {
 // Reset open-file resources before either reopening this Disc with a new
 // image or letting the owning Bus go out of scope. For a cue disc we
 // invoke cueReset which closes every per-cue-track file handle and
-// zeros the file/track counters — the Cue's Vec backings stay live
+// zeros the file/track counters - the Cue's Vec backings stay live
 // (Box(Cue).drop frees them on scope exit). For a raw .bin we close
 // the single std.fs.File handle the Disc holds directly.
 pub fn discClose(d: *mut[] Disc) {
@@ -99,7 +99,7 @@ pub fn pathEndsWithCue(p: []u8) bool {
 // single-track Mode2/2352 .bin.
 pub fn discOpen(d: *mut[] Disc, path: []u8) i32 {
     if (pathEndsWithCue(path)) {
-        // Reuse the always-allocated Box(Cue) at d[0].cuePtr — cueParse
+        // Reuse the always-allocated Box(Cue) at d[0].cuePtr - cueParse
         // populates it in place, so we don't have to deal with assigning
         // a new Box over the old one (jam doesn't auto-drop on field
         // overwrite). On parse failure, cueReset clears whatever

@@ -1,13 +1,13 @@
-// COP2 / GTE — Geometry Transformation Engine.
+// COP2 / GTE - Geometry Transformation Engine.
 //
-// PSX GTE — fixed-point geometry math with saturation flags. This
+// PSX GTE - fixed-point geometry math with saturation flags. This
 // module covers the register file (32 data +
 // 32 control regs), the register-move instructions (MFC2 / MTC2 /
 // CFC2 / CTC2 / LWC2 / SWC2), and the math ops dispatched by gteExec.
 //
 // Implemented ops: RTPS, RTPT (3xRTPS), NCLIP, OP, MVMVA, NCDS, NCDT,
 // SQR, AVSZ3, AVSZ4, DPCS, INTPL, CDP, NCCS, CC, NCS, NCT, DCPL, DPCT,
-// GPF, GPL, NCCT — all 22 GTE ops.
+// GPF, GPL, NCCT - all 22 GTE ops.
 //
 // Saturation FLAG bookkeeping is hardware-faithful: every clamp (IR/IR0/SXY/
 // SZ3/RGB/MAC0) ORs its FLAG bit, the 44-bit MAC overflow is truncated
@@ -19,17 +19,17 @@
 //   1  V0Z (z, low 16 bits)
 //   2  V1  / 3 V1Z
 //   4  V2  / 5 V2Z
-//   6  RGBC                — current colour + code
-//   7  OTZ                 — average Z for ordering table
-//   8  IR0                 — interpolation parameter
+//   6  RGBC                - current colour + code
+//   7  OTZ                 - average Z for ordering table
+//   8  IR0                 - interpolation parameter
 //   9-11  IR1, IR2, IR3
-//   12-15 SXY0, SXY1, SXY2, SXYP — screen-space FIFO + push input
-//   16-19 SZ0, SZ1, SZ2, SZ3     — Z FIFO
+//   12-15 SXY0, SXY1, SXY2, SXYP - screen-space FIFO + push input
+//   16-19 SZ0, SZ1, SZ2, SZ3     - Z FIFO
 //   20-22 RGB0, RGB1, RGB2
-//   23 RES1                — reserved
+//   23 RES1                - reserved
 //   24-27 MAC0, MAC1, MAC2, MAC3
-//   28 IRGB (R), 29 ORGB (R) — packed 15-bit IR view
-//   30 LZCS, 31 LZCR        — leading-zero count source / result
+//   28 IRGB (R), 29 ORGB (R) - packed 15-bit IR view
+//   30 LZCS, 31 LZCR        - leading-zero count source / result
 //
 // Control register layout (32 × u32):
 //   0..4   rotation matrix (R11R12, R13R21, R22R23, R31R32, R33)
@@ -63,7 +63,7 @@ const C_OFY: u32 = 25;
 const C_FLAG: u32 = 31;
 
 // Unsigned Newton-Raphson reciprocal table for the GTE perspective
-// divide. 257 entries — the hardware uses this exact LUT, so a naive
+// divide. 257 entries - the hardware uses this exact LUT, so a naive
 // integer divide diverges from hardware on the projected SX/SY by up to
 // a few units.
 const GTE_UNR_TABLE: [257]u8 = [
@@ -135,7 +135,7 @@ pub fn gteDataRead(g: *mut[] u32, idx: u32) u32 {
     if (i == 28 || i == 29) {
         // Re-pack IR1/IR2/IR3 (>> 7, clamped 0..0x1F) into 15-bit RGB.
         // IR is stored zero-extended in the low 16 bits, so sign-extend
-        // first (s16ToI64) — otherwise a negative IR reads as a large
+        // first (s16ToI64) - otherwise a negative IR reads as a large
         // positive value and clamps to 0x1F instead of 0 (DuckStation
         // gte.cpp:343 gives 0 for IR<0).
         var r: i64 = s16ToI64(g[9]) >> 7;
@@ -155,7 +155,7 @@ pub fn gteDataRead(g: *mut[] u32, idx: u32) u32 {
 pub fn gteDataWrite(g: *mut[] u32, idx: u32, val: u32) {
     const i: u32 = idx & 0x1F;
     if (i == 15) {
-        // SXYP — store the value, then push SXY FIFO so the latest
+        // SXYP - store the value, then push SXY FIFO so the latest
         // entry slides into SXY2 and older entries shift down. Used by
         // the BIOS to pre-load screen-space vertices without RTPS.
         g[15] = val;                                // SXYP raw
@@ -165,7 +165,7 @@ pub fn gteDataWrite(g: *mut[] u32, idx: u32, val: u32) {
         return;
     }
     if (i == 28) {
-        // IRGB — unpack 5-bit channels into IR1/IR2/IR3 (<< 7 to map
+        // IRGB - unpack 5-bit channels into IR1/IR2/IR3 (<< 7 to map
         // 0..0x1F -> 0..0xF80).
         const packed: u32 = val & 0x7FFF;
         g[28] = packed;
@@ -175,11 +175,11 @@ pub fn gteDataWrite(g: *mut[] u32, idx: u32, val: u32) {
         return;
     }
     if (i == 29) {
-        // ORGB is read-only — writes are silently discarded.
+        // ORGB is read-only - writes are silently discarded.
         return;
     }
     if (i == 30) {
-        // LZCS — write computes LZCR (count of leading sign bits, or
+        // LZCS - write computes LZCR (count of leading sign bits, or
         // leading zeros if the value is non-negative).
         g[30] = val;
         g[31] = gteCountLeadingSign(val);
@@ -229,7 +229,7 @@ pub fn gteCtrlRead(g: *mut[] u32, idx: u32) u32 {
 pub fn gteCtrlWrite(g: *mut[] u32, idx: u32, val: u32) {
     const i: u32 = idx & 0x1F;
     if (i == C_FLAG) {
-        // Bit 31 is read-only "any-error" — strip on write so it can be
+        // Bit 31 is read-only "any-error" - strip on write so it can be
         // resynthesized in gteCtrlRead.
         g[32 + C_FLAG] = val & 0x7FFFF000;
         return;
@@ -238,13 +238,13 @@ pub fn gteCtrlWrite(g: *mut[] u32, idx: u32, val: u32) {
 }
 
 // Dispatch on the bottom 6 bits of the GTE math opcode. The full table
-// covers 22 ops (RTPS=0x01, NCLIP=0x06, ..., NCCT=0x3F) — all 22 are
+// covers 22 ops (RTPS=0x01, NCLIP=0x06, ..., NCCT=0x3F) - all 22 are
 // implemented below. FLAG is cleared at the top of every op.
 pub fn gteExec(g: *mut[] u32, opc: u32) {
     g[32 + C_FLAG] = 0;        // clear FLAG every instruction
     const op: u32 = opc & 0x3F;
     // Per-op histogram of GTE math instructions. Stored at control
-    // register 31 (LZCR) + bits — wait, use g spare slot g[70+].
+    // register 31 (LZCR) + bits - wait, use g spare slot g[70+].
     g[70] = g[70] + 1;                        // total GTE ops
     if (op < 0x40) { g[80 + op] = g[80 + op] + 1; }
     // Decode sf (bit 19 -> 12 or 0) and lm (bit 10) once per dispatch
@@ -256,7 +256,7 @@ pub fn gteExec(g: *mut[] u32, opc: u32) {
     if (op == 0x0C) { gteOp(g, sf, lm); }         // OP
     if (op == 0x12) { gteMvmva(g, opc); }         // MVMVA
     if (op == 0x13) { gteNcds(g, 0, sf, lm); }    // NCDS
-    if (op == 0x16) {                              // NCDT — 3 successive NCDS
+    if (op == 0x16) {                              // NCDT - 3 successive NCDS
         gteNcds(g, 0, sf, lm);
         gteNcds(g, 1, sf, lm);
         gteNcds(g, 2, sf, lm);
@@ -264,7 +264,7 @@ pub fn gteExec(g: *mut[] u32, opc: u32) {
     if (op == 0x28) { gteSqr(g, sf, lm); }        // SQR
     if (op == 0x2D) { gteAvsz(g, 3); }            // AVSZ3
     if (op == 0x2E) { gteAvsz(g, 4); }            // AVSZ4
-    if (op == 0x30) {                              // RTPT — 3 successive RTPS
+    if (op == 0x30) {                              // RTPT - 3 successive RTPS
         gteRtps(g, 0, sf, lm, 0);
         gteRtps(g, 1, sf, lm, 0);
         gteRtps(g, 2, sf, lm, 1);                   // DQ tail only on last vertex
@@ -275,7 +275,7 @@ pub fn gteExec(g: *mut[] u32, opc: u32) {
     if (op == 0x1B) { gteNccs(g, 0, sf, lm); }    // NCCS
     if (op == 0x1C) { gteCc(g, sf, lm); }         // CC
     if (op == 0x1E) { gteNcs(g, 0, sf, lm); }     // NCS
-    if (op == 0x20) {                              // NCT — 3× NCS
+    if (op == 0x20) {                              // NCT - 3× NCS
         gteNcs(g, 0, sf, lm);
         gteNcs(g, 1, sf, lm);
         gteNcs(g, 2, sf, lm);
@@ -284,7 +284,7 @@ pub fn gteExec(g: *mut[] u32, opc: u32) {
     if (op == 0x2A) { gteDpct(g, sf, lm); }       // DPCT
     if (op == 0x3D) { gteGpf(g, sf, lm); }        // GPF
     if (op == 0x3E) { gteGpl(g, sf, lm); }        // GPL
-    if (op == 0x3F) {                              // NCCT — 3× NCCS
+    if (op == 0x3F) {                              // NCCT - 3× NCCS
         gteNccs(g, 0, sf, lm);
         gteNccs(g, 1, sf, lm);
         gteNccs(g, 2, sf, lm);
@@ -293,7 +293,7 @@ pub fn gteExec(g: *mut[] u32, opc: u32) {
 
 // CPU-cycle cost of a COP2 (GTE) math op, keyed by the low 6 bits of the
 // opcode. These are the hardware per-op cycle counts. The CPU dispatcher
-// adds this — instead of the flat 2-cycle base — when it runs a GTE math
+// adds this - instead of the flat 2-cycle base - when it runs a GTE math
 // op, so device timing (DMA, CDROM, timers) advances at the correct rate
 // through GTE-heavy code. Unknown sub-ops fall back to the 2-cycle base.
 pub fn gteOpCycles(opc: u32) u32 {
@@ -323,7 +323,7 @@ pub fn gteOpCycles(opc: u32) u32 {
     return 2;
 }
 
-// Push (MAC1>>4, MAC2>>4, MAC3>>4, CODE) onto the RGB FIFO — used by
+// Push (MAC1>>4, MAC2>>4, MAC3>>4, CODE) onto the RGB FIFO - used by
 // every colour-producing GTE op. RGB0 ← RGB1, RGB1 ← RGB2, RGB2 ← new.
 pub fn gtePushRgb(g: *mut[] u32, m1: i64, m2: i64, m3: i64) {
     g[20] = g[21];
@@ -336,7 +336,7 @@ pub fn gtePushRgb(g: *mut[] u32, m1: i64, m2: i64, m3: i64) {
 }
 
 // Light-matrix transform of vertex vidx into (IR1,IR2,IR3) and (MAC1,MAC2,MAC3).
-// Shared by NCS, NCDS, NCCS — they all start with the same L*V
+// Shared by NCS, NCDS, NCCS - they all start with the same L*V
 // transformation. Stores IR into g[9..11] and MAC into g[D_MAC*].
 pub fn gteApplyLight(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     const vSlot: u32 = vidx * 2;
@@ -364,7 +364,7 @@ pub fn gteApplyLight(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     gteIrTriple(g, m1, m2, m3, lm);
 }
 
-// (BK<<12) + LC*IR stage — applied by CC, CDP, NCDS, NCCS, NCS after
+// (BK<<12) + LC*IR stage - applied by CC, CDP, NCDS, NCCS, NCS after
 // L*V. Reads IR1..IR3 from g[9..11], writes MAC1..MAC3, then IR1..IR3
 // clamped by lm.
 pub fn gteApplyLightColor(g: *mut[] u32, sf: u32, lm: u32) {
@@ -436,7 +436,7 @@ pub fn gteFarColorInterp(g: *mut[] u32, sf: u32, lm: u32) {
     gteIrTriple(g, m1, m2, m3, lm);
 }
 
-// NCS — normal-color single. L*V then BK+LC*IR. No final colour stage.
+// NCS - normal-color single. L*V then BK+LC*IR. No final colour stage.
 // Push RGB FIFO with the resulting MAC.
 pub fn gteNcs(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     gteApplyLight(g, vidx, sf, lm);
@@ -445,12 +445,12 @@ pub fn gteNcs(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     const m2: i64 = s32ToI64(g[D_MAC2]);
     const m3: i64 = s32ToI64(g[D_MAC3]);
     gtePushRgb(g, m1, m2, m3);
-    // NCS reclamps IR after the FIFO push using the *new* MAC values —
+    // NCS reclamps IR after the FIFO push using the *new* MAC values -
     // the existing MAC1..MAC3 register state.
     gteIrTriple(g, m1, m2, m3, lm);
 }
 
-// NCCS — normal-color-color single. NCS pipeline + (C * IR) << 4 final
+// NCCS - normal-color-color single. NCS pipeline + (C * IR) << 4 final
 // colour stage (no FC interpolation).
 pub fn gteNccs(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     gteApplyLight(g, vidx, sf, lm);
@@ -473,7 +473,7 @@ pub fn gteNccs(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     gteIrTriple(g, m1, m2, m3, lm);
 }
 
-// CC — color color. Skips L*V (uses existing IR), then BK+LC*IR, then
+// CC - color color. Skips L*V (uses existing IR), then BK+LC*IR, then
 // (C*IR)<<4 final stage.
 pub fn gteCc(g: *mut[] u32, sf: u32, lm: u32) {
     gteApplyLightColor(g, sf, lm);
@@ -495,7 +495,7 @@ pub fn gteCc(g: *mut[] u32, sf: u32, lm: u32) {
     gteIrTriple(g, m1, m2, m3, lm);
 }
 
-// CDP — color depth-cued. Skips L*V (uses existing IR), then BK+LC*IR,
+// CDP - color depth-cued. Skips L*V (uses existing IR), then BK+LC*IR,
 // then FC interpolation. Push RGB FIFO.
 pub fn gteCdp(g: *mut[] u32, sf: u32, lm: u32) {
     gteApplyLightColor(g, sf, lm);
@@ -506,7 +506,7 @@ pub fn gteCdp(g: *mut[] u32, sf: u32, lm: u32) {
     gtePushRgb(g, m1, m2, m3);
 }
 
-// DPCS — depth queue color single. FC interpolation on the RGBC color:
+// DPCS - depth queue color single. FC interpolation on the RGBC color:
 // (RFC<<12) - (RC<<16), then (RC<<16) + IR0*ir'. The shift-by-16
 // difference vs FarColorInterp's (RC<<4)*IR is because here IR=1.0 implicit.
 pub fn gteDpcs(g: *mut[] u32, sf: u32, lm: u32) {
@@ -536,7 +536,7 @@ pub fn gteDpcs(g: *mut[] u32, sf: u32, lm: u32) {
     gtePushRgb(g, m1, m2, m3);
 }
 
-// DPCT — depth queue color triple. Repeats DPCS three times, each time
+// DPCT - depth queue color triple. Repeats DPCS three times, each time
 // using RGB0 (FIFO head) as the source color. The FIFO shifts each
 // iteration so the next "RGB0" is the previous result.
 pub fn gteDpct(g: *mut[] u32, sf: u32, lm: u32) {
@@ -570,7 +570,7 @@ pub fn gteDpct(g: *mut[] u32, sf: u32, lm: u32) {
     }
 }
 
-// INTPL — interpolation. FC interpolation using the *existing* IR as the
+// INTPL - interpolation. FC interpolation using the *existing* IR as the
 // "color" input: ir' = clamp(FC<<12 - IR<<12); MAC = IR<<12 + IR0*ir'.
 pub fn gteIntpl(g: *mut[] u32, sf: u32, lm: u32) {
     const ir1: i64 = s16ToI64(g[9]);
@@ -598,14 +598,14 @@ pub fn gteIntpl(g: *mut[] u32, sf: u32, lm: u32) {
     gtePushRgb(g, m1, m2, m3);
 }
 
-// DCPL — depth-cue color light. Like CDP but uses (RC*IR)<<4 to derive
+// DCPL - depth-cue color light. Like CDP but uses (RC*IR)<<4 to derive
 // the first MAC stage instead of BK+LC*IR. Final stage = FC interpolation.
 pub fn gteDcpl(g: *mut[] u32, sf: u32, lm: u32) {
     // DCPL = far-colour interpolation of (RGBC<<4)*IR. gteFarColorInterp
     // already consumes the (RC<<4)*IR term raw (matching DuckStation's
     // in_MAC = (RGBC*IR)<<4 fed straight into InterpolateColor), so the old
-    // separate clampMac pre-stage here was dead — its MAC writes were
-    // immediately overwritten — but it polluted the FLAG register with
+    // separate clampMac pre-stage here was dead - its MAC writes were
+    // immediately overwritten - but it polluted the FLAG register with
     // spurious MAC1-3 overflow bits. mednafen/DuckStation/Avocado fold the
     // term directly with no extra clamp, so we drop the dead stage.
     gteFarColorInterp(g, sf, lm);
@@ -615,7 +615,7 @@ pub fn gteDcpl(g: *mut[] u32, sf: u32, lm: u32) {
     gtePushRgb(g, m1, m2, m3);
 }
 
-// GPF — general purpose flat (interpolate IR0 with current IR).
+// GPF - general purpose flat (interpolate IR0 with current IR).
 //   MAC = IR0 * IR; IR = clamp(MAC); push RGB FIFO from MAC>>4.
 pub fn gteGpf(g: *mut[] u32, sf: u32, lm: u32) {
     const ir1: i64 = s16ToI64(g[9]);
@@ -633,7 +633,7 @@ pub fn gteGpf(g: *mut[] u32, sf: u32, lm: u32) {
     gtePushRgb(g, m1, m2, m3);
 }
 
-// GPL — general purpose linear (extend MAC by sf bits then add IR0*IR).
+// GPL - general purpose linear (extend MAC by sf bits then add IR0*IR).
 //   MAC = (MAC << sf) + IR0 * IR; IR = clamp(MAC); push RGB FIFO.
 pub fn gteGpl(g: *mut[] u32, sf: u32, lm: u32) {
     const ir1: i64 = s16ToI64(g[9]);
@@ -693,7 +693,7 @@ pub fn satIrLm(v: i64, lm: u32) i64 {
 // FLAG-aware clamps.
 // Each ORs the matching FLAG bit into g[32+C_FLAG] on saturation/overflow
 // and otherwise returns exactly what the plain sat* helpers return, so
-// MAC/IR/SXY/RGB *values* are unchanged — only FLAG gets populated. `i`
+// MAC/IR/SXY/RGB *values* are unchanged - only FLAG gets populated. `i`
 // is the component (1/2/3) selecting the per-channel bit. gteExec clears
 // FLAG at the top of each op; gteCtrlRead synthesizes the bit-31 summary.
 
@@ -707,7 +707,7 @@ pub fn gteClampIr(g: *mut[] u32, i: u32, v: i64, lm: u32) i64 {
 }
 
 // Clamp three MAC values into IR1..IR3 (with FLAG bits 24/23/22) and
-// store them — the tail shared by nearly every colour op. Replaces the
+// store them - the tail shared by nearly every colour op. Replaces the
 // old `g[9..11] = satIrLm(...)` triple.
 pub fn gteIrTriple(g: *mut[] u32, m1: i64, m2: i64, m3: i64, lm: u32) {
     g[9]  = (gteClampIr(g, 1, m1, lm) as u64 & 0xFFFF) as u32;
@@ -787,7 +787,7 @@ pub fn truncI32(v: i64) i64 {
 // IR3 clamp for RTPS/RTPT. The returned value clamps `value >> sf` to
 // [lm?0:-0x8000, 0x7FFF], but FLAG bit 22 is keyed off `value >> 12`
 // (each int32-truncated first). At sf=12 the two shifts agree; at sf=0
-// they diverge — so a plain gteClampIr on the shifted MAC sets bit 22
+// they diverge - so a plain gteClampIr on the shifted MAC sets bit 22
 // from the wrong magnitude. Note this clamp does NOT flag on the
 // value-clamp itself, only on the >>12 range check.
 pub fn gteClampIrZ(g: *mut[] u32, value: i64, sf: u32, lm: u32) i64 {
@@ -832,7 +832,7 @@ pub fn gteClz32(v: u32) u32 {
     return n;
 }
 
-// GTE perspective divide — the hardware's Unsigned Newton-Raphson
+// GTE perspective divide - the hardware's Unsigned Newton-Raphson
 // reciprocal. On overflow (n >= 2d)
 // it returns 0x1FFFF and sets FLAG bit 17 (divide overflow). `n` is H,
 // `d` is SZ3; both are treated as unsigned 16-bit.
@@ -855,7 +855,7 @@ pub fn gteDivide(g: *mut[] u32, h: u32, sz3: u32) u32 {
     return (res & 0xFFFFFFFF) as u32;
 }
 
-// RTPS — rotate, translate, perspective single. Computes a screen-
+// RTPS - rotate, translate, perspective single. Computes a screen-
 // space projection of vertex `vidx` and pushes it onto the SXY/SZ
 // FIFO. Includes the nested 44-bit MAC truncation, the gteClampIrZ IR3
 // path, and the full FLAG bookkeeping, matching hardware.
@@ -900,7 +900,7 @@ pub fn gteRtps(g: *mut[] u32, vidx: u32, sf: u32, lm: u32, last: u32) {
     const c2a: i64 = gteCheckMac(g, 2, (try_ << 12) + rt21 * vx);
     const c2b: i64 = gteCheckMac(g, 2, c2a + rt22 * vy);
     const sm2: i64 = gteClampMac(g, 2, c2b + rt23 * vzS, sf);
-    // macRaw3 is the raw (pre-shift) MAC3 sum — it feeds BOTH gteClampSz3
+    // macRaw3 is the raw (pre-shift) MAC3 sum - it feeds BOTH gteClampSz3
     // and gteClampIrZ.
     const c3a: i64 = gteCheckMac(g, 3, (trz << 12) + rt31 * vx);
     const c3b: i64 = gteCheckMac(g, 3, c3a + rt32 * vy);
@@ -909,7 +909,7 @@ pub fn gteRtps(g: *mut[] u32, vidx: u32, sf: u32, lm: u32, last: u32) {
 
     // IR1/IR2 clamp the shifted MAC; IR3 uses the special gteClampIrZ
     // which keys FLAG bit 22 off macRaw3>>12 while clamping macRaw3>>sf
-    // — differs from a plain IR clamp only when sf=0.
+    // - differs from a plain IR clamp only when sf=0.
     const ir1: i64 = gteClampIr(g, 1, sm1, lm);
     const ir2: i64 = gteClampIr(g, 2, sm2, lm);
     const ir3: i64 = gteClampIrZ(g, macRaw3, sf, lm);
@@ -954,7 +954,7 @@ pub fn gteRtps(g: *mut[] u32, vidx: u32, sf: u32, lm: u32, last: u32) {
     // vertices 0 and 1, then RTP+DQ on vertex 2, and DuckStation gates the
     // DQ block on `last` (gte.cpp:885). Running it on vertices 0/1 would
     // set spurious FLAG bits 12/15/16 (15/16 feed bit 31), so RTPT could
-    // report a false error. DQA is s16 — sign-extend the low half, not the
+    // report a false error. DQA is s16 - sign-extend the low half, not the
     // full 32 bits.
     if (last != 0) {
         const dqa: i64 = s16ToI64(g[32 + 27]);
@@ -967,7 +967,7 @@ pub fn gteRtps(g: *mut[] u32, vidx: u32, sf: u32, lm: u32, last: u32) {
     }
 }
 
-// AVSZ3 / AVSZ4 — average Z of the last 3 or 4 SZ FIFO entries,
+// AVSZ3 / AVSZ4 - average Z of the last 3 or 4 SZ FIFO entries,
 // scaled by ZSF3 / ZSF4 respectively:
 //   AVSZ3: MAC0 = ZSF3 * (SZ1 + SZ2 + SZ3); OTZ = clampSZ(MAC0 >> 12)
 //   AVSZ4: MAC0 = ZSF4 * (SZ0 + SZ1 + SZ2 + SZ3); OTZ = clampSZ(MAC0 >> 12)
@@ -984,7 +984,7 @@ pub fn gteAvsz(g: *mut[] u32, count: u32) {
     g[7] = gteClampSz3(g, mac0 >> 12);               // OTZ (bit 18)
 }
 
-// NCLIP — back-face cull test. MAC0 = signed cross product of the three
+// NCLIP - back-face cull test. MAC0 = signed cross product of the three
 // screen-space vertices currently sitting in the SXY FIFO. The BIOS
 // uses the sign of MAC0 to decide whether to draw a triangle.
 pub fn gteNclip(g: *mut[] u32) {
@@ -998,7 +998,7 @@ pub fn gteNclip(g: *mut[] u32) {
     g[D_MAC0] = (v as u64 & 0xFFFFFFFF) as u32;
 }
 
-// OP — outer product / cross product variant:
+// OP - outer product / cross product variant:
 //   MAC1 = RT22*IR3 - RT33*IR2
 //   MAC2 = RT33*IR1 - RT11*IR3
 //   MAC3 = RT11*IR2 - RT22*IR1
@@ -1021,7 +1021,7 @@ pub fn gteOp(g: *mut[] u32, sf: u32, lm: u32) {
     gteIrTriple(g, mac1, mac2, mac3, lm);
 }
 
-// NCDS — Normal Color Depth Single. Computes per-vertex lit color with
+// NCDS - Normal Color Depth Single. Computes per-vertex lit color with
 // far-color (fog) depth interpolation, using the light matrix to
 // transform the input vertex normal. The pipeline:
 //   1. L * V       -> MAC, IR (vertex normal in light space)
@@ -1043,8 +1043,8 @@ pub fn gteOp(g: *mut[] u32, sf: u32, lm: u32) {
 //   DR[20..22] = RGB FIFO entries 0/1/2
 //
 // Without this, the BIOS PS-logo polygons all receive colour (0,0,0)
-// and render black on a black background — completely invisible.
-// sf is 0 or 12 — gteClampMac shifts the saturated MAC by sf at every
+// and render black on a black background - completely invisible.
+// sf is 0 or 12 - gteClampMac shifts the saturated MAC by sf at every
 // stage; we apply the same shift inline so IR values land in the right
 // magnitude before clamping.
 pub fn gteNcds(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
@@ -1144,7 +1144,7 @@ pub fn gteNcds(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     gtePushRgb(g, m1c, m2c, m3c);
 }
 
-// SQR — square each IR component. Used for vector-length computations.
+// SQR - square each IR component. Used for vector-length computations.
 //   MAC{1,2,3} = IR{1,2,3}^2; IR{1,2,3} = clamp(MAC).
 pub fn gteSqr(g: *mut[] u32, sf: u32, lm: u32) {
     const ir1: i64 = s16ToI64(g[9]);
@@ -1159,13 +1159,13 @@ pub fn gteSqr(g: *mut[] u32, sf: u32, lm: u32) {
     gteIrTriple(g, mac1, mac2, mac3, lm);
 }
 
-// MVMVA — Multiply-Vector-by-Matrix and add-Vector. Opcode bits select
+// MVMVA - Multiply-Vector-by-Matrix and add-Vector. Opcode bits select
 // which matrix (mx: 0=rotation, 1=light, 2=lightColour), which vector
 // (v: 0..2 = V0..V2, 3 = IR vec), and which translation vector
 // (cv: 0=TR, 1=BK, 2=FC, 3=zero). Bit 19 sets sf (shift fraction = 12
 // or 0). Bit 10 sets lm (limit IR to 0..0x7FFF if 1).
 //
-// The CV=FC case is the hardware bug case — most BIOS calls use CV=TR.
+// The CV=FC case is the hardware bug case - most BIOS calls use CV=TR.
 // Result: MAC = (CV << 12) + MX * V; IR = clamp(MAC >> sf).
 pub fn gteMvmva(g: *mut[] u32, opc: u32) {
     const sf: u32 = ((opc >> 19) & 1) * 12;
@@ -1177,7 +1177,7 @@ pub fn gteMvmva(g: *mut[] u32, opc: u32) {
     // Pick the matrix. mxSel 0/1/2 = rotation / light / light-colour at
     // control regs 0..4 / 8..12 / 16..20. mxSel 3 is the hardware's
     // "garbage matrix": a junk mix of RC/IR0/RT13/RT22 that the hardware
-    // actually produces — reproduce it exactly rather than approximate.
+    // actually produces - reproduce it exactly rather than approximate.
     var m11: i64 = 0; var m12: i64 = 0; var m13: i64 = 0;
     var m21: i64 = 0; var m22: i64 = 0; var m23: i64 = 0;
     var m31: i64 = 0; var m32: i64 = 0; var m33: i64 = 0;

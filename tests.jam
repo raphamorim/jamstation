@@ -41,13 +41,13 @@ const { Mcd } = import("mcd");
 const { Mdec } = import("mdec");
 const { busBiosPtr } = import("bus");
 
-// File I/O via std.fs — no raw libc file ABI in the boot harness.
+// File I/O via std.fs - no raw libc file ABI in the boot harness.
 const { File, exists } = import("std/fs");
 
 const C0_SR:  u32 = 12;
 const SR_BEV: u32 = 0x00400000;
 
-// Re-declare the same shapes as cpu.jam — structural equality lets us
+// Re-declare the same shapes as cpu.jam - structural equality lets us
 // pass values across module boundaries.
 const Cpu = struct {
     pc: u32,
@@ -435,7 +435,7 @@ fn tGteRtpsClampIrZ() u32 {
 
 // MVMVA nested 44-bit truncation. TRX<<12 (≈2^43) + RT11*VX overflows 44
 // bits, so the nested gte_check_mac raises FLAG bit 30 (MAC1 positive
-// overflow) — even though the full MAC1 sum (RT12=-0x8000 pulls it back)
+// overflow) - even though the full MAC1 sum (RT12=-0x8000 pulls it back)
 // stays in 44-bit range, which is all the old single clamp_mac saw.
 fn tGteMvmvaNestedOvf() u32 {
     var g: Vec(u32) = gteAlloc();
@@ -656,14 +656,14 @@ tfn emuDiscBootsExec() {
     emuRunFrames(c, bus, regs.ptr, cop0.ptr, 120);
     // Bare minimum: BIOS handed control out of ROM (0xBFC*) into RAM
     // or scratchpad. Stricter "PC inside game text segment" check is
-    // a TODO — currently fails for the Harvest Moon SIO0-WaitEvent
+    // a TODO - currently fails for the Harvest Moon SIO0-WaitEvent
     // stall where PC stays in BIOS scratchpad at 0x00001EB0.
     assert(emuPcInRamOrScratchpad(c.pc), true);
 }
 
 // With a disc attached the BIOS bootstrap-loader should issue CD reads.
 // We assert by reading the response FIFO write index from cdrom state
-// (offset 0x2C is C_RESP_W in cdrom.jam) — it grows every time the CD
+// (offset 0x2C is C_RESP_W in cdrom.jam) - it grows every time the CD
 // pushes an INT3/INT2/INT5 response, so a non-zero value proves the CD
 // state machine got exercised.
 
@@ -707,7 +707,7 @@ fn tCycBios() u32 {
 // A GTE math op (RTPS) fetched from RAM costs its full 15 cycles.
 fn tCycGteRtps() u32 {
     var h: Harness = createHarness();
-    // Enable COP2 (SR.CU2, bit 30 of C0_SR=12) — dispatch raises a
+    // Enable COP2 (SR.CU2, bit 30 of C0_SR=12) - dispatch raises a
     // coprocessor-unusable exception for COP2 ops otherwise, and the GTE
     // cycle cost would never be charged.
     cop0Write(h.cop0.ptr, 12, 0x40000000);

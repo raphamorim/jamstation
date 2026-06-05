@@ -76,7 +76,7 @@ const SIO_IRQ_DELAY: u32 = 200;
 // `head == tail`).
 //
 // `pad` pushes the struct above kByValueMaxBytes (16), forcing the
-// ByPointer ABI — `mut Sio1` parameters take a pointer to live
+// ByPointer ABI - `mut Sio1` parameters take a pointer to live
 // storage so writes propagate. Otherwise an undersized struct would
 // be passed by value and mutations would land in a snapshot.
 pub const Sio1 = struct {
@@ -122,7 +122,7 @@ pub const Sio1 = struct {
     }
 
     // STAT compose: internal field carries the sticky/irq bits; on
-    // read we OR in the dynamic bits — TX_RDY1 always 1 (FIFO never
+    // read we OR in the dynamic bits - TX_RDY1 always 1 (FIFO never
     // full since we transmit immediately), TX_RDY2 = 1 when no TX in
     // flight, RX_NE = 1 when RX FIFO has data.
     pub fn readStat(self: Self) u32 {

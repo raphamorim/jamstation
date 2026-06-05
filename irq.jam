@@ -1,9 +1,9 @@
 // Interrupt controller.
 //
 // Two registers live at 0x1F801070..0x1F801077:
-//   0x00 I_STAT  status — set by devices raising IRQs, cleared by
+//   0x00 I_STAT  status - set by devices raising IRQs, cleared by
 //                writing 0 to the matching bit
-//   0x04 I_MASK  mask — when (stat & mask) != 0, COP0 CAUSE bit IP2
+//   0x04 I_MASK  mask - when (stat & mask) != 0, COP0 CAUSE bit IP2
 //                (= 0x00000400) is asserted, which causes the CPU to
 //                take an external interrupt the next time it samples
 //                pending IRQs at fetch time.
@@ -36,7 +36,7 @@ const C0_CAUSE: u32 = 13;
 // 16 u32 slots: [0]=I_STAT, [1]=I_MASK, [2..12]=per-source fire counters
 // (used by main.jam to print which interrupt sources are firing during a
 // hang), plus slack. Filled with 0 via typed slot writes (safe; the u32
-// loop collapses to a memset at -O1+). The Buf owns the allocation —
+// loop collapses to a memset at -O1+). The Buf owns the allocation -
 // its drop frees on scope exit, no irqFree helper needed.
 pub fn irqAlloc() Vec(u32) { return Vec(u32).filled(0, 16); }
 

@@ -3,7 +3,7 @@
 // Memory cards live on SIO0 as a second device alongside the joypad.
 // When the host writes 0x81 to SIO0_DATA the bus selects the memcard;
 // subsequent bytes drive an SDA-style state machine that reads/writes
-// 128 bytes per frame. Our pad.jam handles slot selection — it routes
+// 128 bytes per frame. Our pad.jam handles slot selection - it routes
 // 0x81 dest writes through here.
 //
 // State machine (MCD_STATE_*):
@@ -62,7 +62,7 @@ const MCD_S_TX_DAT3:     u32 = 26;
 //
 // `pad` pushes the struct above kByValueMaxBytes (16), forcing the
 // ByPointer ABI so a `mut Mcd` parameter takes a pointer to the
-// caller's storage — mutations through `mcd.X` reach the live card,
+// caller's storage - mutations through `mcd.X` reach the live card,
 // rather than landing in a snapshot copy and being discarded.
 pub const Mcd = struct {
     state:    u8,
@@ -113,7 +113,7 @@ pub const Mcd = struct {
             MCD_TX_HIZ { self.txData = 0xFF; }
             MCD_TX_FLG {
                 // If the host's last RX was 0x81/0x01 the card
-                // bails out — game-side probe code expects 0xFF when it
+                // bails out - game-side probe code expects 0xFF when it
                 // tries to ping us by sending the dest byte twice.
                 const rx: u32 = self.rxData as u32;
                 if (rx == 0x81 || rx == 0x01) {
@@ -139,7 +139,7 @@ pub const Mcd = struct {
                 } else if (m == 0x53) {                     // 'S' = status
                     self.state = MCD_S_TX_ACK1 as u8;
                 } else {
-                    // Unknown mode — drop the slot.
+                    // Unknown mode - drop the slot.
                     self.txReady = 0;
                     self.txData = 0xFF;
                     self.state = MCD_TX_HIZ as u8;
@@ -231,7 +231,7 @@ pub const Mcd = struct {
 
 // 128 KB memory-card backing store, zero-filled via typed slot writes
 // (Buf.filled is safe for any T; optimizer collapses the u8 loop to a
-// memset at -O1+). Owned by the Bus's `mcdRam` Buf — its drop frees on
+// memset at -O1+). Owned by the Bus's `mcdRam` Buf - its drop frees on
 // scope exit, no mcdRamFree helper needed.
 pub fn mcdRamAlloc() Vec(u8) {
     return Vec(u8).filled(0, MCD_MEMORY_SIZE as u32);

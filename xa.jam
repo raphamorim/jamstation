@@ -47,7 +47,7 @@ pub fn xaSectorIsAudio(secBuf: *mut[] u8) bool {
     return (secBuf[0x12] & 0x04) != 0;
 }
 
-// Form-2 bit (sub-mode byte bit 0) — form-2 sectors don't have ECC and
+// Form-2 bit (sub-mode byte bit 0) - form-2 sectors don't have ECC and
 // always carry audio/video. The XA fetch path skips non-form-2 sectors
 // even when MODE_XA_ADPCM is set.
 pub fn xaSectorIsForm2(secBuf: *mut[] u8) bool {

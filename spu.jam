@@ -1,4 +1,4 @@
-// SPU — Sound Processing Unit.
+// SPU - Sound Processing Unit.
 //
 // Layout of the byte buffer returned by spuAlloc:
 //   0x000..0x3FF : register file (the voice[24] register slots + globals)
@@ -9,7 +9,7 @@
 // Not yet wired up right now:
 //   - No reverb (the whole reverb-sample path is skipped)
 //   - No Gaussian interpolation (nearest-neighbor: `out = s[0]`)
-//   - No SDL audio callback yet — spuGetSample is exported but unused
+//   - No SDL audio callback yet - spuGetSample is exported but unused
 //
 // What is in: ADPCM block decoder, ADSR (Attack/Decay/Sustain/Release),
 // KON/KOFF, ENDX, voice mixing, master volume. Enough to produce real
@@ -38,7 +38,7 @@ const OUT_FIFO_BASE:  u32 = 0x2D00;
 const OUT_FIFO_CAP:   u32 = 4096;
 const OUT_FIFO_MASK:  u32 = 4095;
 const OUT_FIFO_BYTES: u32 = 16384;
-// Gaussian-interpolation coefficient table — 512 i16 entries =
+// Gaussian-interpolation coefficient table - 512 i16 entries =
 // 1024 bytes. The standard PSX Gaussian table. Populated by
 // spuGaussInit at spuAlloc time so we don't need a runtime fopen.
 const SPU_GAUSS_OFF:   u32 = 0x6D00;
@@ -276,7 +276,7 @@ pub fn spuRamAlloc() Vec(u8) { return Vec(u8).filled(0, SPU_RAM_SIZE); }
 // pairs. spuGetSample drains one entry per call and adds it (volume-
 // scaled by R_CDVOLL / R_CDVOLR) into the main mix. Producer drops
 // samples on full to keep the consumer in lock-step with the output
-// rate — favouring "current" audio over a runaway backlog.
+// rate - favouring "current" audio over a runaway backlog.
 
 pub fn spuPushCdSample(s: *mut[] u8, leftI16: u32, rightI16: u32) {
     const head: u32 = getU32(s, GLOBAL_BASE + G_CD_HEAD);
@@ -294,7 +294,7 @@ pub fn spuPushCdSample(s: *mut[] u8, leftI16: u32, rightI16: u32) {
 // at MBASE×8. The work-area is referenced through a rotating cursor
 // (revbaddr) that wraps within [mbase, 0x80000). All 32 control regs
 // (vIIR/vCOMB1..4/dAPF1/.../mLAPF2/...) are written by the CPU into
-// the SPU register file at 0x1C0..0x1FF — we just read them back here
+// the SPU register file at 0x1C0..0x1FF - we just read them back here
 // and feed the filter.
 
 // Saturate a 64-bit accumulator into a signed 16-bit value.
@@ -337,9 +337,9 @@ pub fn spuWriteReverb(s: *mut[] u8, ram: *mut[] u8, addr: u32, v: i32) {
 }
 
 // Run one reverb sample. inL/inR are the SPU's pre-reverb voice mix.
-// Returns packed (outL | outR<<16) — both already volume-scaled by
+// Returns packed (outL | outR<<16) - both already volume-scaled by
 // vLOUT / vROUT.  Called only when SPUCNT.bit7 is set (reverb master
-// enable) and on the alternating "even cycle" — the reverb-sample
+// enable) and on the alternating "even cycle" - the reverb-sample
 // computation is gated on the even cycle.
 pub fn spuGetReverbSample(s: *mut[] u8, ram: *mut[] u8,
                           inL: i32, inR: i32) u32 {
@@ -424,7 +424,7 @@ pub fn spuGetReverbSample(s: *mut[] u8, ram: *mut[] u8,
       + mulVol(spuReadReverb(s, ram, mrcomb3), vcomb3)
       + mulVol(spuReadReverb(s, ram, mrcomb4), vcomb4));
 
-    // Late reverb — all-pass filter 1.
+    // Late reverb - all-pass filter 1.
     l = sat16i32(l - sat16i32(mulVol(spuReadReverb(s, ram, mlapf1 - dapf1), vapf1)));
     r = sat16i32(r - sat16i32(mulVol(spuReadReverb(s, ram, mrapf1 - dapf1), vapf1)));
     spuWriteReverb(s, ram, mlapf1, l);
@@ -432,7 +432,7 @@ pub fn spuGetReverbSample(s: *mut[] u8, ram: *mut[] u8,
     l = sat16i32(mulVol(l, vapf1) + spuReadReverb(s, ram, mlapf1 - dapf1));
     r = sat16i32(mulVol(r, vapf1) + spuReadReverb(s, ram, mrapf1 - dapf1));
 
-    // Late reverb — all-pass filter 2.
+    // Late reverb - all-pass filter 2.
     l = sat16i32(l - sat16i32(mulVol(spuReadReverb(s, ram, mlapf2 - dapf2), vapf2)));
     r = sat16i32(r - sat16i32(mulVol(spuReadReverb(s, ram, mrapf2 - dapf2), vapf2)));
     spuWriteReverb(s, ram, mlapf2, l);
@@ -440,7 +440,7 @@ pub fn spuGetReverbSample(s: *mut[] u8, ram: *mut[] u8,
     l = sat16i32(mulVol(l, vapf2) + spuReadReverb(s, ram, mlapf2 - dapf2));
     r = sat16i32(mulVol(r, vapf2) + spuReadReverb(s, ram, mrapf2 - dapf2));
 
-    // Output stage — scale by vLOUT/vROUT.
+    // Output stage - scale by vLOUT/vROUT.
     const outL: i32 = sat16i32(mulVol(l, vlout));
     const outR: i32 = sat16i32(mulVol(r, vrout));
 
@@ -581,7 +581,7 @@ pub fn spuReadBlock(s: *mut[] u8, ram: *mut[] u8, v: u32) {
         if ((nibble & 0x8) != 0) { t = t - 16; }
         const tShifted: i32 = t << shift;
         const pred: i32 = ((h0 * f0) + (h1 * f1) + 32) / 64;
-        // wraps to int16 here (not saturates) — see wrap16.
+        // wraps to int16 here (not saturates) - see wrap16.
         const sample: i32 = wrap16(tShifted + pred);
 
         h1 = h0;
@@ -709,7 +709,7 @@ pub fn spuHandleAdsr(s: *mut[] u8, v: u32) {
 // Advance every playing voice's ADSR envelope by ONE SPU sample. Called
 // CPU-synchronously (once per 768 CPU cycles = 44.1 kHz) from runOneFrame
 // so the envelope level the game POLLS at voice reg 0xC (ENVCVOL) is
-// deterministic and matches hardware — instead of advancing on the
+// deterministic and matches hardware - instead of advancing on the
 // wall-clock audio thread (which desyncs from the CPU and made Brave Fencer
 // read a wrong envelope level, looping the intro resource-load -> black FMV).
 // The audio thread no longer steps the envelope (removed from spuGetSample).
@@ -812,7 +812,7 @@ pub fn spuHandleWrite(s: *mut[] u8, ram: *mut[] u8, off: u32, val: u32) i32 {
         var stat: u32 = getU16(s, R_SPUSTAT);
         stat = (stat & 0xFFC0) | (val & 0x3F);
         setU16(s, R_SPUSTAT, stat);
-        // Drain any pending TFIFO data on every SPUCNT write — covers both
+        // Drain any pending TFIFO data on every SPUCNT write - covers both
         // a flush on entering an active mode AND the
         // hardware-spec behavior (flush on transition to Stop). Critically,
         // this puts the flush BEFORE the next setStartAddress in
@@ -903,7 +903,7 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
     var left: i32 = 0;
     var right: i32 = 0;
 
-    // KON/KOFF are one-shot — zero them after dispatch each tick.
+    // KON/KOFF are one-shot - zero them after dispatch each tick.
     setU16(s, R_KONL, 0);
     setU16(s, R_KONH, 0);
     setU16(s, R_KOFFL, 0);
@@ -920,7 +920,7 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
     spuStepNoise(s, cnt0);
     const noiseLvl: i32 = getI16(s, GLOBAL_BASE + G_NOISE_LEVEL);
 
-    // Reverb input accumulators — only EON voices feed the reverb.
+    // Reverb input accumulators - only EON voices feed the reverb.
     // prevOut carries the prior voice's ADSR-scaled output
     // for pitch modulation.
     var revL: i32 = 0;
@@ -1033,7 +1033,7 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
 
     const spucnt: u32 = getU16(s, R_SPUCNT);
     if ((spucnt & 0x4000) == 0) {
-        // SPU disabled — still drain the CD FIFO so the producer
+        // SPU disabled - still drain the CD FIFO so the producer
         // doesn't back up, and return silence to the audio callback.
         const _drain: u32 = spuPopCdSample(s);
         return 0;
@@ -1058,7 +1058,7 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
         if ((spucnt & 0x0004) != 0) { revL = revL + cdMixL; revR = revR + cdMixR; }
     }
 
-    // Reverb pass — gated on SPUCNT.bit 7 (REVERB master enable). The
+    // Reverb pass - gated on SPUCNT.bit 7 (REVERB master enable). The
     // filter chews two samples per turn (the rotating revbaddr advances
     // by 2 bytes per call) so it only fires on the even cycle and
     // caches the result through to the odd cycle. We do the same here:
@@ -1067,7 +1067,7 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
         const even: u32 = getU32(s, GLOBAL_BASE + G_EVEN_CYC);
         if (even != 0) {
             // Reverb input is the EON-voice sum (+ CD when enabled), not the
-            // full mix — matches Avocado/DuckStation.
+            // full mix - matches Avocado/DuckStation.
             const sl16: i32 = sat16(revL);
             const sr16: i32 = sat16(revR);
             const rv: u32 = spuGetReverbSample(s, ram, sl16, sr16);
@@ -1138,7 +1138,7 @@ pub fn spuOutAvailable(s: *mut[] u8) u32 {
 // cycles. We accumulate cycles and drain one spuGetSample per bucket.
 // This advances ADSR + voice playback at the correct rate; ENDX flips
 // naturally when a voice's release finishes. Samples are discarded for
-// now — actual audio output needs an SDL audio device.
+// now - actual audio output needs an SDL audio device.
 
 const G_SAMPLE_ACC: u32 = 0x58;        // u32, after G_LRSR
 const CYC_PER_SAMPLE: u32 = 768;

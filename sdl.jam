@@ -6,7 +6,7 @@
 // bits per pixel (RGB555 + mask bit). We expose it via SDL2's BGR555
 // pixel format so the host GPU does the conversion for us.
 //
-// macOS desktop only — set up via Homebrew's `sdl2` formula. Build
+// macOS desktop only - set up via Homebrew's `sdl2` formula. Build
 // with the SDL2 linker flags via `make run`.
 
 const { Vec } = import("std").collections;
@@ -20,11 +20,11 @@ const SDL_INIT_EVENTS: u32 = 0x00004000;
 const SDL_WINDOW_SHOWN:     u32 = 0x00000004;
 const SDL_WINDOW_RESIZABLE: u32 = 0x00000020;
 
-// SDL_PIXELFORMAT_BGR555 — actually a Macro-alias for XBGR1555. The
+// SDL_PIXELFORMAT_BGR555 - actually a Macro-alias for XBGR1555. The
 // numerical value is determined by SDL's `SDL_DEFINE_PIXELFORMAT` macro
 // (type=PACKED16, order=XBGR, layout=1555, bits=16, bytes=2) which
 // resolves to 0x15530F02 on SDL 2.0.x. Hand-computing the macro from
-// scratch is error-prone — I had 0x14110A02 here originally, which made
+// scratch is error-prone - I had 0x14110A02 here originally, which made
 // SDL reinterpret PSX VRAM bytes through a different bit layout and
 // the screen rendered with a green tint. Verified value by linking a
 // 5-line C program against SDL2 and printing the constant.
@@ -40,7 +40,7 @@ const SDL_QUIT:       u32 = 0x100;
 const SDL_KEYDOWN:    u32 = 0x300;
 const SDL_KEYUP:      u32 = 0x301;
 
-// SDL2 surface — pointer-opaque handles, treated as `*mut[] u8` from Jam.
+// SDL2 surface - pointer-opaque handles, treated as `*mut[] u8` from Jam.
 extern fn SDL_Init(flags: u32) i32;
 extern fn SDL_Quit();
 extern fn SDL_SetHint(name: *const[] u8, value: *const[] u8) i32;
@@ -66,7 +66,7 @@ extern fn SDL_PollEvent(event: *mut[] u8) i32;
 extern fn SDL_GetTicks() u32;
 // Actual render-target size in PIXELS. On a HiDPI / retina display this is
 // larger than the window's point size (e.g. 2×), so we must scale the blit
-// against THIS, not the window size — otherwise the image lands in a corner.
+// against THIS, not the window size - otherwise the image lands in a corner.
 extern fn SDL_GetRendererOutputSize(renderer: *mut[] u8, w: *mut[] i32, h: *mut[] i32) i32;
 // Letterbox/pillarbox bars are painted with the render draw colour on clear.
 extern fn SDL_SetRenderDrawColor(renderer: *mut[] u8, r: u8, g: u8, b: u8, a: u8) i32;
@@ -87,16 +87,16 @@ extern fn objc_msgSend(recv: u64, sel: u64, a: u64, b: u64) u64;
 // Callback-mode SDL audio with an SPSC ring buffer. The SPU is NOT
 // driven by the audio thread (it's clocked CPU-synchronously inside
 // runOneFrame, one sample per 768 cycles, so the envelope the game
-// polls stays deterministic — Brave Fencer's intro depends on this).
+// polls stays deterministic - Brave Fencer's intro depends on this).
 // Instead the CPU loop PRODUCES samples into a ring buffer, and SDL's
 // audio callback (psone_audio_cb) CONSUMES from it at the rock-steady
 // host 44.1 kHz rate. Under/overruns are handled at sample granularity
 // (silence-fill on underrun, bounded drop on overrun) instead of the
-// whole-frame drops that queue mode (SDL_QueueAudio) produced — which
+// whole-frame drops that queue mode (SDL_QueueAudio) produced - which
 // were the source of the "robotic" gaps/clicks.
 //
 // `cbAddr` is the address of `psone_audio_cb` (computed in main.jam
-// via Jam's fn-as-u64 coercion — the ptrtoint cast lowering in the
+// via Jam's fn-as-u64 coercion - the ptrtoint cast lowering in the
 // compiler is what makes this expressible without a C shim).
 // `userdata` is the ring-buffer blob the callback drains (see the
 // RING_* layout below).
@@ -120,7 +120,7 @@ extern fn SDL_LockAudioDevice(dev: u32);
 extern fn SDL_UnlockAudioDevice(dev: u32);
 
 const SDL_INIT_AUDIO: u32 = 0x00000010;
-// AUDIO_S16SYS on little-endian hosts (macOS) is 0x8010 — signed,
+// AUDIO_S16SYS on little-endian hosts (macOS) is 0x8010 - signed,
 // 16-bit, little-endian. SDL2 picks the right format automatically
 // based on system endianness via this alias.
 const SDL_AUDIO_S16SYS: u32 = 0x8010;
@@ -182,7 +182,7 @@ pub fn sdlInit(title: []u8, width: i32, height: i32) Sdl {
     // Force the OpenGL renderer instead of macOS's default Metal one. Metal's
     // SDL_RenderPresent calls [CAMetalLayer nextDrawable], which BLOCKS when
     // the window isn't being composited (unfocused/occluded) because the
-    // drawable pool starves — this is the "stuck when not focused" freeze, and
+    // drawable pool starves - this is the "stuck when not focused" freeze, and
     // it happens even with vsync off. OpenGL's swap has no such pool, so the
     // loop keeps running when unfocused. We also drop PRESENTVSYNC so the
     // present never waits on a vblank (which the OS may stop delivering to an
@@ -192,7 +192,7 @@ pub fn sdlInit(title: []u8, width: i32, height: i32) Sdl {
     SDL_SetHint(hintName.ptr, hintGl.ptr);
     var ren: *mut[] u8 = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
     if (ren as u64 == 0) {
-        // OpenGL unavailable — clear the hint and fall back to the default
+        // OpenGL unavailable - clear the hint and fall back to the default
         // (Metal) renderer so we still get a window rather than crashing.
         var hintEmpty: []u8 = "";
         SDL_SetHint(hintName.ptr, hintEmpty.ptr);
@@ -257,25 +257,25 @@ pub fn setU64Le(buf: *mut[] u8, off: u32, v: u64) {
 pub fn sdlAudioOpen(samplesPerBuffer: u32, cbAddr: u64, userdata: u64) u32 {
     // SDL_AudioSpec is a 32-byte C struct; we hand-pack it and let SDL
     // overwrite the obtained side. Stack arrays beat malloc for these
-    // single-call scratch buffers — they auto-vanish on function exit.
+    // single-call scratch buffers - they auto-vanish on function exit.
     var desired:  [32]u8 = [0; 32];
     var obtained: [32]u8 = [0; 32];
     var dp: *mut[] u8 = desired.asMutPtr();
     // freq @ 0 (i32) = 44100
     dp[0] = 0x44; dp[1] = 0xAC; dp[2] = 0; dp[3] = 0;
-    // format @ 4 (u16) — AUDIO_S16SYS
+    // format @ 4 (u16) - AUDIO_S16SYS
     dp[4] = (SDL_AUDIO_S16SYS         & 0xFF) as u8;
     dp[5] = ((SDL_AUDIO_S16SYS >> 8)  & 0xFF) as u8;
     // channels @ 6 (u8) = 2
     dp[6] = 2;
-    // silence @ 7 (u8) — SDL fills
-    // samples @ 8 (u16) — buffer size in stereo samples
+    // silence @ 7 (u8) - SDL fills
+    // samples @ 8 (u16) - buffer size in stereo samples
     dp[8] = (samplesPerBuffer        & 0xFF) as u8;
     dp[9] = ((samplesPerBuffer >> 8) & 0xFF) as u8;
-    // padding, size — SDL fills
+    // padding, size - SDL fills
     // callback @ 16 (8-byte fn pointer)
     setU64Le(dp, 16, cbAddr);
-    // userdata @ 24 (8-byte ptr) — handed back to the callback as-is
+    // userdata @ 24 (8-byte ptr) - handed back to the callback as-is
     setU64Le(dp, 24, userdata);
     // First arg = NULL (default playback device).
     const dev: u32 = SDL_OpenAudioDevice(0 as u64, 0,
@@ -323,7 +323,7 @@ pub fn setU32Le(buf: *mut[] u8, off: u32, v: u32) {
 
 // PRODUCER (CPU thread): append `n` bytes of S16LE stereo samples from
 // `src` into the ring. Locks the device so it can't race the callback.
-// On overrun (ring nearly full — rare, since the audio-paced frame
+// On overrun (ring nearly full - rare, since the audio-paced frame
 // limiter keeps production matched to the host rate) the OLDEST whole
 // frames are dropped to make room, keeping wr/rd frame-aligned.
 pub fn sdlAudioRingPush(dev: u32, ring: *mut[] u8, src: *mut[] u8, n: u32) {
@@ -333,15 +333,15 @@ pub fn sdlAudioRingPush(dev: u32, ring: *mut[] u8, src: *mut[] u8, n: u32) {
     var rd: u32 = getU32Le(ring, 4);
     // `n` is always a whole number of stereo frames (4 bytes each). EVERY
     // index movement here MUST stay a multiple of 4, or wr/rd drift off the
-    // L/R grid and the callback reads half-frames — which swaps/tears the
+    // L/R grid and the callback reads half-frames - which swaps/tears the
     // channels into loud noise. (The old code clamped toWrite to `free`,
     // but free = RING_CAP-1-avail is ODD, so an overrun wrote an odd byte
-    // count and permanently misaligned the ring — the "weird audio" bug.)
+    // count and permanently misaligned the ring - the "weird audio" bug.)
     const avail: u32 = (wr - rd) & RING_MASK;
     const free: u32 = RING_CAP - 1 - avail;   // 1-byte gap = empty/full
     if (n > free) {
         // Overrun: jam emits a hair above 44.1 kHz (≈+300 B/s), so the ring
-        // slowly fills. Make room by dropping the OLDEST whole frames — this
+        // slowly fills. Make room by dropping the OLDEST whole frames - this
         // keeps latency bounded and plays the freshest audio, with at worst a
         // faint periodic skip instead of channel-tearing. Safe to move rd
         // here: SDL holds the device lock, so the callback can't be running.
@@ -418,9 +418,9 @@ pub fn packRect(buf: *mut[] u8, x: i32, y: i32, w: i32, h: i32) {
 // using the pixel data starting at the matching offset inside the
 // 1024×512 VRAM buffer, then renders that sub-rect (scaled) to the
 // window. This is how we crop the on-screen image to the BIOS's actual
-// display window — without it, the SDL texture would also show the
+// display window - without it, the SDL texture would also show the
 // off-screen texture pages and CLUTs that live elsewhere in VRAM.
-// sdlBlit — copy a rectangle of VRAM to the SDL texture, expanding to
+// sdlBlit - copy a rectangle of VRAM to the SDL texture, expanding to
 // ARGB8888. `is24bpp` selects between PSX 15bpp BGR555 (1 pixel per
 // 16-bit VRAM cell) and PSX 24bpp packed (3 bytes per pixel in raw VRAM
 // byte order R,G,B,R,G,B,…). `displayOff` forces a black frame.
@@ -439,7 +439,7 @@ pub fn sdlBlit(s: Sdl, pixels: *mut[] u8,
 
     // Destination buffer is always ARGB8888 = 4 bytes/pixel. `displayOff`
     // wants every byte zero; the active path overwrites every byte in the
-    // conversion loop. `filled(0, N)` covers both — the zero-fill is one
+    // conversion loop. `filled(0, N)` covers both - the zero-fill is one
     // pass through the same cache lines we touch immediately after.
     const dwU: u32 = dw as u32;
     const dhU: u32 = dh as u32;
@@ -501,8 +501,8 @@ pub fn sdlBlit(s: Sdl, pixels: *mut[] u8,
 
     // Scale the dw×dh image to fill the CURRENT window, preserving the source
     // aspect ratio (the leftover margin becomes black letterbox/pillarbox
-    // bars). We size against the renderer's OUTPUT size in pixels — not the
-    // window's point size — so this is correct on HiDPI/retina (output is
+    // bars). We size against the renderer's OUTPUT size in pixels - not the
+    // window's point size - so this is correct on HiDPI/retina (output is
     // larger than the window) AND tracks live user resizes. Same approach as
     // psxe's screen.c (SDL_GetRendererOutputSize + a computed dstrect); jam's
     // window is resizable, so we recompute every frame instead of on a
@@ -517,11 +517,11 @@ pub fn sdlBlit(s: Sdl, pixels: *mut[] u8,
     var fitW: i32 = ow;
     var fitH: i32 = oh;
     if (ow * dh > oh * dw) {
-        // Window wider than the image → full height, pillarbox the sides.
+        // Window wider than the image -> full height, pillarbox the sides.
         fitH = oh;
         fitW = (oh * dw) / dh;
     } else {
-        // Window taller/narrower → full width, letterbox top/bottom.
+        // Window taller/narrower -> full width, letterbox top/bottom.
         fitW = ow;
         fitH = (ow * dh) / dw;
     }
@@ -537,7 +537,7 @@ pub fn sdlBlit(s: Sdl, pixels: *mut[] u8,
     // arrays that vanish with the frame; no manual cleanup.
 }
 
-// SDL scancodes (USB HID page 7) — see SDL2 SDL_scancode.h.
+// SDL scancodes (USB HID page 7) - see SDL2 SDL_scancode.h.
 const SC_ESC:    u32 = 41;
 const SC_UP:     u32 = 82;
 const SC_DOWN:   u32 = 81;
@@ -639,7 +639,7 @@ pub fn sdlDelay(ms: u32) {
     SDL_Delay(ms);
 }
 
-// Fill a 1024×512 RGB555 buffer with a debug pattern — vertical bands
+// Fill a 1024×512 RGB555 buffer with a debug pattern - vertical bands
 // that show colour and let us verify the SDL pipe is alive even before
 // the GPU emits its first pixel.
 pub fn fillTestPattern(buf: *mut[] u8) {

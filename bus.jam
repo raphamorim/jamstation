@@ -6,8 +6,8 @@
 //
 // IO addresses are dispatched to the matching device module's handler;
 // everything else falls through to the flat byte buffers. Device modules
-// don't import bus.jam — they take whichever raw pointers they need as
-// arguments — so the import graph stays acyclic. The orchestration layer
+// don't import bus.jam - they take whichever raw pointers they need as
+// arguments - so the import graph stays acyclic. The orchestration layer
 // (cpu/dma/main/tests) imports `Bus` from here for its function signatures.
 const { Gpu } = import("gpu");
 const { dmaRead32, dmaRead16, dmaRead8,
@@ -35,7 +35,7 @@ const { Mcd, mcdRamAlloc } = import("mcd");
 // The Bus struct holds every piece of state we route through the
 // memory bus: raw buffers (RAM, BIOS, scratchpad, flat-IO fallback,
 // VRAM) plus the device-state pointers. Other modules redeclare this
-// shape structurally — Jam v0.1.0 doesn't reliably export struct types
+// shape structurally - Jam v0.1.0 doesn't reliably export struct types
 // across modules.
 pub const Bus = struct {
     ram:  Vec(u8),
@@ -265,7 +265,7 @@ pub fn ioRead8(bus: Bus, off: u32) u32 {
     return bufRead8(bus.io.ptr, off);
 }
 
-// Write dispatch — same table for writes. Note that DMA writes need
+// Write dispatch - same table for writes. Note that DMA writes need
 // the Bus (for memory access during a triggered transfer) and timer /
 // irq writes need cop0 to keep the COP0 cause register coherent. We
 // require those parameters at the outer interface.
@@ -320,7 +320,7 @@ pub fn ioWrite8(bus: Bus, cop0: *mut[] u32, off: u32, val: u32) {
     bufWrite8(bus.io.ptr, off, val);
 }
 
-// `busRead/Write` is the public memory-access surface — `cop0` is only
+// `busRead/Write` is the public memory-access surface - `cop0` is only
 // needed when the access target is an IO region that may update the
 // COP0 cause register; a wrapper that hardcodes cop0=NULL would be
 // unsound, so we always thread it through.
@@ -332,7 +332,7 @@ pub fn busRead32(bus: Bus, addr: u32) u32 {
         2 { return bufRead32(bus.bios.ptr, r.off & (BIOS_SIZE - 1)); }
         3 { return bufRead32(bus.spad.ptr, r.off & (SPAD_SIZE - 1)); }
         4 { return ioRead32(bus, r.off); }
-        // kind 5: EXP1 (no cart loaded) — reads return 0xFF per byte.
+        // kind 5: EXP1 (no cart loaded) - reads return 0xFF per byte.
         5 { return 0xFFFFFFFF; }
         _ { return 0; }
     }
@@ -405,10 +405,6 @@ pub fn busWrite8(bus: Bus, cop0: *mut[] u32, addr: u32, val: u32) {
 pub fn busRamPtr(bus: Bus)  *mut[] u8 { return bus.ram.ptr;  }
 pub fn busBiosPtr(bus: Bus) *mut[] u8 { return bus.bios.ptr; }
 pub fn busVramPtr(bus: Bus) *mut[] u8 { return bus.vram.ptr; }
-// busGpuPtr removed — use `bus.gpu.bufPtr()` directly for raw slot
-// access. The `bus.gpu` field is now a `Gpu` struct value.
 pub fn busDmaPtr(bus: Bus) *mut[] u32 { return bus.dma.ptr; }
 pub fn busIrqPtr(bus: Bus) *mut[] u32 { return bus.irq.ptr; }
-// busTimerPtr removed — `bus.timer` is by-value now. Callers use
-// the Timer methods directly via `bus.timer.method(...)`.
 pub fn busGtePtr(bus: Bus) *mut[] u32 { return bus.gte.ptr; }

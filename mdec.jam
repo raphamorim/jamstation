@@ -1,4 +1,4 @@
-// MDEC — Motion Decoder.
+// MDEC - Motion Decoder.
 //
 // PSX intros (Musashi SQUARESOFT logo, Harvest Moon opening, BIOS PS-X
 // startup splash, etc.) decompress YUV macroblock data through this
@@ -34,7 +34,7 @@ const DEPTH_8BIT:  u32 = 1;
 const DEPTH_24BIT: u32 = 2;
 const DEPTH_15BIT: u32 = 3;
 
-// Zig-zag table — index into yblk in iDCT-input order.
+// Zig-zag table - index into yblk in iDCT-input order.
 const ZAGZIG_INIT: [64]u8 = [
      0,  1,  8, 16,  9,  2,  3, 10,
     17, 24, 32, 25, 18, 11,  4,  5,
@@ -50,7 +50,7 @@ const ZAGZIG_INIT: [64]u8 = [
 // layout for ease of bit-fiddling); tables are typed arrays
 // addressable via `self.field` or `self.field.asMutPtr()`.
 //
-// yBlk / crBlk / cbBlk are 128-element i16 arrays — the iDCT
+// yBlk / crBlk / cbBlk are 128-element i16 arrays - the iDCT
 // ping-pongs between the first 64 entries (live block) and the next
 // 64 (scratch), using a "blk + 128" scratch offset.
 pub const Mdec = struct {
@@ -259,7 +259,7 @@ pub const Mdec = struct {
         const depth: u32 = self.outputDepth;
         const inputBytes: u32 = self.inputSizeB;
         if (depth < 2) {
-            // 4-bit / 8-bit mono — single Y block per macroblock.
+            // 4-bit / 8-bit mono - single Y block per macroblock.
             self.rlDecodeBlock(input, 0, self.yBlk.asMutPtr(),
                                self.yQuant.asMutPtr());
             var i: u32 = 0;
@@ -275,7 +275,7 @@ pub const Mdec = struct {
             self.outputIndex = 0;
             return;
         }
-        // 24-bit (depth=2) / 15-bit (depth=3) — full YUV macroblock.
+        // 24-bit (depth=2) / 15-bit (depth=3) - full YUV macroblock.
         var blockSize: u32 = 768;     // 16×16×3 (24-bit)
         if (depth == DEPTH_15BIT) { blockSize = 512; }   // 16×16×2
 
@@ -365,7 +365,7 @@ pub const Mdec = struct {
     // bus dispatch
     pub fn read32(self: mut Self, output: *mut[] u8, off: u32) u32 {
         if (off == 0) {
-            // Data port — drain one word from the output buffer.
+            // Data port - drain one word from the output buffer.
             const wordsRem: u32 = self.outputWords;
             if (wordsRem > 0) {
                 const idx: u32 = self.outputIndex;
@@ -490,7 +490,7 @@ pub const Mdec = struct {
             if ((val & 0x20000000) != 0) { self.enableDma1 = 1; }
             else                         { self.enableDma1 = 0; }
             if ((val & 0x80000000) != 0) {
-                // Reset — status = 0x80040000.
+                // Reset - status = 0x80040000.
                 self.busy = 0;
                 self.wordsRem = 0;
                 self.outputBit15 = 0;
@@ -545,7 +545,7 @@ pub fn clampS10(v: i32) i32 {
 // Wrap an i32 to int16. The RLE dequant product is held in an int16_t,
 // so it TRUNCATES before the CLAMP(-0x400,0x3ff). For products past
 // int16 range the wrap can flip the sign and clamp to the opposite
-// bound — must be applied pre-clamp.
+// bound - must be applied pre-clamp.
 pub fn mdecTrunc16(v: i32) i32 {
     return ((v & 0xFFFF) ^ 0x8000) - 0x8000;
 }
@@ -575,7 +575,7 @@ pub fn writeU32(buf: *mut[] u8, off: u32, v: u32) {
 }
 
 // iDCT pass operating on i16 pointers + scale table. The block is
-// 128 entries — the live block lives in [0..64], scratch in [64..128].
+// 128 entries - the live block lives in [0..64], scratch in [64..128].
 // `scratchOff` is the index offset (64) into the same buffer for the
 // secondary pass. We pingpong by indexing through that offset.
 pub fn idctPassPtr(blk: *mut[] i16, _dst: *mut[] i16,

@@ -1,6 +1,6 @@
 // Three 16-bit timers at 0x1F801100 / 0x1F801110 / 0x1F801120, each
 // exposing three registers (counter, mode, target). They count at
-// different clock sources — system clock, dotclock, hblank — and can
+// different clock sources - system clock, dotclock, hblank - and can
 // raise IRQs (lines 4 / 5 / 6 = TIMER0 / TIMER1 / TIMER2) on
 // target-hit or 0xFFFF wraparound.
 
@@ -99,7 +99,7 @@ pub const Timer = struct {
         return v;
     }
 
-    // Mode write — decompose the value into the per-flag fields,
+    // Mode write - decompose the value into the per-flag fields,
     // then reset side-state (counter, irq, fired, etc.).
     // Also seeds `paused` from hblank/vblank for sync
     // modes.
@@ -145,7 +145,7 @@ pub const Timer = struct {
         }
     }
 
-    // IRQ delivery logic — call after every counter advance and
+    // IRQ delivery logic - call after every counter advance and
     // every register write. Sets targetReached / maxReached as
     // appropriate, fires the matching IRQ line if its mask bit is
     // enabled, honours one-shot vs repeat, and resets the counter
@@ -154,7 +154,7 @@ pub const Timer = struct {
                      ic: *mut[] u32, cop0: *mut[] u32) {
         // Compare the FLOAT counter directly to the target and to 65535.0f
         // with strict `>`. Using `>=` (toward hardware/DuckStation) would
-        // fire the timer IRQ one tick earlier on every exact landing — a
+        // fire the timer IRQ one tick earlier on every exact landing - a
         // per-IRQ delivery-timing divergence. Stick with `>`.
         const counter: f32 = self.channels[idx].counter;
         const target:  u32 = self.channels[idx].target;
@@ -203,7 +203,7 @@ pub const Timer = struct {
         }
     }
 
-    // Bus reads — register layout per timer is:
+    // Bus reads - register layout per timer is:
     //   +0 counter (16-bit)
     //   +4 mode    (16-bit, read also clears targetReached / maxReached)
     //   +8 target  (16-bit)
@@ -257,7 +257,7 @@ pub const Timer = struct {
     pub fn updateCyc(self: mut Self, ic: *mut[] u32, cop0: *mut[] u32,
                  cyc: u32) {
         // IGNORE the cyc arg and advance all three timers by a hardcoded 2
-        // per instruction — NOT the real per-instruction cycle count.
+        // per instruction - NOT the real per-instruction cycle count.
         // Feeding the real `cyc` (fetchCyc+2 = 20 for BIOS-resident code)
         // makes the sysclk timers run ~10× too fast in BIOS/kernel loops,
         // drifting any timer value the game reads. Pass 2. (`cyc` kept for
@@ -276,7 +276,7 @@ pub const Timer = struct {
         // Advance the float counter. Timer 2 with clk_source>=2 ticks at
         // sysclk/8 (`+= cyc/8`). Timer 0 with clk_source bit0 set ticks at
         // the GPU dot-clock (`+= cyc * dotDiv`, dotDiv = (11/7)/hdiv) instead
-        // of full sysclk — matches the reference emulators (the dot-clock is
+        // of full sysclk - matches the reference emulators (the dot-clock is
         // slower than sysclk, so a plain `+= cyc` would run T0 several× too
         // fast). No integer subtick or leap-past-target adjustment: the float
         // overshoot/reset is handled directly by handleIrq.

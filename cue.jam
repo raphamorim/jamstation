@@ -14,11 +14,11 @@
 // track data start, MSF format).
 //
 // We use fixed-size tables (max 16 files, 99 tracks) instead of
-// linked lists — Jam's stdlib doesn't ship one and a CD can't have more
+// linked lists - Jam's stdlib doesn't ship one and a CD can't have more
 // than 99 tracks anyway. Each track stores absolute LBA start/end so the
 // disc-read path can look up by LBA.
 
-// All file I/O goes through std.fs — no raw libc file ABI in this module.
+// All file I/O goes through std.fs - no raw libc file ABI in this module.
 const { File, exists, canonicalize } = import("std/fs");
 const { Vec } = import("std/collections");
 const { Box } = import("std/box");
@@ -38,7 +38,7 @@ pub const SECTOR:     u32 = 2352;
 // Per-file metadata. `file` is the libc FILE* (kept open while the CUE
 // is live); `startLba` is the absolute LBA where this file's first
 // sector lands.
-// Internal types — not exported (other modules treat Cue as an opaque
+// Internal types - not exported (other modules treat Cue as an opaque
 // `*mut[] u8` blob and use the cueXxx functions to interact).
 pub const CueFile = struct {
     file:     File,         // std.fs.File handle
@@ -80,7 +80,7 @@ pub const Cue = struct {
 
     // Close every open per-file handle before the Vec backings get
     // freed by the auto-drop. The Vec drop itself doesn't know how to
-    // close a File — that's our responsibility. The user-side cleanup
+    // close a File - that's our responsibility. The user-side cleanup
     // path is `cueClose(c)`; this `cfn drop` is the safety net for any
     // path that bypasses cueClose (e.g. test teardown).
     cfn drop(self: mut Self) {
@@ -206,14 +206,14 @@ pub fn kwId(buf: *mut[] u8) u32 {
 
 // Allocate a Box(Cue) with each inner Vec sized to its MAX_/cap. The
 // Vecs are filled-with-zero so the existing index-based writes by
-// cueParse (`c.files.ptr[fi].sectors = ...`) land on valid slots —
+// cueParse (`c.files.ptr[fi].sectors = ...`) land on valid slots -
 // matches the old memset-after-malloc semantics. When the owning Bus
 // goes out of scope, Box(Disc).drop -> @dropInPlace -> Disc.cuePtr Box
 // drop -> @dropInPlace on Cue -> Cue's cfn drop closes open files ->
 // Cue's field-walk drops each Vec -> libc free.
 // Close every open per-cue-file handle and zero the counters so the
 // same Box(Cue) can be repopulated by a fresh cueParse. The Vec backings
-// stay live — only the user-visible "we have N tracks/files loaded"
+// stay live - only the user-visible "we have N tracks/files loaded"
 // state is reset. Called from discClose AND from discOpen's parse-
 // failure path so partial state never leaks into a subsequent open.
 pub fn cueReset(c: *mut[] Cue) {
@@ -296,7 +296,7 @@ pub fn cueComputeRanges(raw: *mut[] u8) {
             ti = ti + 1;
         }
         if (firstTrack == MAX_TRACKS) {
-            // No tracks for this file — skip.
+            // No tracks for this file - skip.
             fi = fi + 1;
             continue;
         }
@@ -321,7 +321,7 @@ pub fn cueComputeRanges(raw: *mut[] u8) {
                     c[0].tracks.ptr[ti].endLba = lba + fileSectors;
                 } else {
                     // endLba is exclusive, so it equals the next track's
-                    // startLba — contiguous, no 1-sector gap at the boundary
+                    // startLba - contiguous, no 1-sector gap at the boundary
                     // (mednafen/Avocado compute track length = next.index1 -
                     // this.index1 with no -1).
                     c[0].tracks.ptr[ti].endLba =
@@ -380,7 +380,7 @@ pub fn cueFindTrack(raw: *mut[] u8, lba: u32) u32 {
 
 // Pregap sector layout: byte 0 = 0x00, bytes 1..10 = 0xFF (sync pattern),
 // byte 11 = 0x00, the rest zero. Local
-// duplicate of disc.fillPregapSector — keeps cue.jam acyclic (disc
+// duplicate of disc.fillPregapSector - keeps cue.jam acyclic (disc
 // imports cue, not the other way around).
 fn fillPregap(buf: *mut[] u8) {
     var i: u32 = 0;
@@ -395,7 +395,7 @@ pub fn cueRead(raw: *mut[] u8, lba: u32, buf: *mut[] u8) i32 {
     var c: *mut[] Cue = raw as *mut[] Cue;
     const ti: u32 = cueFindTrack(raw, lba);
     if (ti == c[0].trackCount) {
-        // Past last track — could be pregap or far past end.
+        // Past last track - could be pregap or far past end.
         if (c[0].trackCount > 0 && lba >= c[0].tracks.ptr[c[0].trackCount - 1].endLba) {
             return 0;
         }
@@ -493,7 +493,7 @@ pub fn cueParse(raw: *mut[] u8, path: []u8) i32 {
         } else if (kw == 3) {                   // INDEX
             cueParseIndex(raw);
         } else {
-            // REM / PREGAP / POSTGAP / FLAGS — skip to end of line.
+            // REM / PREGAP / POSTGAP / FLAGS - skip to end of line.
             while (c[0].cur != 0x0A && c[0].cur != 0x0D
                    && !c[0].file.eof()) {
                 c[0].cur = c[0].file.readByte() as u32 & 0xFF;
@@ -531,7 +531,7 @@ pub fn cueParseFile(raw: *mut[] u8) {
     nameBuf[ni] = 0;
     c[0].cur = c[0].file.readByte() as u32 & 0xFF;     // consume closing '"'
 
-    // Skip type keyword (BINARY / WAVE / etc.) — we only treat as binary.
+    // Skip type keyword (BINARY / WAVE / etc.) - we only treat as binary.
     while (isSpace(c[0].cur)) { c[0].cur = c[0].file.readByte() as u32 & 0xFF; }
     while (isAlpha(c[0].cur)) { c[0].cur = c[0].file.readByte() as u32 & 0xFF; }
 

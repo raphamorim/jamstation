@@ -8,7 +8,7 @@
 //
 // Minimum protocol the BIOS exercises during PAD driver init and every
 // VSync: write 0x01 to TX (start poll), then write 0x42 (read switches)
-// and clock out 0x41 / 0x5A / SW low / SW high — the BIOS keeps the
+// and clock out 0x41 / 0x5A / SW low / SW high - the BIOS keeps the
 // last two bytes as the cached pad state. The /ACK line and the IRQ7
 // edge are modelled via a `cycles_until_irq` countdown; when it
 // expires, IC_JOY (0x080) is raised and JOY_STAT.IRQ7 is set.
@@ -64,7 +64,7 @@ const CTRL_SLOT: u32 = 0x2000;
 const STAT_TXR1: u32 = 0x0001;
 const STAT_RXNE: u32 = 0x0002;
 const STAT_TXR2: u32 = 0x0004;
-const STAT_ACKL: u32 = 0x0080;   // /ACK input level — controller response pulse
+const STAT_ACKL: u32 = 0x0080;   // /ACK input level - controller response pulse
 const STAT_IRQ7: u32 = 0x0200;
 
 // Destinations on first TX byte.
@@ -115,7 +115,7 @@ pub fn padSetU32(p: *mut[] u8, off: u32, v: u32) {
     p[off + 3] = ((v >> 24) & 0xFF) as u8;
 }
 
-// SDA read — return the next byte in the digital-pad sequence and
+// SDA read - return the next byte in the digital-pad sequence and
 // advance the state machine. After SWH the sequence is complete; the
 // pad returns to HIZ and tx_ready clears.
 pub fn sdaRead(p: *mut[] u8) u32 {
@@ -145,7 +145,7 @@ pub fn sdaRead(p: *mut[] u8) u32 {
     return data;
 }
 
-// SDA write — handles 0x43 (toggle analog config mode) by resetting the
+// SDA write - handles 0x43 (toggle analog config mode) by resetting the
 // state machine. Other writes are ignored (the digital pad doesn't
 // respond to any other commands).
 pub fn sdaWrite(p: *mut[] u8, data: u32) {
@@ -188,7 +188,7 @@ pub fn padWriteTx(p: *mut[] u8, mcd: mut Mcd, data: u32) {
     if (p[P_DEST] == 0) {
         // First TX byte selects the destination (0x01 = joy, 0x81 = mcd).
         // Sets dest, schedules the ACK-pulse countdown
-        // if CTRL_ACIE — but does NOT set irq_bit on the first byte. The
+        // if CTRL_ACIE - but does NOT set irq_bit on the first byte. The
         // BIOS expects IC_JOY to assert while STAT.IRQ7 stays 0 until a
         // *subsequent* byte writes through.
         const b: u32 = data & 0xFF;
@@ -316,7 +316,7 @@ pub fn padUpdate(p: *mut[] u8, ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
     // Raises IC_JOY unconditionally on countdown
     // expiry, and ONLY sets STAT.IRQ7 (bit 9) if irq_bit was set by
     // a subsequent-byte TX. The first byte raises IC_JOY without
-    // latching IRQ7 — BIOS sees the ACK pulse but no data-IRQ yet.
+    // latching IRQ7 - BIOS sees the ACK pulse but no data-IRQ yet.
     if (p[P_IRQ_BIT] != 0) {
         var stat: u32 = padGetU16(p, P_STAT_LO);
         stat = stat | STAT_IRQ7;

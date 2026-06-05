@@ -1,9 +1,9 @@
-// CD-ROM controller — a minimal implementation covering
+// CD-ROM controller - a minimal implementation covering
 // the BIOS-boot subset of commands plus the FIFO + IRQ + state-machine
 // plumbing every command depends on. Audio (CDDA) is stubbed; XA-ADPCM
 // streams through to the SPU CD-audio FIFO when MODE.XA is set.
 //
-// Register map at 0x1F801800..0x1F801803 — every register is bank-
+// Register map at 0x1F801800..0x1F801803 - every register is bank-
 // selected: writes to address 0x800 set bits 0-1 of the bank index,
 // then addresses 0x801..0x803 take different meanings per bank. The
 // dispatch table:
@@ -23,7 +23,7 @@
 // after `CD_DELAY_FR` CPU cycles. When the delay elapses, the response
 // handler pushes bytes to the response FIFO, sets IFR to a 1..7 INT
 // number, and raises IC_CDROM. The BIOS handler reads response bytes
-// then writes 0x07 to IFR to ack — the FIFO and IFR stay sticky until
+// then writes 0x07 to IFR to ack - the FIFO and IFR stay sticky until
 // then.
 
 const { irqRaise, IC_CDROM } = import("irq");
@@ -147,7 +147,7 @@ pub const Cdrom = struct {
     // sectors so block-N's predictor sees block-(N-1)'s tail.
     xaLh:        [2]i32,
     xaRh:        [2]i32,
-    // Last resampled OUTPUT sample per channel — the `ls` seed for the next
+    // Last resampled OUTPUT sample per channel - the `ls` seed for the next
     // sector's XA->44.1kHz rate conversion.
     xaPrevL:     i32,
     xaPrevR:     i32,
@@ -172,8 +172,8 @@ pub const Cdrom = struct {
             paramR: 0, paramW: 0,
             respR: 0, respW: 0,
             // Start at LBA 150 (00:02:00, first data sector).
-            // jam's LBA is pregap-inclusive — cueRead
-            // maps off=(lba-startLba)*SECTOR with track1 startLba=150 —
+            // jam's LBA is pregap-inclusive - cueRead
+            // maps off=(lba-startLba)*SECTOR with track1 startLba=150 -
             // so 0 would read a negative offset (zero pregap), not sector 0.
             delay: 0, lba: 150, pendingLba: 150, pendingSpeedSwitch: 0,
             dataRidx: 0, dataWidx: 0,
@@ -191,7 +191,7 @@ pub const Cdrom = struct {
     }
 
     // FIFO ops
-    // Two separate FIFOs (param / resp) — methods are duplicated rather
+    // Two separate FIFOs (param / resp) - methods are duplicated rather
     // than parameterized to keep the index/buffer pairing type-safe.
     // Same ring-buffer math the old `qPush`/`qPop` did, just with
     // typed fields.
@@ -267,7 +267,7 @@ pub const Cdrom = struct {
         // bit 2 (ADPBUSY): XA-ADPCM streaming active. Set when a ReadN/ReadS
         // runs in XA mode.
         // (Brave Fencer's FMV polls this; jam hardcoding 0 made the game
-        // branch away from the decode path — the SECOND trace-diff divergence,
+        // branch away from the decode path - the SECOND trace-diff divergence,
         // instr ~368.37M.)
         if (self.xaPlaying != 0) { r = r | 0x04; }
         if (self.paramEmpty()) { r = r | 0x08; }
@@ -314,7 +314,7 @@ pub const Cdrom = struct {
         const bank: u32 = (self.index as u32) & 0x3;
         const slot: u32 = (bank << 2) | (off & 0x3);
         match (slot) {
-            // Bank 0 — command byte: schedule state-machine entry.
+            // Bank 0 - command byte: schedule state-machine entry.
             1 {
                 self.pendingCmd = (val & 0xFF) as u8;
                 self.cmdPending = 1;
@@ -334,7 +334,7 @@ pub const Cdrom = struct {
             }
             // Push parameter byte.
             2 { self.pushParam(val); }
-            // Request register — bit 7 = BFRD (data req).
+            // Request register - bit 7 = BFRD (data req).
             3 { self.dataReq = ((val >> 7) & 1) as u8; }
             // Bank 1
             6 { self.ier = (val & 0x1F) as u8; }
@@ -342,7 +342,7 @@ pub const Cdrom = struct {
                 if ((val & 0x40) != 0) { self.clearParam(); }
                 self.ifr = ((self.ifr as u32) & (~(val & 0x1F))) as u8;
             }
-            // Bank 2 / 3 — volume registers. Not needed for BIOS boot.
+            // Bank 2 / 3 - volume registers. Not needed for BIOS boot.
             _ {}
         }
     }
@@ -361,7 +361,7 @@ pub const Cdrom = struct {
 
     // state-machine tick
 
-    // Handle the command response — dispatch the queued command
+    // Handle the command response - dispatch the queued command
     // after the TX_RESP1 delay elapses.
     pub fn executeCommand(self: mut Self, disc: *mut[] Disc,
                           ic: *mut[] u32, cop0: *mut[] u32) {
@@ -371,7 +371,7 @@ pub const Cdrom = struct {
         // Response-1 prechecks, before dispatch:
         // (1) disc-required commands with no disc -> INT5(11h,80h),
         // (3) wrong parameter count -> INT5(03h,20h), unknown command ->
-        // INT5(03h,40h). (Version checks are omitted — jam models a
+        // INT5(03h,40h). (Version checks are omitted - jam models a
         // single CD-ROM revision.) `pcnt` = parameters queued for this cmd.
         const pcnt: u32 = ((self.paramW as u32) - (self.paramR as u32)) & 0xFF;
         const c0: bool = cmd == CDL_GETSTAT || cmd == CDL_FORWARD ||
@@ -506,7 +506,7 @@ pub const Cdrom = struct {
             self.state = CD_STATE_TX_RESP2 as u8;
             // seek precision is set in resp2 on success, not
             // here in resp1. SeekL's 2nd-response delay is
-            // CD_DELAY_1MS (NOT FR) — the FR=50401 vs 1MS=33869 gap (16532
+            // CD_DELAY_1MS (NOT FR) - the FR=50401 vs 1MS=33869 gap (16532
             // cyc) made jam's SeekL INT2 fire ~8266 instrs late, the root of
             // the FMV CD-INT divergence at ~102.7M.
             self.delay = CD_DELAY_1MS;
@@ -906,7 +906,7 @@ pub const Cdrom = struct {
         self.processSetloc();
         if (self.hasDisc == 0) {
             // Report no-disc as SHELLOPEN (0x10), giving INT5(11h,80h)
-            // — not SPINDLE (which would give 03h,80h).
+            // - not SPINDLE (which would give 03h,80h).
             self.errorOut(CD_STAT_SHELLOPEN, CD_ERR_NO_DISC);
             return;
         }
@@ -922,7 +922,7 @@ pub const Cdrom = struct {
         // path), as on real hardware
         // when no audio filter is set. Suppressing audio-sector INT1s here
         // (the previous "filter" behaviour, ported from Avocado's filtered
-        // model) desynced games that do SOFTWARE de-interleaving — they expect
+        // model) desynced games that do SOFTWARE de-interleaving - they expect
         // one interrupt per sector to track stream position, so dropping the
         // audio INT1s stalled FMV streaming. submode is at sector offset 0x12
         // (bit 2 = Audio, bit 6 = Real-time).
@@ -981,9 +981,9 @@ pub const Cdrom = struct {
         // SPU CD FIFO is drained one entry per 44100 Hz output sample, so
         // pushing native-rate samples 1:1 plays XA ~17% too fast and overruns
         // the FIFO (most samples dropped -> warble). The resampler is
-        // conceptually a 7×-upsample —
+        // conceptually a 7×-upsample -
         // whose `(k+1)/8` integer-divides to 0, making it a sample-and-hold of
-        // the previous source sample — then decimate by m=f18khz?3:6, yielding
+        // the previous source sample - then decimate by m=f18khz?3:6, yielding
         // `resampleCount` samples at 44100 Hz. Output j samples source index
         // q-1 where q=(j*m)/7; q==0 uses the previous sector's last output
         // sample (the `ls` seed, carried in xaPrevL/R). n (2016 stereo / 4032
@@ -1058,7 +1058,7 @@ pub fn bcdValid(b: u32) bool {
 }
 
 // CD-ROM controller version-ID table, 4 bytes per version. Index 1 = C0A.
-// `version` is unused for v1 — would index a table for other versions.
+// `version` is unused for v1 - would index a table for other versions.
 pub fn versionByteForIdx(version: u32, n: u32) u32 {
     if (n == 0) { return 0x94; }
     if (n == 1) { return 0x09; }

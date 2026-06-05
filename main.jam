@@ -1,11 +1,11 @@
-// PSX emulator — SDL2 frontend.
+// PSX emulator - SDL2 frontend.
 //
 // Glues bus.jam + cpu.jam + sdl.jam together, loads BIOS and (optional)
 // PSX-EXE, then drives the CPU inside a 60 Hz SDL2 frame loop. Each
 // frame runs ~565K CPU cycles (≈ 33.87 MHz / 60 Hz) and presents the
 // PSX VRAM as a 1024×512 BGR555 texture.
 //
-// Pure-CPU unit tests live in tests.jam — keep them there so this
+// Pure-CPU unit tests live in tests.jam - keep them there so this
 // file doesn't have to link SDL2 just to run them.
 
 const {
@@ -50,7 +50,7 @@ const { print } = import("std/fmt");
 
 // File I/O comes from std/fs (loadExe / dumpVramPpm / fileExists). All
 // console output routes through std/fmt.print, which lowers to a direct
-// unbuffered write(1, ...) via the `@emitWriteBytes` intrinsic — no
+// unbuffered write(1, ...) via the `@emitWriteBytes` intrinsic - no
 // libc stdio buffering, so no fflush needed.
 
 // SDL2 externs need to be re-declared here so the codegen for sdl.jam's
@@ -118,7 +118,7 @@ const CYCLES_PER_FRAME: u32 = 564480;
 const VRAM_WIDTH:  i32 = 1024;
 const VRAM_HEIGHT: i32 = 512;
 
-// Maximum on-screen resolution we support — 640×480 is the largest the
+// Maximum on-screen resolution we support - 640×480 is the largest the
 // PSX can produce (interlaced 640H × 480V). The SDL window is sized to
 // this and the active display region is read out of the GPU's
 // display_mode register each frame so different resolutions all fit.
@@ -131,7 +131,7 @@ const SCREEN_H: i32 = 480;
 //
 // Bit layout of GP1 0x08:
 //   0-1 horizontal res code (0=256, 1=320, 2=512, 3=640)
-//   2   vertical res (0=240, 1=480 — but only if bit 5 interlace=1)
+//   2   vertical res (0=240, 1=480 - but only if bit 5 interlace=1)
 //   3   PAL/NTSC
 //   4   24bpp colour depth
 //   5   interlace enable
@@ -243,7 +243,7 @@ fn loadBios(path: []u8, bus: Bus) u64 {
 // cycles and HBlank spans [2560, 3413] (the last ~25%). Each instruction
 // advances a *float* accumulator by
 // `delta_cpu_cycles × (53.693175 / 33.868800)` GPU cycles. The HBlank
-// event — line++, GPUSTAT bit-31 (odd/even), VBlank IRQ — fires on the
+// event - line++, GPUSTAT bit-31 (odd/even), VBlank IRQ - fires on the
 // crossing INTO [2560,3413]; the scanline wraps (acc -= 3413) on the
 // crossing back out. The f32 accumulator preserves the sub-cycle phase:
 // an integer cycles/scanline drifts ~0.03
@@ -262,11 +262,11 @@ const FloatBits = union { i: u32, f: f32 };
 // Returns the number of stereo audio samples generated this frame (one
 // per 768 CPU cycles ≈ 735–737). The main loop paces the frame off this
 // count so the emulator advances at exactly the rate that yields 44.1 kHz
-// output — keeping SPU production locked to the host's playback rate.
+// output - keeping SPU production locked to the host's playback rate.
 fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
                audioDev: u32, ring: *mut[] u8) u32 {
     // The scanline counter and the float GPU-cycle accumulator are
-    // CONTINUOUS across frames — they free-run rather than resetting per
+    // CONTINUOUS across frames - they free-run rather than resetting per
     // frame. Persist them in GPU scratch slots 36/37 (the f32 via
     // a u32 type-pun) so the sub-cycle phase doesn't reset every frame.
     var gpuBuf: *mut[] u32 = bus.gpu.bufPtr();
@@ -298,7 +298,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
         // 1. CDROM
         bus.cdrom.update(bus.disc.ptrMut(), bus.spu.ptr, bus.irq.ptr, cop0, delta);
 
-        // 2. GPU — scanline window [0,3413], HBlank [2560,3413]. The HBlank
+        // 2. GPU - scanline window [0,3413], HBlank [2560,3413]. The HBlank
         // event (line++, GPUSTAT bit-31 odd/even, the hblank/vblank timer
         // hooks + VBlank IRQ) fires on the crossing INTO [2560,3413] (~75%
         // through the line); the scanline wraps on crossing out. This runs
@@ -335,7 +335,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
         }
         // 3. PAD
         padUpdate(bus.pad.ptr, bus.irq.ptr, cop0, delta);
-        // 4. TIMER sysclk — updateCyc ignores delta, uses 2.
+        // 4. TIMER sysclk - updateCyc ignores delta, uses 2.
         bus.timer.updateCyc(bus.irq.ptr, cop0, delta);
         // 5. DMA
         dmaTickSpu(bus.dma.ptr, delta);
@@ -343,7 +343,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
 
         // jam-only extras: neither of these belongs in the per-instruction
         // device update above. Kept at the end (least perturbation to the
-        // device order above) and flagged as divergences — SIO1 ->
+        // device order above) and flagged as divergences - SIO1 ->
         // peripherals task, SPU CPU-clock -> SPU task (revisit once the
         // deterministic CPU surface settles).
         bus.sio1.update(bus.irq.ptr, cop0, delta);
@@ -353,7 +353,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
             const sample: u32 = spuGetSample(bus.spu.ptr, bus.spuram.ptr,
                                               bus.irq.ptr, cop0);
             // Stash the sample bytes into the per-frame audio scratch.
-            // Drop on buffer-full instead of stomping past the end —
+            // Drop on buffer-full instead of stomping past the end -
             // worst-case ~735 samples/frame fits comfortably in 4096
             // bytes; the guard is belt-and-suspenders against runaway
             // delta accumulation (e.g. after a long debugger pause).
@@ -377,7 +377,7 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
     if (audioDev != 0 && audioLen > 0) {
         sdlAudioRingPush(audioDev, ring, audioBuf.asMutPtr(), audioLen);
     }
-    // NOTE: do NOT commitLoad here — each instruction's own commitLoad
+    // NOTE: do NOT commitLoad here - each instruction's own commitLoad
     // handles the R3000 load-delay slot.
     gpuBuf[36] = line;
     var outB: FloatBits = FloatBits { f: acc };
@@ -457,7 +457,7 @@ fn main() {
     var bus: Bus = allocBus();
     var c: Cpu = freshCpu();
 
-    // Memory card slot 1 — pull saved data from ./slot1.mcd if it
+    // Memory card slot 1 - pull saved data from ./slot1.mcd if it
     // exists. On exit we write the (possibly modified) 128 KB buffer
     // back to the same file so saves survive across runs.
     var mcdPath: []u8 = "./slot1.mcd";
@@ -471,7 +471,7 @@ fn main() {
     cop0Write(cop0.ptr, C0_PRID, 0x00000002);
 
     // CLI:  jamstation <BIOS_PATH> [GAME_PATH]
-    //   argv[1] = BIOS image — REQUIRED, no default.
+    //   argv[1] = BIOS image - REQUIRED, no default.
     //   argv[2] = optional game image: a .cue/.bin disc or a .exe
     //             (dispatched below). When omitted, the fixed ./game.*
     //             / ./demo.exe names in the cwd are used as a fallback.
@@ -489,7 +489,7 @@ fn main() {
         Some(arg) { gameArg = arg; hasGameArg = true; }
         None { }
     }
-    // A BIOS image is required — there is no default. Bail with a usage
+    // A BIOS image is required - there is no default. Bail with a usage
     // message instead of silently booting to a black screen.
     if (!hasBios) {
         print("error: no BIOS image given\nusage: jamstation <BIOS_PATH> [GAME_PATH]\n");
@@ -503,7 +503,7 @@ fn main() {
     print("Loaded BIOS: {got} bytes from {biosPath}\n");
 
     // EXE side-load. If `./demo.exe` exists we drop it into RAM and jump
-    // straight to its entry point (skipping the BIOS boot animation —
+    // straight to its entry point (skipping the BIOS boot animation -
     // appropriate for hand-crafted demos with their own init). For games
     // that depend on the BIOS kernel being set up, drop the EXE at
     // `./game.exe` instead: we boot the BIOS first and only sideload
@@ -518,7 +518,7 @@ fn main() {
     // fixed ./game.cue / ./game.bin / ./demo.exe / ./game.exe names in
     // the cwd. A .exe is sideloaded (BIOS boots first, then we hand off
     // at PC=0x80030000); a .cue/.bin is attached as a CD-ROM so the BIOS
-    // bootstraps the game off the disc — discOpen auto-detects .cue
+    // bootstraps the game off the disc - discOpen auto-detects .cue
     // (multi-track aware) vs a raw .bin (single-track Mode2/2352).
     if (hasGameArg) {
         if (pathEndsWithExe(gameArg)) {
@@ -578,9 +578,9 @@ fn main() {
         print("JAM_PSONE_FULL_VRAM set — showing full VRAM\n");
     }
     var sdl: Sdl = sdlInit(title, sdlW, sdlH);
-    // Audio device — callback + SPSC ring buffer. The SPU is advanced
+    // Audio device - callback + SPSC ring buffer. The SPU is advanced
     // CPU-synchronously inside runOneFrame (one sample per 768 cycles
-    // for deterministic envelope state — required for Brave Fencer's
+    // for deterministic envelope state - required for Brave Fencer's
     // intro to not loop, see commit 51b9ad9); those samples are pushed
     // into `audioRing`, and SDL's audio callback (psone_audio_cb) drains
     // the ring at the host 44.1 kHz rate. This replaces queue mode,
@@ -606,12 +606,12 @@ fn main() {
     // 0xFFFF = no buttons pressed; sdlPump clears bits on KEYDOWN and
     // sets them on KEYUP. padUpdate copies it into the SDA pad state
     // each frame so the next controller poll sees fresh input. Stack-
-    // local — sdlPump just borrows the pointer per call.
+    // local - sdlPump just borrows the pointer per call.
     var buttons: [1]u32 = [0xFFFF; 1];
     var btnPtr: *mut[] u32 = buttons.asMutPtr();
 
     var quit: bool = false;
-    // Idle-loop fallback for game.exe — when no disc is attached the
+    // Idle-loop fallback for game.exe - when no disc is attached the
     // BIOS shell renders, then sits in its main poll loop forever.
     // We detect "BIOS finished drawing" by watching the GPU polygon
     // counter: once it's been stable for ~3s of wall-clock with at
@@ -665,7 +665,7 @@ fn main() {
         // 44.1 kHz pull rate.
         var vram: *mut[] u8 = busVramPtr(bus);
         // Read the current display origin out of the GPU state buffer
-        // (g[63] disp_x, g[64] disp_y — set by GP1 0x05). The BIOS
+        // (g[63] disp_x, g[64] disp_y - set by GP1 0x05). The BIOS
         // moves these around during double-buffered animation.
         var gpuState: *mut[] u32 = bus.gpu.bufPtr();
         const dispX: i32 = gpuState[63] as i32;
@@ -695,12 +695,12 @@ fn main() {
 
         // Pace this frame by the AUDIO it produced: frameSamples / 44100 s.
         // The SPU emits one sample per 768 CPU cycles, so this makes the
-        // emulator advance at exactly 33.8688 MHz — the rate at which
+        // emulator advance at exactly 33.8688 MHz - the rate at which
         // production matches the host's 44.1 kHz playback, so the audio ring
         // never drifts full (the old fixed-59.94 Hz target emitted ~737
         // samples/frame = 44178 Hz, a 0.18% excess that crept the ring to
         // overrun every few seconds). The renderer runs WITHOUT vsync (see
-        // sdlInit — vsync would block the present on an unfocused window), so
+        // sdlInit - vsync would block the present on an unfocused window), so
         // this wall-clock limiter is the sole pacer. Fall back to the fixed
         // target only if a frame somehow produced no audio (avoids a busy
         // spin); a normal frame is ~735–737 samples ≈ 16.7 ms.
@@ -713,7 +713,7 @@ fn main() {
         if ((nowMs as f64) < nextFrameMs) {
             SDL_Delay((nextFrameMs - (nowMs as f64)) as u32);
         } else {
-            // Fell behind (slow frame) — resync so we never burst-catch-up
+            // Fell behind (slow frame) - resync so we never burst-catch-up
             // faster than real time.
             nextFrameMs = nowMs as f64;
         }
@@ -723,7 +723,7 @@ fn main() {
     mcdRamSave(bus.mcdRam.ptr, mcdPath);
 
     sdlAudioClose(audioDev);
-    // audioCtx and buttons are stack arrays — they vanish with main()'s
+    // audioCtx and buttons are stack arrays - they vanish with main()'s
     // frame; no manual free needed.
     sdlQuit(sdl);
     print("\nsdl quitted\n");
