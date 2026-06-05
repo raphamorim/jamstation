@@ -39,7 +39,7 @@ const {
 } = import("cpu");
 
 const {
-    sdlInit, sdlQuit, sdlBlit, sdlPump, sdlDelay,
+    sdlInit, sdlQuit, sdlBlit, sdlPump, sdlDelay, sdlTicks,
     sdlAudioOpen, sdlAudioClose, sdlAudioRingPush, psone_audio_cb
 } = import("sdl");
 const { Vec } = import("std").collections;
@@ -51,39 +51,6 @@ const { print } = import("std/fmt");
 // console output routes through std/fmt.print, which lowers to a direct
 // unbuffered write(1, ...) via the `@emitWriteBytes` intrinsic - no
 // libc stdio buffering, so no fflush needed.
-
-// SDL2 externs need to be re-declared here so the codegen for sdl.jam's
-// pub wrappers (which lives in this module's compilation context) can
-// resolve them.
-extern fn SDL_Init(flags: u32) i32;
-extern fn SDL_Quit();
-extern fn SDL_CreateWindow(title: *const[] u8,
-                           x: i32, y: i32, w: i32, h: i32,
-                           flags: u32) *mut[] u8;
-extern fn SDL_DestroyWindow(window: *mut[] u8);
-extern fn SDL_CreateRenderer(window: *mut[] u8, index: i32, flags: u32) *mut[] u8;
-extern fn SDL_DestroyRenderer(renderer: *mut[] u8);
-extern fn SDL_CreateTexture(renderer: *mut[] u8, format: u32, access: i32,
-                            w: i32, h: i32) *mut[] u8;
-extern fn SDL_DestroyTexture(texture: *mut[] u8);
-extern fn SDL_UpdateTexture(texture: *mut[] u8, rect: *const[] u8,
-                            pixels: *const[] u8, pitch: i32) i32;
-extern fn SDL_RenderClear(renderer: *mut[] u8) i32;
-extern fn SDL_RenderCopy(renderer: *mut[] u8, texture: *mut[] u8,
-                         srcrect: *const[] u8, dstrect: *const[] u8) i32;
-extern fn SDL_RenderPresent(renderer: *mut[] u8);
-extern fn SDL_Delay(ms: u32);
-extern fn SDL_PollEvent(event: *mut[] u8) i32;
-extern fn SDL_GetTicks() u32;
-extern fn SDL_GetRendererOutputSize(renderer: *mut[] u8, w: *mut[] i32, h: *mut[] i32) i32;
-extern fn SDL_SetRenderDrawColor(renderer: *mut[] u8, r: u8, g: u8, b: u8, a: u8) i32;
-extern fn SDL_OpenAudioDevice(device: u64, iscapture: i32,
-                              desired: *mut[] u8, obtained: *mut[] u8,
-                              allowed_changes: i32) u32;
-extern fn SDL_CloseAudioDevice(dev: u32);
-extern fn SDL_PauseAudioDevice(dev: u32, pause_on: i32);
-extern fn SDL_QueueAudio(dev: u32, data: *const[] u8, len: u32) i32;
-extern fn SDL_GetQueuedAudioSize(dev: u32) u32;
 
 // Locally-redeclared shapes matching cpu.jam / sdl.jam.
 const Cpu = struct {
@@ -626,7 +593,7 @@ fn main() {
     // panel) and overruns/drops the audio queue. The f64 accumulator avoids
     // the drift an integer-ms target would introduce.
     const FRAME_MS: f64 = 1000.0 / 59.94;
-    var nextFrameMs: f64 = SDL_GetTicks() as f64;
+    var nextFrameMs: f64 = sdlTicks() as f64;
     while (!quit) {
         // Game-EXE side-load. Two trigger paths:
         //   1. BIOS jumps to 0x80030000 (real-disc boot handoff).
@@ -708,9 +675,9 @@ fn main() {
             frameMs = (frameSamples as f64) * 1000.0 / 44100.0;
         }
         nextFrameMs = nextFrameMs + frameMs;
-        const nowMs: u32 = SDL_GetTicks();
+        const nowMs: u32 = sdlTicks();
         if ((nowMs as f64) < nextFrameMs) {
-            SDL_Delay((nextFrameMs - (nowMs as f64)) as u32);
+            sdlDelay((nextFrameMs - (nowMs as f64)) as u32);
         } else {
             // Fell behind (slow frame) - resync so we never burst-catch-up
             // faster than real time.

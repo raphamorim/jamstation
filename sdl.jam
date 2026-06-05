@@ -639,6 +639,11 @@ pub fn sdlDelay(ms: u32) {
     SDL_Delay(ms);
 }
 
+// Milliseconds since SDL_Init — the frame limiter's wall-clock source.
+pub fn sdlTicks() u32 {
+    return SDL_GetTicks();
+}
+
 // Fill a 1024×512 RGB555 buffer with a debug pattern - vertical bands
 // that show colour and let us verify the SDL pipe is alive even before
 // the GPU emits its first pixel.
