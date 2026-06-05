@@ -39,6 +39,7 @@ const {
 } = import("cpu");
 
 const {
+    Sdl,
     sdlInit, sdlQuit, sdlBlit, sdlPump, sdlDelay, sdlTicks,
     sdlAudioOpen, sdlAudioClose, sdlAudioRingPush, psone_audio_cb
 } = import("sdl");
@@ -52,7 +53,7 @@ const { print } = import("std/fmt");
 // unbuffered write(1, ...) via the `@emitWriteBytes` intrinsic - no
 // libc stdio buffering, so no fflush needed.
 
-// Locally-redeclared shapes matching cpu.jam / sdl.jam.
+// Locally-redeclared shape matching cpu.jam.
 const Cpu = struct {
     pc: u32,
     nextPc: u32,
@@ -66,14 +67,6 @@ const Cpu = struct {
     branchTaken: u8,
     halted: u8,
     cycles: u64,
-};
-
-const Sdl = struct {
-    window:   *mut[] u8,
-    renderer: *mut[] u8,
-    texture:  *mut[] u8,
-    width:  i32,
-    height: i32,
 };
 
 const C0_SR:    u32 = 12;

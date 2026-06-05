@@ -127,7 +127,7 @@ const SDL_AUDIO_S16SYS: u32 = 0x8010;
 
 // Bundles the SDL2 window / renderer / texture so we can pass them
 // through one parameter.
-const Sdl = struct {
+pub const Sdl = struct {
     window:   *mut[] u8,
     renderer: *mut[] u8,
     texture:  *mut[] u8,
