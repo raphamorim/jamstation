@@ -1,12 +1,7 @@
-// CD-ROM controller - a minimal implementation covering
-// the BIOS-boot subset of commands plus the FIFO + IRQ + state-machine
-// plumbing every command depends on. Audio (CDDA) is stubbed; XA-ADPCM
-// streams through to the SPU CD-audio FIFO when MODE.XA is set.
+// register map at 0x1F801800..0x1F801803
 //
-// Register map at 0x1F801800..0x1F801803 - every register is bank-
-// selected: writes to address 0x800 set bits 0-1 of the bank index,
-// then addresses 0x801..0x803 take different meanings per bank. The
-// dispatch table:
+// every register is bank-selected: writes to address 0x800 set bits 0-1 of the bank index,
+// then addresses 0x801..0x803 take different meanings per bank. The dispatch table:
 //
 //   bank read 0x800  status (busy/parm-empty/resp-empty/...)
 //   bank read 0x801  pop one byte from the response FIFO
@@ -18,13 +13,6 @@
 //   bank 0 write 0x803  request register (bit 7 = data req)
 //   bank 1 write 0x802  IER
 //   bank 1 write 0x803  IFR ack (clears bits in IFR that are set in val)
-//
-// Acknowledge protocol: each command schedules a response that fires
-// after `CD_DELAY_FR` CPU cycles. When the delay elapses, the response
-// handler pushes bytes to the response FIFO, sets IFR to a 1..7 INT
-// number, and raises IC_CDROM. The BIOS handler reads response bytes
-// then writes 0x07 to IFR to ack - the FIFO and IFR stay sticky until
-// then.
 
 const { irqRaise, IC_CDROM } = import("irq");
 const { Disc, discRead, discLoaded,
@@ -38,21 +26,21 @@ const { spuPushCdSample } = import("spu");
 
 const SECTOR_BYTES: u32 = 2352;
 
-// State machine states (IDLE/TX_RESP1/TX_RESP2/READ/PLAY).
 const CD_STATE_IDLE:      u32 = 0;
 const CD_STATE_TX_RESP1:  u32 = 1;
 const CD_STATE_TX_RESP2:  u32 = 2;
 const CD_STATE_READ:      u32 = 3;
 const CD_STATE_PLAY:      u32 = 4;
 
-// Response / read scheduling delays (CPU cycles).
-const CD_DELAY_1MS:       u32 = 33869;       // 1ms at 33.8688MHz
+// 1ms at 33.8688MHz
+const CD_DELAY_1MS:       u32 = 33869;
 const CD_DELAY_FR:        u32 = 50401;
 const CD_DELAY_INIT_FR:   u32 = 81102;
-const CD_DELAY_READ_SS:   u32 = 451584;     // 33_868_800 / 75
-const CD_DELAY_READ_DS:   u32 = 225792;     // 33_868_800 / (2*75)
+// 33_868_800 / 75
+const CD_DELAY_READ_SS:   u32 = 451584;
+// 33_868_800 / (2*75)
+const CD_DELAY_READ_DS:   u32 = 225792;
 
-// Command codes (matches CDL_* in cdrom.h).
 const CDL_GETSTAT:    u32 = 0x01;
 const CDL_SETLOC:     u32 = 0x02;
 const CDL_PLAY:       u32 = 0x03;
@@ -82,13 +70,15 @@ const CDL_RESET:      u32 = 0x1C;
 const CDL_GETQ:       u32 = 0x1D;
 const CDL_READTOC:    u32 = 0x1E;
 
-// MODE register bits.
-const MODE_SECTOR_SIZE: u32 = 0x20;   // 0 = 0x800 payload, 1 = 0x924 raw
-const MODE_SPEED:       u32 = 0x80;   // 0 = 1x, 1 = 2x
-const MODE_XA_ADPCM:    u32 = 0x40;   // 1 = enable XA-ADPCM streaming
-const MODE_XA_FILTER:   u32 = 0x08;   // 1 = honour CdlSetFilter file/chan
+// 0 = 0x800 payload, 1 = 0x924 raw
+const MODE_SECTOR_SIZE: u32 = 0x20;
+// 0 = 1x, 1 = 2x
+const MODE_SPEED:       u32 = 0x80;
+// 1 = enable XA-ADPCM streaming
+const MODE_XA_ADPCM:    u32 = 0x40;
+// 1 = honour CdlSetFilter file/chan
+const MODE_XA_FILTER:   u32 = 0x08;
 
-// Status byte bits (CD_STAT_*).
 const CD_STAT_PLAY:      u32 = 0x80;
 const CD_STAT_SEEK:      u32 = 0x40;
 const CD_STAT_READ:      u32 = 0x20;
@@ -98,40 +88,49 @@ const CD_STAT_SEEKERROR: u32 = 0x04;
 const CD_STAT_SPINDLE:   u32 = 0x02;
 const CD_STAT_ERROR:     u32 = 0x01;
 
-// Error codes (CD_ERR_*).
+// error codes (CD_ERR_*).
 const CD_ERR_NO_DISC:          u32 = 0x80;
 const CD_ERR_INVALID_COMMAND:  u32 = 0x40;
 const CD_ERR_WRONG_PARAM_CNT:  u32 = 0x20;
 const CD_ERR_INVALID_SUBFUNC:  u32 = 0x10;
 const CD_ERR_SEEK_FAILED:      u32 = 0x04;
 
-// CD-ROM controller state. Each field replaces a named byte offset from
-// the old buffer-based layout. Two 32-byte FIFOs (param / resp) ride
-// alongside the registers; the 2352-byte data buffer holds one raw
-// Mode2/2352 sector at a time and `dataRidx` / `dataWidx` track the
-// DMA-side cursor through it.
 pub const Cdrom = struct {
-    // 1-byte control / status registers.
-    index:       u8,    // bank select 0-3
-    ifr:         u8,    // interrupt flag register, low 5 bits
-    ier:         u8,    // interrupt enable register
-    busy:        u8,    // command in progress
-    state:       u8,    // CD_STATE_*
+    // bank select 0-3
+    index:       u8,
+    // interrupt flag register, low 5 bits
+    ifr:         u8,
+    // interrupt enable register
+    ier:         u8,
+    // command in progress
+    busy:        u8,
+    // CD_STATE_*
+    state:       u8,
     prevState:   u8,
     pendingCmd:  u8,
-    dataReq:     u8,    // request register bit 7
+    // request register bit 7
+    dataReq:     u8,
     mode:        u8,
-    discType:    u8,    // 0=licensed, 1=audio, 2=unlicensed
-    region:      u8,    // 0=Japan, 1=America, 2=Europe
-    version:     u8,    // CDR_VERSION_* index
-    readOngoing: u8,    // sector pump active
-    xaPlaying:   u8,    // XA-ADPCM streaming active (status reg bit2 ADPBUSY)
+    // 0=licensed, 1=audio, 2=unlicensed
+    discType:    u8,
+    // 0=Japan, 1=America, 2=Europe
+    region:      u8,
+    // CDR_VERSION_* index
+    version:     u8,
+    // sector pump active
+    readOngoing: u8,
+    // XA-ADPCM streaming active (status reg bit2 ADPBUSY)
+    xaPlaying:   u8,
     hasDisc:     u8,
     cmdPending:  u8,
-    xaFile:      u8,    // SetFilter file
-    xaChannel:   u8,    // SetFilter channel
-    seekPrec:    u8,    // SeekL sets, GetLocP reads
-    prevSpeed:   u8,    // previous MODE.SPEED for SetMode delay
+    // SetFilter file
+    xaFile:      u8,
+    // SetFilter channel
+    xaChannel:   u8,
+    // SeekL sets, GetLocP reads
+    seekPrec:    u8,
+    // previous MODE.SPEED for SetMode delay
+    prevSpeed:   u8,
     paramR:      u8,
     paramW:      u8,
     respR:       u8,
@@ -140,18 +139,16 @@ pub const Cdrom = struct {
     delay:       u32,
     lba:         u32,
     pendingLba:  u32,
-    pendingSpeedSwitch: u32,  // 1x<->2x speed-change resync delay
+    pendingSpeedSwitch: u32,
     dataRidx:    u32,
     dataWidx:    u32,
     // XA-ADPCM per-channel history (2 i32 each). Persists across
     // sectors so block-N's predictor sees block-(N-1)'s tail.
     xaLh:        [2]i32,
     xaRh:        [2]i32,
-    // Last resampled OUTPUT sample per channel - the `ls` seed for the next
-    // sector's XA->44.1kHz rate conversion.
     xaPrevL:     i32,
     xaPrevR:     i32,
-    // Parameter / response FIFOs. Each is a 32-byte ring with u8
+    // Parameter / response FIFOs. each is a 32-byte ring with u8
     // head/tail; the indexes wrap modulo 32 via `& 0x1F`, and the
     // empty test compares the raw head/tail bytes directly.
     paramFifo:   [32]u8,
@@ -171,10 +168,6 @@ pub const Cdrom = struct {
             seekPrec: 1, prevSpeed: 0,
             paramR: 0, paramW: 0,
             respR: 0, respW: 0,
-            // Start at LBA 150 (00:02:00, first data sector).
-            // jam's LBA is pregap-inclusive - cueRead
-            // maps off=(lba-startLba)*SECTOR with track1 startLba=150 -
-            // so 0 would read a negative offset (zero pregap), not sector 0.
             delay: 0, lba: 150, pendingLba: 150, pendingSpeedSwitch: 0,
             dataRidx: 0, dataWidx: 0,
             xaLh: [0, 0],
@@ -190,12 +183,6 @@ pub const Cdrom = struct {
         if (discLoaded(disc) != 0) { self.hasDisc = 1; }
     }
 
-    // FIFO ops
-    // Two separate FIFOs (param / resp) - methods are duplicated rather
-    // than parameterized to keep the index/buffer pairing type-safe.
-    // Same ring-buffer math the old `qPush`/`qPop` did, just with
-    // typed fields.
-
     pub fn pushParam(self: mut Self, v: u32) {
         const idx: u32 = (self.paramW as u32) & 0x1F;
         self.paramFifo[idx] = (v & 0xFF) as u8;
@@ -210,11 +197,11 @@ pub const Cdrom = struct {
         return v as u32;
     }
 
-    pub fn paramEmpty(self: mut Self) bool {
+    pub fn paramEmpty(self: Self) bool {
         return self.paramR == self.paramW;
     }
 
-    pub fn paramFull(self: mut Self) bool {
+    pub fn paramFull(self: Self) bool {
         return (((self.paramW as u32) - (self.paramR as u32)) & 0x1F) == 16;
     }
 
@@ -237,7 +224,7 @@ pub const Cdrom = struct {
         return v as u32;
     }
 
-    pub fn respEmpty(self: mut Self) bool {
+    pub fn respEmpty(self: Self) bool {
         return self.respR == self.respW;
     }
 
@@ -246,12 +233,10 @@ pub const Cdrom = struct {
         self.respW = 0;
     }
 
-    // status byte
-
     // Status byte: SPINDLE always, plus
     // READ while the sector pump is active, SHELLOPEN if no disc,
     // IDERROR if mode bit 4 is set.
-    pub fn getStat(self: mut Self) u32 {
+    pub fn getStat(self: Self) u32 {
         var s: u32 = CD_STAT_SPINDLE;
         if (self.readOngoing != 0) { s = s | CD_STAT_READ; }
         if ((self.mode as u32 & 0x10) != 0) { s = s | CD_STAT_IDERROR; }
@@ -262,7 +247,7 @@ pub const Cdrom = struct {
     // register I/O
 
     // Status register at offset 0 (always, regardless of bank).
-    pub fn readStatus(self: mut Self) u32 {
+    pub fn readStatus(self: Self) u32 {
         var r: u32 = (self.index as u32) & 0x3;
         // bit 2 (ADPBUSY): XA-ADPCM streaming active. Set when a ReadN/ReadS
         // runs in XA mode.
@@ -706,7 +691,7 @@ pub const Cdrom = struct {
         self.pendingLba = 0;
     }
 
-    pub fn readDelay(self: mut Self) u32 {
+    pub fn readDelay(self: Self) u32 {
         if ((self.mode as u32 & MODE_SPEED) != 0) { return CD_DELAY_READ_DS; }
         return CD_DELAY_READ_SS;
     }
@@ -1027,7 +1012,7 @@ pub const Cdrom = struct {
     }
 
     // Read one sector at `lba` into the dataBuf. Returns 1 on success.
-    pub fn discReadAt(self: mut Self, disc: *mut[] Disc, lba: u32) i32 {
+    pub fn discReadAt(self: Self, disc: *mut[] Disc, lba: u32) i32 {
         return discRead(disc, lba, self.dataBuf.asMutPtr());
     }
 

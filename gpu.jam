@@ -1352,37 +1352,37 @@ pub const Gpu = struct {
         return s;
     }
 
-    pub fn familyCount(self: mut Self, family: u32) u32 {
+    pub fn familyCount(self: Self, family: u32) u32 {
         return gpuFamilyCount(self.buf.asMutPtr(), family);
     }
 
-    pub fn read8(self: mut Self, vram: *mut[] u8, off: u32) u32 {
+    pub fn read8(self: Self, vram: *mut[] u8, off: u32) u32 {
         return gpuRead8(self.buf.asMutPtr(), vram, off);
     }
 
-    pub fn read16(self: mut Self, vram: *mut[] u8, off: u32) u32 {
+    pub fn read16(self: Self, vram: *mut[] u8, off: u32) u32 {
         return gpuRead16(self.buf.asMutPtr(), vram, off);
     }
 
-    pub fn read32(self: mut Self, vram: *mut[] u8, off: u32) u32 {
+    pub fn read32(self: Self, vram: *mut[] u8, off: u32) u32 {
         return gpuRead32(self.buf.asMutPtr(), vram, off);
     }
 
-    pub fn write8(self: mut Self, vram: *mut[] u8, off: u32, val: u32) {
+    pub fn write8(self: Self, vram: *mut[] u8, off: u32, val: u32) {
         gpuWrite8(self.buf.asMutPtr(), vram, off, val);
     }
 
-    pub fn write16(self: mut Self, vram: *mut[] u8, off: u32, val: u32) {
+    pub fn write16(self: Self, vram: *mut[] u8, off: u32, val: u32) {
         gpuWrite16(self.buf.asMutPtr(), vram, off, val);
     }
 
-    pub fn write32(self: mut Self, vram: *mut[] u8, off: u32, val: u32) {
+    pub fn write32(self: Self, vram: *mut[] u8, off: u32, val: u32) {
         gpuWrite32(self.buf.asMutPtr(), vram, off, val);
     }
 
     // DMA channel 2 GPU path (linked-list + request modes) calls
     // these per word from dma.jam.
-    pub fn gp0(self: mut Self, vram: *mut[] u8, val: u32) {
+    pub fn gp0(self: Self, vram: *mut[] u8, val: u32) {
         gpuGp0(self.buf.asMutPtr(), vram, val);
     }
 
@@ -1390,7 +1390,7 @@ pub const Gpu = struct {
     // display-mode / disp_x / etc. fields directly. Bypasses the
     // method API for the small set of read-only readouts the host
     // pump needs each frame.
-    pub fn bufPtr(self: mut Self) *mut[] u32 {
+    pub fn bufPtr(self: Self) *mut[] u32 {
         return self.buf.asMutPtr();
     }
 };

@@ -624,5 +624,5 @@ fn main() {
     mcdRamSave(bus.mcdRam.ptr, mcdPath);
     sdlAudioClose(audioDev);
     sdlQuit(sdl);
-    print("\njamstation quitted\n");
+    print("jamstation: quitting...\n");
 }

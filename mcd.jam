@@ -100,7 +100,7 @@ pub const Mcd = struct {
         self.txReady = 0;
     }
 
-    pub fn query(self: mut Self) bool {
+    pub fn query(self: Self) bool {
         return self.txReady != 0;
     }
 
