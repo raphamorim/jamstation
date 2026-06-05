@@ -24,14 +24,14 @@ const { busRead32, busRead16, busRead8,
 // Even though cpu.jam doesn't call into these directly, the module
 // resolver only registers pub prototypes from modules in the *root*
 // import set. Forcing an import here brings each device module's pub
-// fns into the codegen context so bus.jam's allocBus/dispatch helpers
+// fns into the codegen context so bus.jam's createBus/dispatch helpers
 // resolve cleanly when cpu.jam is the root module.
 const { Gpu } = import("gpu");
-const { dmaAlloc } = import("dma");
-const { irqAlloc } = import("irq");
+const { createDma } = import("dma");
+const { createIrq } = import("irq");
 const { Bus } = import("bus");
 const { Timer } = import("timer");
-const { gteAlloc, gteDataRead, gteDataWrite,
+const { createGte, gteDataRead, gteDataWrite,
         gteCtrlRead, gteCtrlWrite, gteExec, gteOpCycles } = import("gte");
 const { Cdrom } = import("cdrom");
 const { Mcd } = import("mcd");
@@ -96,7 +96,7 @@ const CAUSE_OV:      u32 = 0x30;
 // (typed `*mut[] u32`) into the gprRead/Write/cop0Read/Write helpers so
 // the hot loop stays as a single `LDR` per access (no per-call Vec
 // indirection in the helpers).
-pub fn allocRegFile(n: u32) Vec(u32) { return Vec(u32).filled(0, n); }
+pub fn createRegFile(n: u32) Vec(u32) { return Vec(u32).filled(0, n); }
 
 pub fn gprRead(regs: *mut[] u32, idx: u32) u32 { return regs[idx]; }
 pub fn gprWrite(regs: *mut[] u32, idx: u32, val: u32) {

@@ -524,8 +524,8 @@ pub const Mdec = struct {
 // input/output buffer allocation (still heap-resident)
 
 // Owned MDEC IO buffers. Auto-drop with the Bus.
-pub fn mdecInputAlloc()  Vec(u8) { return Vec(u8).filled(0, MDEC_INPUT_SIZE); }
-pub fn mdecOutputAlloc() Vec(u8) { return Vec(u8).filled(0, MDEC_OUTPUT_SIZE); }
+pub fn createMdecInput()  Vec(u8) { return Vec(u8).filled(0, MDEC_INPUT_SIZE); }
+pub fn createMdecOutput() Vec(u8) { return Vec(u8).filled(0, MDEC_OUTPUT_SIZE); }
 
 // free helpers (no state required)
 

@@ -103,12 +103,19 @@ pub fn strEqAscii(a: *mut[] u8, b: *const[] u8, n: u32) bool {
 
 pub fn parseMsf(raw: *mut[] u8) u32 {
     var c: *mut[] Cue = raw as *mut[] Cue;
-    if (!isDigit(c[0].cur)) { return 0; }
+    if (!isDigit(c[0].cur)) {
+        return 0;
+    }
     const m: u32 = parseNumber(raw);
-    if (c[0].cur != 0x3A) { return 0; }
+    if (c[0].cur != 0x3A) {
+        return 0;
+    }
     c[0].cur = c[0].file.readByte() as u32 & 0xFF;
     const s: u32 = parseNumber(raw);
-    if (c[0].cur != 0x3A) { return 0; }
+    if (c[0].cur != 0x3A) {
+        return 0;
+    }
+
     c[0].cur = c[0].file.readByte() as u32 & 0xFF;
     const f: u32 = parseNumber(raw);
     return f + (s * 75) + (m * 4500);
@@ -131,7 +138,6 @@ pub fn skipWs(raw: *mut[] u8) {
     }
 }
 
-// Read an ASCII keyword (alpha + '/' + digits) into a 16-byte buf.
 pub fn parseKeyword(raw: *mut[] u8, buf: *mut[] u8) u32 {
     var c: *mut[] Cue = raw as *mut[] Cue;
     var n: u32 = 0;
@@ -145,8 +151,6 @@ pub fn parseKeyword(raw: *mut[] u8, buf: *mut[] u8) u32 {
     return n;
 }
 
-// Match a parsed keyword against a known list of cue directives.
-// Returns:
 //   1 = FILE, 2 = TRACK, 3 = INDEX, 4 = REM, 5 = PREGAP, 6 = POSTGAP,
 //   7 = FLAGS, 8 = MODE1/2048, 9 = MODE1/2352, 10 = MODE2/2336,
 //   11 = MODE2/2352, 12 = AUDIO, 13 = BINARY, 0 = unknown
@@ -180,20 +184,6 @@ pub fn kwId(buf: *mut[] u8) u32 {
     return 0;
 }
 
-// allocator
-
-// Allocate a Box(Cue) with each inner Vec sized to its MAX_/cap. The
-// Vecs are filled-with-zero so the existing index-based writes by
-// cueParse (`c.files.ptr[fi].sectors = ...`) land on valid slots -
-// matches the old memset-after-malloc semantics. When the owning Bus
-// goes out of scope, Box(Disc).drop -> @dropInPlace -> Disc.cuePtr Box
-// drop -> @dropInPlace on Cue -> Cue's cfn drop closes open files ->
-// Cue's field-walk drops each Vec -> libc free.
-// Close every open per-cue-file handle and zero the counters so the
-// same Box(Cue) can be repopulated by a fresh cueParse. The Vec backings
-// stay live - only the user-visible "we have N tracks/files loaded"
-// state is reset. Called from discClose AND from discOpen's parse-
-// failure path so partial state never leaks into a subsequent open.
 pub fn cueReset(c: *mut[] Cue) {
     var i: u32 = 0;
     while (i < c[0].fileCount) {
@@ -210,7 +200,7 @@ pub fn cueReset(c: *mut[] Cue) {
     c[0].rootLen = 0;
 }
 
-pub fn cueAlloc() Box(Cue) {
+pub fn createCue() Box(Cue) {
     return Box(Cue).init(Cue {
         files:      Vec(CueFile).filled(
                         CueFile { file: File { handle: 0 as *mut[] u8 },
@@ -234,10 +224,6 @@ pub fn cueAlloc() Box(Cue) {
     });
 }
 
-// track-range computation
-//
-// After parsing all FILE/TRACK/INDEX lines, walk each file's track list
-// and compute startLba/endLba.
 pub fn cueComputeRanges(raw: *mut[] u8) {
     var c: *mut[] Cue = raw as *mut[] Cue;
     // Initial LBA is 150 (00:02:00 lead-in).
@@ -245,9 +231,6 @@ pub fn cueComputeRanges(raw: *mut[] u8) {
     var fi: u32 = 0;
     while (fi < c[0].fileCount) {
         c[0].files.ptr[fi].startLba = lba;
-        // Find tracks for this file and assign ranges.
-        // Single-track file: track spans the whole file.
-        // Multi-track file: each track ends where the next begins.
         var firstTrack: u32 = MAX_TRACKS;
         var lastTrack: u32 = 0;
         var ti: u32 = 0;
@@ -259,7 +242,7 @@ pub fn cueComputeRanges(raw: *mut[] u8) {
             ti = ti + 1;
         }
         if (firstTrack == MAX_TRACKS) {
-            // No tracks for this file - skip.
+            // No tracks for this file.
             fi = fi + 1;
             continue;
         }
@@ -283,10 +266,6 @@ pub fn cueComputeRanges(raw: *mut[] u8) {
                 if (ti == lastTrack) {
                     c[0].tracks.ptr[ti].endLba = lba + fileSectors;
                 } else {
-                    // endLba is exclusive, so it equals the next track's
-                    // startLba - contiguous, no 1-sector gap at the boundary
-                    // (mednafen/Avocado compute track length = next.index1 -
-                    // this.index1 with no -1).
                     c[0].tracks.ptr[ti].endLba =
                         (c[0].tracks.ptr[ti + 1].index1 as u32) + 150;
                 }
@@ -297,8 +276,6 @@ pub fn cueComputeRanges(raw: *mut[] u8) {
         fi = fi + 1;
     }
 }
-
-// lookup helpers
 
 pub fn cueGetTrackCount(raw: *mut[] u8) u32 {
     var c: *mut[] Cue = raw as *mut[] Cue;
@@ -327,8 +304,6 @@ pub fn cueGetTrackNumber(raw: *mut[] u8, lba: u32) u32 {
     return 1;
 }
 
-// Locate the track owning `lba`. Returns trackCount on "past-end"; a
-// value < trackCount with mode=AUDIO means CDDA.
 pub fn cueFindTrack(raw: *mut[] u8, lba: u32) u32 {
     var c: *mut[] Cue = raw as *mut[] Cue;
     var i: u32 = 0;
@@ -341,10 +316,6 @@ pub fn cueFindTrack(raw: *mut[] u8, lba: u32) u32 {
     return c[0].trackCount;
 }
 
-// Pregap sector layout: byte 0 = 0x00, bytes 1..10 = 0xFF (sync pattern),
-// byte 11 = 0x00, the rest zero. Local
-// duplicate of disc.fillPregapSector - keeps cue.jam acyclic (disc
-// imports cue, not the other way around).
 fn fillPregap(buf: *mut[] u8) {
     var i: u32 = 0;
     while (i < SECTOR) { buf[i] = 0; i = i + 1; }
@@ -352,7 +323,7 @@ fn fillPregap(buf: *mut[] u8) {
     while (i < 11) { buf[i] = 0xFF; i = i + 1; }
 }
 
-// Read a 2352-byte sector at the given absolute LBA. Returns 1 on
+// read a sector at the given absolute LBA. Returns 1 on
 // success, 0 on out-of-range or read failure.
 pub fn cueRead(raw: *mut[] u8, lba: u32, buf: *mut[] u8) i32 {
     var c: *mut[] Cue = raw as *mut[] Cue;
@@ -393,11 +364,6 @@ pub fn cueQuery(raw: *mut[] u8, lba: u32) u32 {
     return 0;
 }
 
-// parser
-//
-// Stream the .cue text char-by-char (fgetc model). Each keyword
-// dispatches to its handler; FILE pushes onto files[], TRACK pushes
-// onto tracks[] with the most recent file, INDEX records its MSF.
 pub fn cueParse(raw: *mut[] u8, path: []u8) i32 {
     var c: *mut[] Cue = raw as *mut[] Cue;
     match (File.open(path)) {
@@ -405,19 +371,6 @@ pub fn cueParse(raw: *mut[] u8, path: []u8) i32 {
         None { return 1; }
     }
     c[0].cur = c[0].file.readByte() as u32 & 0xFF;
-    // Resolve any symlinks in the .cue path so the rootPath we extract is
-    // the directory of the actual file. Without this, a symlinked
-    // `./game.cue` whose target lives elsewhere produces rootPath="./",
-    // and the FILE entries in the .cue (which use basenames) fail to
-    // open relative to "./".
-    //
-    // access(path, 4) above already confirmed the file is readable, so
-    // realpath() should succeed; we still pre-fill the buffer with the
-    // original path as a fallback for the unlikely failure case (Jam
-    // can't null-check pointer returns).
-    // 4096 = PATH_MAX-ish, fits any realistic resolved path on
-    // macOS/Linux. Array literal [0; N] already zero-fills the
-    // buffer; no memset needed.
     var resolved: [4096]u8 = [0; 4096];
     var pi: u32 = 0;
     while (path[pi] != 0 && pi < 4095) {
@@ -441,8 +394,6 @@ pub fn cueParse(raw: *mut[] u8, path: []u8) i32 {
     c[0].rootLen = lastSlash;
 
     skipWs(raw);
-    // 16 bytes is the longest CUE keyword (FILE/TRACK/INDEX/REM/etc.)
-    // plus a little slack; parseKeyword bounds itself to this size.
     var kwbuf: [16]u8 = [0; 16];
 
     while (!c[0].file.eof()) {
@@ -464,7 +415,6 @@ pub fn cueParse(raw: *mut[] u8, path: []u8) i32 {
         }
         skipWs(raw);
     }
-    // kwbuf / resolved auto-drop at function-scope exit.
     c[0].file.close();
     cueComputeRanges(raw);
     return 0;

@@ -38,7 +38,7 @@ const C0_CAUSE: u32 = 13;
 // hang), plus slack. Filled with 0 via typed slot writes (safe; the u32
 // loop collapses to a memset at -O1+). The Buf owns the allocation -
 // its drop frees on scope exit, no irqFree helper needed.
-pub fn irqAlloc() Vec(u32) { return Vec(u32).filled(0, 16); }
+pub fn createIrq() Vec(u32) { return Vec(u32).filled(0, 16); }
 
 // Update COP0_CAUSE.IP2 based on the current (stat & mask). Called
 // after every write and every irqRaise so the CPU sees the right

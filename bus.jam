@@ -5,25 +5,25 @@
 // buffers and the four device state buffers (gpu, dma, irq, timer).
 const { Gpu } = import("gpu");
 const { dmaRead32, dmaRead16, dmaRead8,
-        dmaWrite32, dmaWrite16, dmaWrite8, dmaAlloc } = import("dma");
+        dmaWrite32, dmaWrite16, dmaWrite8, createDma } = import("dma");
 const { irqRead32, irqRead16, irqRead8,
-        irqWrite32, irqWrite16, irqWrite8, irqAlloc } = import("irq");
+        irqWrite32, irqWrite16, irqWrite8, createIrq } = import("irq");
 const { Vec } = import("std/collections");
 const { Timer } = import("timer");
-const { gteAlloc } = import("gte");
+const { createGte } = import("gte");
 const std = import("std");
 const { Cdrom } = import("cdrom");
-const { Disc, discAlloc, discClose } = import("disc");
+const { Disc, createDisc, discClose } = import("disc");
 const { Box } = import("std/box");
 const { padRead32, padRead16, padRead8,
         padWrite32, padWrite16, padWrite8,
-        padAlloc } = import("pad");
+        createPad } = import("pad");
 const { spuRead32, spuRead16, spuRead8,
         spuWrite32, spuWrite16, spuWrite8,
-        spuAlloc, spuRamAlloc } = import("spu");
-const { Mdec, mdecInputAlloc, mdecOutputAlloc } = import("mdec");
+        createSpu, createSpuRam } = import("spu");
+const { Mdec, createMdecInput, createMdecOutput } = import("mdec");
 const { Sio1 } = import("sio1");
-const { Mcd, mcdRamAlloc } = import("mcd");
+const { Mcd, createMcdRam } = import("mcd");
 
 pub const Bus = struct {
     ram:  Vec(u8),
@@ -147,7 +147,7 @@ pub fn route(paddr: u32) BusRoute {
     return r;
 }
 
-pub fn allocBus() Bus {
+pub fn createBus() Bus {
     // RAM/BIOS are zero-initialised.
     //
     // note!!! On Darwin uninitialised pages happen to read as zero (NOP),
@@ -173,21 +173,21 @@ pub fn allocBus() Bus {
     var b: Bus = Bus {
         ram: ram, bios: bios, spad: spad, io: io, vram: vram,
         gpu:   Gpu.init(),
-        dma:   dmaAlloc(),
-        irq:   irqAlloc(),
+        dma:   createDma(),
+        irq:   createIrq(),
         timer: Timer.init(),
-        gte:   gteAlloc(),
+        gte:   createGte(),
         cdrom: Cdrom.init(),
-        disc:  discAlloc(),
-        pad:   padAlloc(),
-        spu:    spuAlloc(),
-        spuram: spuRamAlloc(),
+        disc:  createDisc(),
+        pad:   createPad(),
+        spu:    createSpu(),
+        spuram: createSpuRam(),
         mdec:    Mdec.init(),
-        mdecIn:  mdecInputAlloc(),
-        mdecOut: mdecOutputAlloc(),
+        mdecIn:  createMdecInput(),
+        mdecOut: createMdecOutput(),
         sio1:    Sio1.init(),
         mcd:     Mcd.init(),
-        mcdRam:  mcdRamAlloc(),
+        mcdRam:  createMcdRam(),
         biosLoaded: 0,
     };
     return b;

@@ -18,7 +18,7 @@
 // real discs prefix the data with 2 seconds (150 sectors) of pregap
 // that's not part of the image file.
 
-const { Cue, cueAlloc, cueReset, cueParse, cueRead, cueQuery,
+const { Cue, createCue, cueReset, cueParse, cueRead, cueQuery,
         cueGetTrackCount, cueGetTrackLba, cueGetTrackNumber } = import("cue");
 
 const { Box } = import("std/box");
@@ -49,14 +49,14 @@ pub const Disc = struct {
 // (discOpen / discRead / ...) still take a raw `*mut[] Disc` so the
 // callsites can keep the `d[0].field` idiom; callers extract the raw
 // pointer with `box.ptrMut()`.
-pub fn discAlloc() Box(Disc) {
+pub fn createDisc() Box(Disc) {
     return Box(Disc).init(Disc {
         file:    File { handle: 0 as *mut[] u8 },
         loaded:  0,
         isCue:   0,
         pad1:    0,
         pad2:    0,
-        cuePtr:  cueAlloc(),
+        cuePtr:  createCue(),
     });
 }
 

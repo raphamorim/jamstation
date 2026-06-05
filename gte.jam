@@ -103,7 +103,7 @@ const GTE_UNR_TABLE: [257]u8 = [
 ];
 
 // Owned GTE-register buffer (zero-initialised). Auto-drops with the Bus.
-pub fn gteAlloc() Vec(u32) { return Vec(u32).filled(0, GTE_REGS); }
+pub fn createGte() Vec(u32) { return Vec(u32).filled(0, GTE_REGS); }
 
 // Data and control share the same storage buffer: data at index 0..31,
 // control at index 32..63.

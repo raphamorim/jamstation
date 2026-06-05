@@ -1,6 +1,6 @@
 // SPU - Sound Processing Unit.
 //
-// Layout of the byte buffer returned by spuAlloc:
+// Layout of the byte buffer returned by createSpu:
 //   0x000..0x3FF : register file (the voice[24] register slots + globals)
 //   0x400..      : 24 × VS_SIZE per-voice runtime data (playing, counter,
 //                  current_addr, ADSR state, decoded buf[28], etc.)
@@ -32,7 +32,7 @@ const CD_FIFO_CAP:    u32 = 1024;        // entries (power of two)
 const CD_FIFO_MASK:   u32 = 1023;
 // Gaussian-interpolation coefficient table - 512 i16 entries =
 // 1024 bytes. The standard PSX Gaussian table. Populated by
-// spuGaussInit at spuAlloc time so we don't need a runtime fopen.
+// spuGaussInit at createSpu time so we don't need a runtime fopen.
 const SPU_GAUSS_OFF:   u32 = 0x6D00;
 const SPU_STATE_SIZE: u32 = 0x6D00 + 1024; // 0x7100
 const SPU_RAM_SIZE:   u32 = 0x80000;
@@ -244,7 +244,7 @@ fn spuStepNoise(s: *mut[] u8, spucnt: u32) {
 // Owned SPU-state buffer (~29KB). Initialised via setU16 + spuGaussInit
 // (reset values: all voices ended, irq9addr = 0xFFFF). Auto-drops
 // with the Bus.
-pub fn spuAlloc() Vec(u8) {
+pub fn createSpu() Vec(u8) {
     var b: Vec(u8) = Vec(u8).filled(0, SPU_STATE_SIZE);
     var p: *mut[] u8 = b.ptr;
     setU16(p, R_ENDXL, 0xFFFF);
@@ -256,7 +256,7 @@ pub fn spuAlloc() Vec(u8) {
 
 // Owned SPU sample-RAM buffer (512 KB), zero-initialised. Auto-drops
 // with the Bus.
-pub fn spuRamAlloc() Vec(u8) { return Vec(u8).filled(0, SPU_RAM_SIZE); }
+pub fn createSpuRam() Vec(u8) { return Vec(u8).filled(0, SPU_RAM_SIZE); }
 
 // CD-audio FIFO
 //
@@ -1063,7 +1063,7 @@ pub fn spuUpdate(s: *mut[] u8, ram: *mut[] u8,
 // Replaces the previous nearest-neighbor sample lookup with the 4-tap
 // Gaussian filter PSX hardware uses. Lookup table lives at offset
 // SPU_GAUSS_OFF inside the SPU state buffer, populated once at
-// spuAlloc via spuGaussInit. Per-sample math:
+// createSpu via spuGaussInit. Per-sample math:
 //
 //   idx = (counter >> 4) & 0xff
 //   out = (table[0x0FF - idx] * s3

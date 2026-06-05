@@ -74,7 +74,7 @@ const DEST_MCD: u32 = 0x81;
 const JOY_IRQ_DELAY: u32 = 512;
 
 // Owned PAD-state buffer (32 bytes). Auto-drops with the Bus.
-pub fn padAlloc() Vec(u8) {
+pub fn createPad() Vec(u8) {
     var b: Vec(u8) = Vec(u8).filled(0, PAD_STATE_SIZE);
     // sw defaults to 0xFFFF (no buttons pressed).
     b[P_SW_LO] = 0xFF;

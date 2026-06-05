@@ -8,13 +8,13 @@ const { assert } = import("test");
 
 const {
     Bus,
-    allocBus,
+    createBus,
     busWrite32
 } = import("bus");
 
 const {
     freshCpu, freshCpuAt,
-    allocRegFile,
+    createRegFile,
     gprRead, gprWrite,
     cop0Read, cop0Write,
     run,
@@ -23,18 +23,18 @@ const {
 } = import("cpu");
 
 // Force device modules into this module's codegen context so bus.jam's
-// allocBus body (which calls gpuAlloc / dmaAlloc / etc.) resolves.
+// createBus body (which calls gpuAlloc / createDma / etc.) resolves.
 const { Gpu } = import("gpu");
-const { gteAlloc, gteExec, gteDivide,
+const { createGte, gteExec, gteDivide,
         gteDataRead, gteDataWrite, gteCtrlWrite, gteCtrlRead,
         gteOpCycles } = import("gte");
 const { Cdrom } = import("cdrom");
-const { Disc, discAlloc, discOpen } = import("disc");
-const { dmaAlloc, dmaUpdate } = import("dma");
-const { padAlloc, padUpdate } = import("pad");
-const { spuAlloc, spuRamAlloc, spuUpdate } = import("spu");
+const { Disc, createDisc, discOpen } = import("disc");
+const { createDma, dmaUpdate } = import("dma");
+const { createPad, padUpdate } = import("pad");
+const { createSpu, createSpuRam, spuUpdate } = import("spu");
 const { Sio1 } = import("sio1");
-const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
+const { createIrq, irqRaise, IC_VBLANK } = import("irq");
 const { Vec } = import("std/collections");
 const { Timer } = import("timer");
 const { Mcd } = import("mcd");
@@ -75,9 +75,9 @@ const Harness = struct {
 };
 
 fn createHarness() Harness {
-    var regs: Vec(u32) = allocRegFile(32);
-    var cop0: Vec(u32) = allocRegFile(32);
-    var bus: Bus = allocBus();
+    var regs: Vec(u32) = createRegFile(32);
+    var cop0: Vec(u32) = createRegFile(32);
+    var bus: Bus = createBus();
     var cpu: Cpu = freshCpuAt(0x80000000);
     var h: Harness = Harness { cpu: cpu, regs: regs, cop0: cop0, bus: bus };
     return h;
@@ -337,7 +337,7 @@ tfn psxLwlLwr()         { assert(tLwlLwr(), 0xBBCCDD11); }
 
 // GTE (COP2) unit tests
 //
-// gteAlloc gives a standalone register buffer, so the math ops can be
+// createGte gives a standalone register buffer, so the math ops can be
 // exercised without a full Bus. These lock in the GTE fixes:
 // RTPS stores MAC >> sf (not the raw 44-bit sum), MFC2 sign-extends the
 // 16-bit registers, and the perspective divide uses the UNR LUT.
@@ -352,7 +352,7 @@ fn gteSetIdentity(g: *mut[] u32) {
 }
 
 fn tGteRtpsMac() u32 {
-    var g: Vec(u32) = gteAlloc();
+    var g: Vec(u32) = createGte();
     gteSetIdentity(g.ptr);
     gteDataWrite(g.ptr, 0, (200 << 16) | 100);    // V0 = (100, 200, z)
     gteDataWrite(g.ptr, 1, 300);                   // V0.z = 300
@@ -363,7 +363,7 @@ fn tGteRtpsMac() u32 {
 }
 
 fn tGteRtpsIr() u32 {
-    var g: Vec(u32) = gteAlloc();
+    var g: Vec(u32) = createGte();
     gteSetIdentity(g.ptr);
     gteDataWrite(g.ptr, 0, (200 << 16) | 100);
     gteDataWrite(g.ptr, 1, 300);
@@ -373,20 +373,20 @@ fn tGteRtpsIr() u32 {
 }
 
 fn tGteIrSext() u32 {
-    var g: Vec(u32) = gteAlloc();
+    var g: Vec(u32) = createGte();
     gteDataWrite(g.ptr, 9, 0x0000FFFF);            // IR1 = -1 (16-bit)
     const v: u32 = gteDataRead(g.ptr, 9);          // MFC2 sign-extends -> -1
     return v;
 }
 
 fn tGteDivide() u32 {
-    var g: Vec(u32) = gteAlloc();
+    var g: Vec(u32) = createGte();
     const q: u32 = gteDivide(g.ptr, 0x800, 0x1000); // 2048/4096 -> 0x8000
     return q;
 }
 
 fn tGteDivideOvf() u32 {
-    var g: Vec(u32) = gteAlloc();
+    var g: Vec(u32) = createGte();
     const q: u32 = gteDivide(g.ptr, 0x2000, 0x1000); // n >= 2d -> saturates
     return q;
 }
@@ -395,7 +395,7 @@ fn tGteDivideOvf() u32 {
 // 0x7FFFF000 with bit 31 synthesized from the 0x7F87E000 error summary.
 
 fn tGteSqrFlag() u32 {
-    var g: Vec(u32) = gteAlloc();
+    var g: Vec(u32) = createGte();
     gteDataWrite(g.ptr, 9, 0x7FFF);            // IR1 = 32767
     gteExec(g.ptr, 0x4A080028);                // SQR, sf=12 -> MAC1=262143, IR1 saturates
     const f: u32 = gteCtrlRead(g.ptr, 31);     // bit 24 (IR1 sat) + bit 31 summary
@@ -403,14 +403,14 @@ fn tGteSqrFlag() u32 {
 }
 
 fn tGteDivideFlag() u32 {
-    var g: Vec(u32) = gteAlloc();
+    var g: Vec(u32) = createGte();
     const q: u32 = gteDivide(g.ptr, 0x2000, 0x1000);  // n>=2d -> bit 17 (divide ovf)
     const f: u32 = gteCtrlRead(g.ptr, 31);            // bit 17 + bit 31 summary
     return f;
 }
 
 fn tGteNoFlag() u32 {
-    var g: Vec(u32) = gteAlloc();
+    var g: Vec(u32) = createGte();
     gteDataWrite(g.ptr, 9, 100);               // IR1 = 100
     gteExec(g.ptr, 0x4A080028);                // SQR sf=12 -> MAC1=2, no saturation
     const f: u32 = gteCtrlRead(g.ptr, 31);     // FLAG must be clean
@@ -423,7 +423,7 @@ fn tGteNoFlag() u32 {
 // old plain IR clamp keyed bit 22 off the unshifted 0x100000 and wrongly
 // set it (FLAG = 0x400000; bit 22 is excluded from the bit-31 summary).
 fn tGteRtpsClampIrZ() u32 {
-    var g: Vec(u32) = gteAlloc();
+    var g: Vec(u32) = createGte();
     gteSetIdentity(g.ptr);
     gteDataWrite(g.ptr, 0, 0);                 // V0 = (0, 0, z)
     gteDataWrite(g.ptr, 1, 256);               // V0.z = 256
@@ -437,7 +437,7 @@ fn tGteRtpsClampIrZ() u32 {
 // overflow) - even though the full MAC1 sum (RT12=-0x8000 pulls it back)
 // stays in 44-bit range, which is all the old single clamp_mac saw.
 fn tGteMvmvaNestedOvf() u32 {
-    var g: Vec(u32) = gteAlloc();
+    var g: Vec(u32) = createGte();
     gteCtrlWrite(g.ptr, 5, 0x7FFFFFFF);        // TRX = max
     gteCtrlWrite(g.ptr, 0, 0x80007FFF);        // RT11 = 0x7FFF, RT12 = -0x8000
     gteCtrlWrite(g.ptr, 1, 0);                  // RT13 = 0
@@ -454,7 +454,7 @@ fn tGteMvmvaNestedOvf() u32 {
 // gte.cpp:343). The old `(g[9] as i32)` bit-cast read IR1=-1 as +65535 -> 0x1F;
 // with all three IR = -1 the packed result must be 0, not 0x7FFF.
 fn tGteIrgbNeg() u32 {
-    var g: Vec(u32) = gteAlloc();
+    var g: Vec(u32) = createGte();
     gteDataWrite(g.ptr, 9, 0x0000FFFF);        // IR1 = -1
     gteDataWrite(g.ptr, 10, 0x0000FFFF);       // IR2 = -1
     gteDataWrite(g.ptr, 11, 0x0000FFFF);       // IR3 = -1
@@ -464,7 +464,7 @@ fn tGteIrgbNeg() u32 {
 // Positive packing still works after the sign-extension fix: IR1=3968->31,
 // IR2=128->1, IR3=0 ⇒ 0x1F | (1<<5) | 0 = 0x3F.
 fn tGteIrgbPos() u32 {
-    var g: Vec(u32) = gteAlloc();
+    var g: Vec(u32) = createGte();
     gteDataWrite(g.ptr, 9, 0x0F80);            // IR1 = 3968 -> >>7 = 31
     gteDataWrite(g.ptr, 10, 0x0080);           // IR2 = 128  -> >>7 = 1
     gteDataWrite(g.ptr, 11, 0x0000);           // IR3 = 0
@@ -479,7 +479,7 @@ fn tGteIrgbPos() u32 {
 // cleanly isolates whether intermediate vertices wrongly ran the DQ. With the
 // fix only V2's DQ runs -> bit 12 clear. (Pre-fix: V0/V1 saturate it -> 0x1000.)
 fn tGteRtptDqGate() u32 {
-    var g: Vec(u32) = gteAlloc();
+    var g: Vec(u32) = createGte();
     gteSetIdentity(g.ptr);
     gteCtrlWrite(g.ptr, 26, 2);                // H = 2
     gteCtrlWrite(g.ptr, 27, 0x1000);           // DQA = 4096
@@ -497,7 +497,7 @@ fn tGteRtptDqGate() u32 {
 // MAC1 = IR0*ir1f hugely overflows 255 on R alone; bits 19/20/21 masked must
 // read 0x200000 (R). The old inline clampU8 set none of these (returned 0).
 fn tGteNcdsRgbSat() u32 {
-    var g: Vec(u32) = gteAlloc();
+    var g: Vec(u32) = createGte();
     gteCtrlWrite(g.ptr, 21, 0x00010000);       // RFC large -> ir1f saturates high
     gteDataWrite(g.ptr, 8, 0x7FFF);            // IR0 = max
     gteExec(g.ptr, 0x4A000013);                // NCDS, sf=0
@@ -510,7 +510,7 @@ fn tGteNcdsRgbSat() u32 {
 // IR0 = clamp(0x10000>>12) = 16. The old s32 read used 65537, giving a huge
 // MAC0 that saturated IR0 to 0x1000. H=SZ3=4096 ⇒ div = 0x10000.
 fn tGteDqaWidth() u32 {
-    var g: Vec(u32) = gteAlloc();
+    var g: Vec(u32) = createGte();
     gteSetIdentity(g.ptr);
     gteCtrlWrite(g.ptr, 26, 0x1000);           // H = 4096
     gteCtrlWrite(g.ptr, 27, 0x00010001);       // DQA: low16=1 (s16), high bits set
@@ -626,9 +626,9 @@ fn emuPcInRamOrScratchpad(pc: u32) bool {
 }
 
 tfn emuBiosShellBoots() {
-    var regs: Vec(u32) = allocRegFile(32);
-    var cop0: Vec(u32) = allocRegFile(32);
-    var bus: Bus = allocBus();
+    var regs: Vec(u32) = createRegFile(32);
+    var cop0: Vec(u32) = createRegFile(32);
+    var bus: Bus = createBus();
     var c: Cpu = freshCpu();
     if (emuBoot(c, bus, regs.ptr, cop0.ptr) == 0) {
         return;
@@ -644,9 +644,9 @@ tfn emuBiosShellBoots() {
 tfn emuDiscBootsExec() {
     var diskPath: []u8 = "game.bin";
     if (!fileExists(diskPath)) { return; }
-    var regs: Vec(u32) = allocRegFile(32);
-    var cop0: Vec(u32) = allocRegFile(32);
-    var bus: Bus = allocBus();
+    var regs: Vec(u32) = createRegFile(32);
+    var cop0: Vec(u32) = createRegFile(32);
+    var bus: Bus = createBus();
     var c: Cpu = freshCpu();
     if (emuBoot(c, bus, regs.ptr, cop0.ptr) == 0) {
         return;
@@ -693,9 +693,9 @@ fn tCycRam() u32 {
 // base is charged before dispatch, so the cost is independent of what
 // the (zeroed) BIOS actually decodes to, as long as it isn't a GTE op.
 fn tCycBios() u32 {
-    var regs: Vec(u32) = allocRegFile(32);
-    var cop0: Vec(u32) = allocRegFile(32);
-    var bus: Bus = allocBus();
+    var regs: Vec(u32) = createRegFile(32);
+    var cop0: Vec(u32) = createRegFile(32);
+    var bus: Bus = createBus();
     var cpu: Cpu = freshCpuAt(0xBFC00000);       // KSEG1 BIOS entry
     var h: Harness = Harness { cpu: cpu, regs: regs, cop0: cop0, bus: bus };
     step(h.cpu, h.bus, h.regs.ptr, h.cop0.ptr);

@@ -233,7 +233,7 @@ pub const Mcd = struct {
 // (Buf.filled is safe for any T; optimizer collapses the u8 loop to a
 // memset at -O1+). Owned by the Bus's `mcdRam` Buf - its drop frees on
 // scope exit, no mcdRamFree helper needed.
-pub fn mcdRamAlloc() Vec(u8) {
+pub fn createMcdRam() Vec(u8) {
     return Vec(u8).filled(0, MCD_MEMORY_SIZE as u32);
 }
 

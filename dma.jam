@@ -50,7 +50,7 @@ const DICR_IRQSI: u32 = 0x80000000;
 
 // Owned DMA-state buffer. d[21] = DPCR is pre-set to its reset default
 // (0x07654321). Auto-drops with the Bus.
-pub fn dmaAlloc() Vec(u32) {
+pub fn createDma() Vec(u32) {
     var b: Vec(u32) = Vec(u32).filled(0, DMA_STATE_WORDS);
     b[21] = 0x07654321;
     return b;

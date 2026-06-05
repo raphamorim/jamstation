@@ -10,26 +10,26 @@
 
 const {
     Bus,
-    allocBus, busRead32, busRead16, busRead8,
+    createBus, busRead32, busRead16, busRead8,
     busWrite32, busWrite16, busWrite8
 } = import("bus");
 // Force device modules into main.jam's codegen context.
 const { Gpu } = import("gpu");
-const { gteAlloc } = import("gte");
+const { createGte } = import("gte");
 const { Cdrom } = import("cdrom");
-const { Disc, discAlloc, discOpen } = import("disc");
-const { dmaAlloc, dmaTickSpu, dmaUpdate } = import("dma");
-const { padAlloc, padUpdate, padSetButtons } = import("pad");
-const { spuAlloc, spuRamAlloc, spuGetSample } = import("spu");
+const { Disc, createDisc, discOpen } = import("disc");
+const { createDma, dmaTickSpu, dmaUpdate } = import("dma");
+const { createPad, padUpdate, padSetButtons } = import("pad");
+const { createSpu, createSpuRam, spuGetSample } = import("spu");
 const { Sio1 } = import("sio1");
 const { Mdec } = import("mdec");
-const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
+const { createIrq, irqRaise, IC_VBLANK } = import("irq");
 const { Mcd, mcdRamLoad, mcdRamSave } = import("mcd");
 const { Timer } = import("timer");
 
 const {
     freshCpu, freshCpuAt,
-    allocRegFile,
+    createRegFile,
     gprRead, gprWrite,
     cop0Read, cop0Write,
     run,
@@ -352,12 +352,12 @@ fn pathEndsWithExe(p: []u8) bool {
 }
 
 fn main() {
-    var regs: Vec(u32) = allocRegFile(32);
+    var regs: Vec(u32) = createRegFile(32);
     // 32 COP0 slots (not 16): MFC0/MTC0 take a 5-bit rd (0..31), so a
     // reserved index like $16+ must land in a valid slot rather than read/
     // write past the end. Matches PCSX-Redux's 32-entry COP0 array.
-    var cop0: Vec(u32) = allocRegFile(32);
-    var bus: Bus = allocBus();
+    var cop0: Vec(u32) = createRegFile(32);
+    var bus: Bus = createBus();
     var c: Cpu = freshCpu();
 
     // Memory card slot 1 - pull saved data from ./slot1.mcd if it
