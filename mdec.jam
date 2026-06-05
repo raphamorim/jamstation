@@ -1,38 +1,21 @@
-// MDEC - Motion Decoder.
-//
-// PSX intros (Musashi SQUARESOFT logo, Harvest Moon opening, BIOS PS-X
-// startup splash, etc.) decompress YUV macroblock data through this
-// chip. The game's flow per frame:
-//
+// MDEC is Motion Decoder.
+// basically:
 //   1. CdlReadS streams compressed sectors into RAM.
 //   2. DMA channel 0 copies input -> MDEC's input FIFO (0x1F801820).
 //   3. MDEC runs RLE-decode -> inverse-quantisation -> iDCT -> YUV->RGB.
 //   4. DMA channel 1 reads decoded RGB -> RAM.
 //   5. GPU display VRAM blit of the decoded frame.
-//
-// Without MDEC, step 4 hands the game zeros / never fires the DMA-done
-// IRQ -> game stalls on its FMV-wait loop.
-//
-// Layout: state is a flat struct of typed fields. Input/output buffers
-// stay heap-allocated separately (256KB + 1MB) so we avoid per-command
-// malloc/free.
 
 const { Vec } = import("std/collections");
 
-const MDEC_INPUT_SIZE: u32  = 0x40000;   // 256 KB
-const MDEC_OUTPUT_SIZE: u32 = 0x100000;  // 1 MB
-
-// Command-table indices (top 3 bits of cmd word).
+const MDEC_INPUT_SIZE: u32  = 0x40000;
+const MDEC_OUTPUT_SIZE: u32 = 0x100000;
 const MDEC_CMD_NOP:     u32 = 0;
 const MDEC_CMD_DECODE:  u32 = 1;
 const MDEC_CMD_SET_QT:  u32 = 2;
 const MDEC_CMD_SET_ST:  u32 = 3;
-
-// Output depth values.
 const DEPTH_4BIT:  u32 = 0;
 const DEPTH_15BIT: u32 = 3;
-
-// Zig-zag table - index into yblk in iDCT-input order.
 const ZAGZIG_INIT: [64]u8 = [
      0,  1,  8, 16,  9,  2,  3, 10,
     17, 24, 32, 25, 18, 11,  4,  5,
@@ -44,13 +27,6 @@ const ZAGZIG_INIT: [64]u8 = [
     53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
-// Aggregate MDEC state. Scalars are u32 (matching the old buffer
-// layout for ease of bit-fiddling); tables are typed arrays
-// addressable via `self.field` or `self.field.asMutPtr()`.
-//
-// yBlk / crBlk / cbBlk are 128-element i16 arrays - the iDCT
-// ping-pongs between the first 64 entries (live block) and the next
-// 64 (scratch), using a "blk + 128" scratch offset.
 pub const Mdec = struct {
     cmd:            u32,
     wordsRem:       u32,
@@ -127,28 +103,13 @@ pub const Mdec = struct {
         };
     }
 
-    // iDCT
-    //
-    // Two-pass 8×8 transform. The block (blk) provides both the input
-    // and final output; we ping-pong through the scratch slot at
-    // blk + 64 (i.e. the second half of the 128-element block array).
     pub fn realIdct(self: Self, blk: *mut[] i16) {
         idctPassPtr(blk, blk, 64, self.scale.asMutPtr());
         idctPassPtr(blk, blk, 64, self.scale.asMutPtr());
-        // Note: the iDCT ping-pongs blk↔scratch via 64-entry offset.
-        // Our 128-entry block holds both. After the two passes the
-        // final result lives in blk[0..64].
     }
 
-    // RLE block decode
-    //
-    // Reads 16-bit words from `input` starting at `inIdx`. Decodes one
-    // block into `blk` (a 128-entry i16 array; lower 64 are the live
-    // block, upper 64 the iDCT scratch). `quant` selects Y or UV.
-    // Returns the new input word index.
     pub fn rlDecodeBlock(self: Self, input: *mut[] u8, inIdx: u32,
                          blk: *mut[] i16, quant: *mut[] u8) u32 {
-        // Clear the live block.
         var i: u32 = 0;
         while (i < 64) {
             blk[i] = 0;
@@ -193,7 +154,6 @@ pub const Mdec = struct {
         return idx;
     }
 
-    // YUV -> RGB
     pub fn yuvToRgb(self: Self, output: *mut[] u8, outBase: u32,
                     xx: u32, yy: u32) {
         const depth: u32 = self.outputDepth;
@@ -208,8 +168,6 @@ pub const Mdec = struct {
                 const rRaw: i32 = self.crBlk[cri] as i32;
                 const bRaw: i32 = self.cbBlk[cri] as i32;
 
-                // YUV->RGB coefficients (float): g = -0.3437*b + -0.7143*r;
-                //                               r = 1.402*r;  b = 1.772*b.
                 const rf: f64 = rRaw as f64;
                 const bf: f64 = bRaw as f64;
                 const gFloat: f64 = (0.0 - 0.3437) * bf + (0.0 - 0.7143) * rf;
@@ -251,13 +209,11 @@ pub const Mdec = struct {
         }
     }
 
-    // decode macroblock
     pub fn decodeMacroblock(self: mut Self,
                             input: *mut[] u8, output: *mut[] u8) {
         const depth: u32 = self.outputDepth;
         const inputBytes: u32 = self.inputSizeB;
         if (depth < 2) {
-            // 4-bit / 8-bit mono - single Y block per macroblock.
             self.rlDecodeBlock(input, 0, self.yBlk.asMutPtr(),
                                self.yQuant.asMutPtr());
             var i: u32 = 0;
@@ -266,20 +222,22 @@ pub const Mdec = struct {
                 output[i] = (yv & 0xFF) as u8;
                 i = i + 1;
             }
-            var words: u32 = 16;   // 64 bytes / 4
-            if (depth == DEPTH_4BIT) { words = 8; }
+            var words: u32 = 16;
+            if (depth == DEPTH_4BIT) {
+                words = 8;
+            }
             self.outputWords = words;
             self.outputEmpty = 0;
             self.outputIndex = 0;
             return;
         }
-        // 24-bit (depth=2) / 15-bit (depth=3) - full YUV macroblock.
-        var blockSize: u32 = 768;     // 16×16×3 (24-bit)
-        if (depth == DEPTH_15BIT) { blockSize = 512; }   // 16×16×2
+        var blockSize: u32 = 768;
+        if (depth == DEPTH_15BIT) {
+            blockSize = 512;
+        }
 
-        var idx: u32 = 0;          // word index into input buffer
+        var idx: u32 = 0;
         var outBytes: u32 = 0;
-        // Each macroblock: Cr, Cb, Y0, Y1, Y2, Y3 -> 16×16 RGB.
         while (idx * 2 < inputBytes) {
             const outBase: u32 = outBytes;
             idx = self.rlDecodeBlock(input, idx,
@@ -313,7 +271,6 @@ pub const Mdec = struct {
         self.outputIndex = 0;
     }
 
-    // command dispatch (write to 0x1F801820)
     pub fn setQt(self: mut Self, input: *mut[] u8) {
         var i: u32 = 0;
         while (i < 64) {
@@ -335,7 +292,6 @@ pub const Mdec = struct {
             const lo: u32 = input[i * 2]     as u32;
             const hi: u32 = input[i * 2 + 1] as u32;
             var v: u32 = (hi << 8) | lo;
-            // Sign-extend the 16-bit value into the i16 field.
             if ((v & 0x8000) != 0) { v = v | 0xFFFF0000; }
             self.scale[i] = v as i16;
             i = i + 1;
@@ -360,10 +316,8 @@ pub const Mdec = struct {
         }
     }
 
-    // bus dispatch
     pub fn read32(self: mut Self, output: *mut[] u8, off: u32) u32 {
         if (off == 0) {
-            // Data port - drain one word from the output buffer.
             const wordsRem: u32 = self.outputWords;
             if (wordsRem > 0) {
                 const idx: u32 = self.outputIndex;
@@ -378,28 +332,14 @@ pub const Mdec = struct {
             return 0xAAAAAAAA;
         }
         if (off == 4) {
-            // Status register.
             // Bits 0-15 = "number of parameter words remaining MINUS 1"
             // (nocash: FFFFh = none). DuckStation `(remaining/2)-1`, Avocado
-            // `(paramCount-1)&0xffff`, mednafen's 0xFFFF sentinel all agree;
-            // the old jam code reported the raw count, so a game
-            // that polls for (status & 0xFFFF)==0xFFFF after a SET_QT/SET_ST
-            // upload to confirm "no params pending" never saw it and never
-            // advanced to DECODE. wordsRem is u32, so 0-1 wraps to 0xFFFF here.
+            // `(paramCount-1)&0xffff`, mednafen's 0xFFFF sentinel all agree
             var st: u32 = (self.wordsRem - 1) & 0xFFFF;
             st = st | ((self.curBlock & 0x7) << 16);
             if (self.outputBit15  != 0) { st = st | (1 << 23); }
             if (self.outputSigned != 0) { st = st | (1 << 24); }
             st = st | ((self.outputDepth & 3) << 25);
-            // Request bits 27/28 and Data-Out FIFO Empty (31) are LEVELS
-            // recomputed here, NOT latched: bit 27 = DMA1 enabled AND output
-            // has data; bit 28 = DMA0 enabled AND more input wanted; bit 31 =
-            // output drained. Matches nocash psx-spx, DuckStation
-            // (`enable_dma_out && !out_fifo.empty()`) and Avocado. Latching
-            // outputReq at the final decode word instead would mean a game that
-            // enables DMA1 AFTER the decode reads bit 27 = 0 forever and never
-            // DMAs the MDEC output back out -- the frame decodes but is never
-            // read (FMV skip).
             if (self.enableDma1 != 0 && self.outputWords > 0) { st = st | (1 << 27); }
             if (self.enableDma0 != 0 && self.wordsRem  > 0) { st = st | (1 << 28); }
             if (self.busy         != 0) { st = st | (1 << 29); }
@@ -421,8 +361,6 @@ pub const Mdec = struct {
     pub fn write32(self: mut Self, input: *mut[] u8, output: *mut[] u8,
                    off: u32, val: u32) {
         if (off == 0) {
-            // Data port. Either streaming command parameters or the
-            // command word itself when wordsRem == 0.
             const wordsRem: u32 = self.wordsRem;
             if (wordsRem > 0) {
                 const idx: u32 = self.inputIndex;
@@ -431,12 +369,6 @@ pub const Mdec = struct {
                 self.wordsRem = wordsRem - 1;
                 if (wordsRem - 1 == 0) {
                     self.outputEmpty = 0;
-                    // dispatch() consumes the whole input FIFO synchronously,
-                    // so by the time the guest reads status the data-in FIFO is
-                    // empty (bit30 = 0), NOT full. The old `inputFull = 1` left
-                    // bit30 stuck at 1 after a SET_QT/SET_ST upload, so a game
-                    // that polls "in-FIFO not full" before issuing the next
-                    // command (the DECODE) would wait forever. Refs report 0.
                     self.inputFull = 0;
                     self.inputReq = 0;
                     self.busy = 0;
@@ -449,10 +381,6 @@ pub const Mdec = struct {
             self.cmd = val;
             self.outputReq = 0;
             self.outputEmpty = 1;
-            // Clear any stale output count from a prior decode so status
-            // bit 31 (out-FIFO-empty) and bit 27 (out-request) read correctly
-            // after a SET_QT/SET_ST that doesn't write output (duckstation
-            // clears the out FIFO on every command parse, mdec.cpp:433).
             self.outputWords = 0;
             self.outputBit15  = (val >> 25) & 1;
             self.outputSigned = (val >> 26) & 1;
@@ -468,7 +396,11 @@ pub const Mdec = struct {
                 newWords = val & 0xFFFF;
             } else if (op == MDEC_CMD_SET_QT) {
                 self.recvColor = val & 1;
-                if ((val & 1) != 0) { newWords = 32; } else { newWords = 16; }
+                if ((val & 1) != 0) {
+                    newWords = 32;
+                } else {
+                    newWords = 16;
+                }
             } else if (op == MDEC_CMD_SET_ST) {
                 newWords = 32;
             }
@@ -483,10 +415,17 @@ pub const Mdec = struct {
         }
         if (off == 4) {
             // Control register.
-            if ((val & 0x40000000) != 0) { self.enableDma0 = 1; }
-            else                         { self.enableDma0 = 0; }
-            if ((val & 0x20000000) != 0) { self.enableDma1 = 1; }
-            else                         { self.enableDma1 = 0; }
+            if ((val & 0x40000000) != 0) {
+                self.enableDma0 = 1;
+            } else {
+                self.enableDma0 = 0;
+            }
+
+            if ((val & 0x20000000) != 0) {
+                self.enableDma1 = 1;
+            } else {
+                self.enableDma1 = 0;
+            }
             if ((val & 0x80000000) != 0) {
                 // Reset - status = 0x80040000.
                 self.busy = 0;
@@ -498,10 +437,6 @@ pub const Mdec = struct {
                 self.outputReq = 0;
                 self.inputFull = 0;
                 self.outputEmpty = 1;
-                // Status bit 31 (out-FIFO-empty) is computed from outputWords,
-                // so it must be cleared here too or a reset issued with
-                // undrained output would report not-empty (duckstation SoftReset
-                // clears the out FIFO, mdec.cpp:330-344).
                 self.outputWords = 0;
                 self.outputIndex = 0;
                 self.curBlock = 4;
@@ -521,13 +456,13 @@ pub const Mdec = struct {
     }
 };
 
-// input/output buffer allocation (still heap-resident)
+pub fn createMdecInput()  Vec(u8) {
+    return Vec(u8).filled(0, MDEC_INPUT_SIZE);
+}
 
-// Owned MDEC IO buffers. Auto-drop with the Bus.
-pub fn createMdecInput()  Vec(u8) { return Vec(u8).filled(0, MDEC_INPUT_SIZE); }
-pub fn createMdecOutput() Vec(u8) { return Vec(u8).filled(0, MDEC_OUTPUT_SIZE); }
-
-// free helpers (no state required)
+pub fn createMdecOutput() Vec(u8) {
+    return Vec(u8).filled(0, MDEC_OUTPUT_SIZE);
+}
 
 pub fn exts10(v: u32) i32 {
     const t: u32 = (v << 22) & 0xFFFFFFFF;
@@ -540,10 +475,6 @@ pub fn clampS10(v: i32) i32 {
     return v;
 }
 
-// Wrap an i32 to int16. The RLE dequant product is held in an int16_t,
-// so it TRUNCATES before the CLAMP(-0x400,0x3ff). For products past
-// int16 range the wrap can flip the sign and clamp to the opposite
-// bound - must be applied pre-clamp.
 pub fn mdecTrunc16(v: i32) i32 {
     return ((v & 0xFFFF) ^ 0x8000) - 0x8000;
 }
@@ -572,14 +503,8 @@ pub fn writeU32(buf: *mut[] u8, off: u32, v: u32) {
     buf[off + 3] = ((v >> 24) & 0xFF) as u8;
 }
 
-// iDCT pass operating on i16 pointers + scale table. The block is
-// 128 entries - the live block lives in [0..64], scratch in [64..128].
-// `scratchOff` is the index offset (64) into the same buffer for the
-// secondary pass. We pingpong by indexing through that offset.
 pub fn idctPassPtr(blk: *mut[] i16, _dst: *mut[] i16,
                    _scratchOff: u32, scale: *mut[] i16) {
-    // Pass: write into the scratch half, then copy back. This is the
-    // two-pass iDCT via a 64-entry temp.
     var scratch: [64]i16 = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
                             0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
                             0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,

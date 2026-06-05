@@ -1,20 +1,3 @@
-// SPU - Sound Processing Unit.
-//
-// Layout of the byte buffer returned by createSpu:
-//   0x000..0x3FF : register file (the voice[24] register slots + globals)
-//   0x400..      : 24 × VS_SIZE per-voice runtime data (playing, counter,
-//                  current_addr, ADSR state, decoded buf[28], etc.)
-//   0x1C00..     : global runtime state (taddr, tfifo, even_cycle, revbaddr)
-//
-// Not yet wired up right now:
-//   - No reverb (the whole reverb-sample path is skipped)
-//   - No Gaussian interpolation (nearest-neighbor: `out = s[0]`)
-//   - No SDL audio callback yet - spuGetSample is exported but unused
-//
-// What is in: ADPCM block decoder, ADSR (Attack/Decay/Sustain/Release),
-// KON/KOFF, ENDX, voice mixing, master volume. Enough to produce real
-// samples; we'll wire SDL audio + reverb after this lands clean.
-
 const { irqRaise, IC_SPU } = import("irq");
 
 const { Vec } = import("std/collections");
@@ -23,21 +6,14 @@ const SPU_REG_SIZE:   u32 = 0x400;
 const VS_SIZE:        u32 = 256;
 const VOICE_COUNT:    u32 = 24;
 const VOICE_BASE:     u32 = 0x400;
-const GLOBAL_BASE:    u32 = 0x400 + 24 * 256;     // 0x1C00
-// CD-audio FIFO for XA samples decoded by cdrom.jam. Producer = cdrom
-// XA path, consumer = spuGetSample (one stereo sample per call). 1024
-// stereo entries × 4 bytes = 4 KB, lives at 0x1D00.
+const GLOBAL_BASE:    u32 = 0x400 + 24 * 256;
 const CD_FIFO_BASE:   u32 = 0x1D00;
-const CD_FIFO_CAP:    u32 = 1024;        // entries (power of two)
+const CD_FIFO_CAP:    u32 = 1024;
 const CD_FIFO_MASK:   u32 = 1023;
-// Gaussian-interpolation coefficient table - 512 i16 entries =
-// 1024 bytes. The standard PSX Gaussian table. Populated by
-// spuGaussInit at createSpu time so we don't need a runtime fopen.
 const SPU_GAUSS_OFF:   u32 = 0x6D00;
-const SPU_STATE_SIZE: u32 = 0x6D00 + 1024; // 0x7100
+const SPU_STATE_SIZE: u32 = 0x6D00 + 1024;
 const SPU_RAM_SIZE:   u32 = 0x80000;
 
-// Voice-register offsets inside a 16-byte voice slot.
 const VR_VOLUMEL: u32 = 0x0;
 const VR_VOLUMER: u32 = 0x2;
 const VR_ADSAMPR: u32 = 0x4;
@@ -47,7 +23,6 @@ const VR_ENVCTL2: u32 = 0xA;
 const VR_ENVCVOL: u32 = 0xC;
 const VR_ADRADDR: u32 = 0xE;
 
-// Global register offsets (relative to 0x1F801C00).
 const R_MAINLVOL: u32 = 0x180;
 const R_MAINRVOL: u32 = 0x182;
 const R_VLOUT:    u32 = 0x184;
@@ -56,10 +31,10 @@ const R_KONL:     u32 = 0x188;
 const R_KONH:     u32 = 0x18A;
 const R_KOFFL:    u32 = 0x18C;
 const R_KOFFH:    u32 = 0x18E;
-const R_PMONL:    u32 = 0x190;   // pitch-modulation enable (voices 1..15)
-const R_PMONH:    u32 = 0x192;   // (voices 16..23)
-const R_NONL:     u32 = 0x194;   // noise-mode enable (voices 0..15)
-const R_NONH:     u32 = 0x196;   // (voices 16..23)
+const R_PMONL:    u32 = 0x190;
+const R_PMONH:    u32 = 0x192;
+const R_NONL:     u32 = 0x194;
+const R_NONH:     u32 = 0x196;
 const R_EONL:     u32 = 0x198;
 const R_EONH:     u32 = 0x19A;
 const R_ENDXL:    u32 = 0x19C;
@@ -74,10 +49,6 @@ const R_SPUSTAT:  u32 = 0x1AE;
 const R_CDVOLL:   u32 = 0x1B0;
 const R_CDVOLR:   u32 = 0x1B2;
 
-// Reverb work-area registers (nocash psx-spx). All i16 values, two
-// flavours: 'd*' / 'm*' are byte offsets into SPU RAM (multiplied by 8
-// in the reverb-sample path) and 'v*' are i16 fixed-point
-// coefficients in the range [-0x8000, 0x7FFF].
 const R_DAPF1:    u32 = 0x1C0;
 const R_DAPF2:    u32 = 0x1C2;
 const R_VIIR:     u32 = 0x1C4;
@@ -111,7 +82,6 @@ const R_MRAPF2:   u32 = 0x1FA;
 const R_VLIN:     u32 = 0x1FC;
 const R_VRIN:     u32 = 0x1FE;
 
-// Per-voice runtime offsets (added to VOICE_BASE + v * VS_SIZE).
 const D_PLAYING:    u32 = 0x00;
 const D_COUNTER:    u32 = 0x04;
 const D_CURADDR:    u32 = 0x08;
@@ -122,10 +92,10 @@ const D_S1:         u32 = 0x18;
 const D_S2:         u32 = 0x1C;
 const D_S3:         u32 = 0x20;
 const D_BFLAGS:     u32 = 0x24;
-const D_BUF0:       u32 = 0x28;   // 28 × i16 -> 56 bytes through 0x60
+const D_BUF0:       u32 = 0x28;
 const D_H0:         u32 = 0x60;
 const D_H1:         u32 = 0x64;
-const D_LVOL:       u32 = 0x68;   // kept as i32 (volumel); a float would also work
+const D_LVOL:       u32 = 0x68;
 const D_RVOL:       u32 = 0x6C;
 const D_CVOL:       u32 = 0x70;
 const D_APHASE:     u32 = 0x74;
@@ -139,34 +109,24 @@ const D_APENDSTEP:  u32 = 0x90;
 const D_ASUSLVL:    u32 = 0x94;
 const D_ENVCTL:     u32 = 0x98;
 
-// Global runtime offsets (added to GLOBAL_BASE).
 const G_TADDR:      u32 = 0x00;
-const G_TFIFO:      u32 = 0x04;   // 32 × u16 = 64 bytes -> through 0x44
+const G_TFIFO:      u32 = 0x04;
 const G_TFIFO_IDX:  u32 = 0x44;
 const G_EVEN_CYC:   u32 = 0x48;
 const G_REVBADDR:   u32 = 0x4C;
 const G_LRSL:       u32 = 0x50;
 const G_LRSR:       u32 = 0x54;
-// CD-audio FIFO head/tail. 32-bit ring indices that mod-mask down to
-// CD_FIFO_MASK for the slot. Producer-only writes head; consumer-only
-// writes tail. Equal head == tail -> empty.
 const G_CD_HEAD:    u32 = 0x60;
 const G_CD_TAIL:    u32 = 0x64;
-// Noise generator state (free space before CD_FIFO_BASE=0x1D00): the 16-bit
-// LFSR level and the 32-bit fractional clock accumulator. Ticked once per
-// output sample by spuStepNoise; voices with their NON bit set output the
-// LFSR level instead of their ADPCM sample.
 const G_NOISE_LEVEL: u32 = 0x70;
 const G_NOISE_COUNT: u32 = 0x74;
 
-// ADSR phases.
 const ADSR_ATTACK:  u32 = 0;
 const ADSR_DECAY:   u32 = 1;
 const ADSR_SUSTAIN: u32 = 2;
 const ADSR_RELEASE: u32 = 3;
 const ADSR_END:     u32 = 4;
 
-// ADPCM filter coefficient tables.
 const ADPCM_POS_0: i32 =   0;
 const ADPCM_POS_1: i32 =  60;
 const ADPCM_POS_2: i32 = 115;
@@ -196,11 +156,6 @@ pub fn adpcmNeg(f: u32) i32 {
     }
 }
 
-// noise generator (Avocado/DuckStation/nocash)
-//
-// SPUCNT bits 8-13 are the noise clock: shift = bits 10-13, step = bits 8-9.
-// noiseFreqAdd is the {0,84,140,180,210} half-cycle table (index 4 = 210 is
-// the threshold, inlined below).
 fn noiseFreqAdd(step: u32) u32 {
     match (step) {
         1 { return 84; }
@@ -210,17 +165,12 @@ fn noiseFreqAdd(step: u32) u32 {
     }
 }
 
-// The 64-entry noise waveform LUT, indexed by (level >> 10) & 0x3F. It is two
-// 32-entry halves: the low half repeats {1,0,0,1,0,1,1,0} (bitmask 0x69 per
-// 8 entries), the high half its complement (0x96).
 fn noiseWaveAdd(idx: u32) u32 {
     const j: u32 = idx & 7;
     if ((idx & 0x20) != 0) { return (0x96 >> j) & 1; }
     return (0x69 >> j) & 1;
 }
 
-// Advance the LFSR once per output sample. freq = (0x8000>>shift)<<16 is
-// always a power of two, so the modulo is a mask.
 fn spuStepNoise(s: *mut[] u8, spucnt: u32) {
     const shift: u32 = (spucnt >> 10) & 0xF;
     const step:  u32 = (spucnt >> 8) & 3;
@@ -239,11 +189,6 @@ fn spuStepNoise(s: *mut[] u8, spucnt: u32) {
     setU32(s, GLOBAL_BASE + G_NOISE_COUNT, count);
 }
 
-// allocation
-
-// Owned SPU-state buffer (~29KB). Initialised via setU16 + spuGaussInit
-// (reset values: all voices ended, irq9addr = 0xFFFF). Auto-drops
-// with the Bus.
 pub fn createSpu() Vec(u8) {
     var b: Vec(u8) = Vec(u8).filled(0, SPU_STATE_SIZE);
     var p: *mut[] u8 = b.ptr;
@@ -254,52 +199,28 @@ pub fn createSpu() Vec(u8) {
     return b;
 }
 
-// Owned SPU sample-RAM buffer (512 KB), zero-initialised. Auto-drops
-// with the Bus.
 pub fn createSpuRam() Vec(u8) { return Vec(u8).filled(0, SPU_RAM_SIZE); }
-
-// CD-audio FIFO
-//
-// XA samples decoded by cdrom.jam land here as packed (left, right) i16
-// pairs. spuGetSample drains one entry per call and adds it (volume-
-// scaled by R_CDVOLL / R_CDVOLR) into the main mix. Producer drops
-// samples on full to keep the consumer in lock-step with the output
-// rate - favouring "current" audio over a runaway backlog.
 
 pub fn spuPushCdSample(s: *mut[] u8, leftI16: u32, rightI16: u32) {
     const head: u32 = getU32(s, GLOBAL_BASE + G_CD_HEAD);
     const tail: u32 = getU32(s, GLOBAL_BASE + G_CD_TAIL);
-    if ((head - tail) >= CD_FIFO_CAP) { return; }      // full -> drop
+    if ((head - tail) >= CD_FIFO_CAP) { return; }
     const slot: u32 = CD_FIFO_BASE + ((head & CD_FIFO_MASK) << 2);
     setU16(s, slot,     leftI16  & 0xFFFF);
     setU16(s, slot + 2, rightI16 & 0xFFFF);
     setU32(s, GLOBAL_BASE + G_CD_HEAD, head + 1);
 }
 
-// reverb
-//
-// PSX reverb is a 22-tap filter living in the tail of SPU RAM starting
-// at MBASE×8. The work-area is referenced through a rotating cursor
-// (revbaddr) that wraps within [mbase, 0x80000). All 32 control regs
-// (vIIR/vCOMB1..4/dAPF1/.../mLAPF2/...) are written by the CPU into
-// the SPU register file at 0x1C0..0x1FF - we just read them back here
-// and feed the filter.
-
-// Saturate a 64-bit accumulator into a signed 16-bit value.
 pub fn sat16i32(v: i32) i32 {
     if (v < -32768) { return -32768; }
     if (v > 32767)  { return 32767; }
     return v;
 }
 
-// Multiply 16-bit signed by 16-bit signed coef and shift down by 15
-// (== / 32768). This is the standard (vXxx * sample) / 32768 idiom.
 pub fn mulVol(v: i32, vol: i32) i32 {
     return (v * vol) >> 15;
 }
 
-// Read one i16 from the reverb work area at (mbase + addr + revbaddr)
-// mod (0x80000 - mbase), then masked to 0x7FFFE for halfword alignment.
 pub fn spuReadReverb(s: *mut[] u8, ram: *mut[] u8, addr: u32) i32 {
     const mbase: u32 = getU16(s, R_MBASE) << 3;
     const revb:  u32 = getU32(s, GLOBAL_BASE + G_REVBADDR);
@@ -324,15 +245,8 @@ pub fn spuWriteReverb(s: *mut[] u8, ram: *mut[] u8, addr: u32, v: i32) {
     ram[wrapped + 1] = ((w >> 8) & 0xFF) as u8;
 }
 
-// Run one reverb sample. inL/inR are the SPU's pre-reverb voice mix.
-// Returns packed (outL | outR<<16) - both already volume-scaled by
-// vLOUT / vROUT.  Called only when SPUCNT.bit7 is set (reverb master
-// enable) and on the alternating "even cycle" - the reverb-sample
-// computation is gated on the even cycle.
 pub fn spuGetReverbSample(s: *mut[] u8, ram: *mut[] u8,
                           inL: i32, inR: i32) u32 {
-    // All d*/m* values are <<3 to convert from "halfword index" to
-    // byte offset (the `<< 3`).
     const dapf1: u32 = (getU16(s, R_DAPF1)) << 3;
     const dapf2: u32 = (getU16(s, R_DAPF2)) << 3;
     const mlsame:  u32 = (getU16(s, R_MLSAME))  << 3;
@@ -372,7 +286,6 @@ pub fn spuGetReverbSample(s: *mut[] u8, ram: *mut[] u8,
     const lin: i32 = mulVol(inL, vlin);
     const rin: i32 = mulVol(inR, vrin);
 
-    // Same-side reflection (L->L, R->R).
     const sLsamePrev: i32 = spuReadReverb(s, ram, mlsame - 2);
     const sRsamePrev: i32 = spuReadReverb(s, ram, mrsame - 2);
     const sLsameNow: i32 = sat16i32(lin
@@ -386,7 +299,6 @@ pub fn spuGetReverbSample(s: *mut[] u8, ram: *mut[] u8,
     spuWriteReverb(s, ram, mlsame, sLsameNow);
     spuWriteReverb(s, ram, mrsame, sRsameNow);
 
-    // Cross-side reflection (L->R, R->L).
     const sLdiffPrev: i32 = spuReadReverb(s, ram, mldiff - 2);
     const sRdiffPrev: i32 = spuReadReverb(s, ram, mrdiff - 2);
     const sLdiffNow: i32 = sat16i32(lin
@@ -400,7 +312,6 @@ pub fn spuGetReverbSample(s: *mut[] u8, ram: *mut[] u8,
     spuWriteReverb(s, ram, mldiff, sLdiffNow);
     spuWriteReverb(s, ram, mrdiff, sRdiffNow);
 
-    // Early-echo (4-tap comb).
     var l: i32 = sat16i32(
         mulVol(spuReadReverb(s, ram, mlcomb1), vcomb1)
       + mulVol(spuReadReverb(s, ram, mlcomb2), vcomb2)
@@ -412,7 +323,6 @@ pub fn spuGetReverbSample(s: *mut[] u8, ram: *mut[] u8,
       + mulVol(spuReadReverb(s, ram, mrcomb3), vcomb3)
       + mulVol(spuReadReverb(s, ram, mrcomb4), vcomb4));
 
-    // Late reverb - all-pass filter 1.
     l = sat16i32(l - sat16i32(mulVol(spuReadReverb(s, ram, mlapf1 - dapf1), vapf1)));
     r = sat16i32(r - sat16i32(mulVol(spuReadReverb(s, ram, mrapf1 - dapf1), vapf1)));
     spuWriteReverb(s, ram, mlapf1, l);
@@ -420,7 +330,6 @@ pub fn spuGetReverbSample(s: *mut[] u8, ram: *mut[] u8,
     l = sat16i32(mulVol(l, vapf1) + spuReadReverb(s, ram, mlapf1 - dapf1));
     r = sat16i32(mulVol(r, vapf1) + spuReadReverb(s, ram, mrapf1 - dapf1));
 
-    // Late reverb - all-pass filter 2.
     l = sat16i32(l - sat16i32(mulVol(spuReadReverb(s, ram, mlapf2 - dapf2), vapf2)));
     r = sat16i32(r - sat16i32(mulVol(spuReadReverb(s, ram, mrapf2 - dapf2), vapf2)));
     spuWriteReverb(s, ram, mlapf2, l);
@@ -428,11 +337,9 @@ pub fn spuGetReverbSample(s: *mut[] u8, ram: *mut[] u8,
     l = sat16i32(mulVol(l, vapf2) + spuReadReverb(s, ram, mlapf2 - dapf2));
     r = sat16i32(mulVol(r, vapf2) + spuReadReverb(s, ram, mrapf2 - dapf2));
 
-    // Output stage - scale by vLOUT/vROUT.
     const outL: i32 = sat16i32(mulVol(l, vlout));
     const outR: i32 = sat16i32(mulVol(r, vrout));
 
-    // Advance the rotating reverb cursor by 2 bytes (one i16).
     const mbase: u32 = getU16(s, R_MBASE) << 3;
     var revb: u32 = getU32(s, GLOBAL_BASE + G_REVBADDR);
     revb = (revb + 2) & 0x7FFFE;
@@ -442,8 +349,6 @@ pub fn spuGetReverbSample(s: *mut[] u8, ram: *mut[] u8,
     return ((outL as u32) & 0xFFFF) | (((outR as u32) & 0xFFFF) << 16);
 }
 
-// Pop one stereo sample. Returns packed left|right<<16; on empty
-// returns 0 (both channels silent).
 pub fn spuPopCdSample(s: *mut[] u8) u32 {
     const head: u32 = getU32(s, GLOBAL_BASE + G_CD_HEAD);
     const tail: u32 = getU32(s, GLOBAL_BASE + G_CD_TAIL);
@@ -454,8 +359,6 @@ pub fn spuPopCdSample(s: *mut[] u8) u32 {
     setU32(s, GLOBAL_BASE + G_CD_TAIL, tail + 1);
     return l | (r << 16);
 }
-
-// byte-buffer access helpers
 
 pub fn getU16(s: *mut[] u8, off: u32) u32 {
     return (s[off] as u32) | ((s[off + 1] as u32) << 8);
@@ -504,9 +407,6 @@ pub fn sat16(v: i32) i32 {
     return v;
 }
 
-// Wrap an i32 to int16 (low 16 bits, sign-extended). The ADPCM
-// reconstruction assigns the sum to an int16_t, which TRUNCATES (wraps)
-// rather than saturates (a <INT16_MIN clamp would be dead code).
 pub fn wrap16(v: i32) i32 {
     return ((v & 0xFFFF) ^ 0x8000) - 0x8000;
 }
@@ -516,8 +416,6 @@ pub fn clamp7fff(v: i32) i32 {
     return v;
 }
 pub fn maxI(a: i32, b: i32) i32 { if (a > b) { return a; } return b; }
-
-// ADPCM block decoder
 
 pub fn spuReadBlock(s: *mut[] u8, ram: *mut[] u8, v: u32) {
     const base: u32 = voiceRTBase(v);
@@ -540,12 +438,10 @@ pub fn spuReadBlock(s: *mut[] u8, ram: *mut[] u8, v: u32) {
     while (j < 28) {
         const byte: u32 = ram[addr + 2 + (j >> 1)] as u32;
         const nibble: u32 = (byte >> ((j & 1) * 4)) & 0xF;
-        // Sign-extend the 4-bit nibble.
         var t: i32 = nibble as i32;
         if ((nibble & 0x8) != 0) { t = t - 16; }
         const tShifted: i32 = t << shift;
         const pred: i32 = ((h0 * f0) + (h1 * f1) + 32) / 64;
-        // wraps to int16 here (not saturates) - see wrap16.
         const sample: i32 = wrap16(tShifted + pred);
 
         h1 = h0;
@@ -557,8 +453,6 @@ pub fn spuReadBlock(s: *mut[] u8, ram: *mut[] u8, v: u32) {
     setI32(s, base + D_H0, h0);
     setI32(s, base + D_H1, h1);
 }
-
-// ADSR
 
 pub fn adsrCalcValues(s: *mut[] u8, v: u32) {
     const base: u32 = voiceRTBase(v);
@@ -661,16 +555,12 @@ pub fn spuHandleAdsr(s: *mut[] u8, v: u32) {
             setU32(s, base + D_PLAYING, 0);
         }
     } else {
-        // ADSR_END
         setU32(s, base + D_PLAYING, 0);
     }
 
-    // Mirror the envelope volume into the voice register so games can read it.
     setU16(s, voiceRegBase(v) + VR_ENVCVOL, getI32(s, base + D_CVOL) as u32);
     setI32(s, base + D_ACYCLES, getI32(s, base + D_ACYRELOAD));
 }
-
-// KON / KOFF
 
 pub fn spuKon(s: *mut[] u8, ram: *mut[] u8, value: u32) {
     var i: u32 = 0;
@@ -681,11 +571,6 @@ pub fn spuKon(s: *mut[] u8, ram: *mut[] u8, value: u32) {
             setU32(s, rt + D_PLAYING, 1);
             setU32(s, rt + D_CURADDR, getU16(s, vr + VR_ADSADDR) << 3);
             setU32(s, rt + D_REPADDR, getU16(s, vr + VR_ADRADDR) << 3);
-            // Store volumes as signed i32 (a float would also work; the
-            // multiplier matters more than the type). The volume scales by x2:
-            // lvol = (volumel / 32767) * 2. Bake the x2
-            // in here so the >>15 sample path matches reference amplitude
-            // (without it every voice plays ~6 dB too quiet).
             setI32(s, rt + D_LVOL, getI16(s, vr + VR_VOLUMEL) * 2);
             setI32(s, rt + D_RVOL, getI16(s, vr + VR_VOLUMER) * 2);
             setI32(s, rt + D_ASUSLVL,
@@ -710,8 +595,6 @@ pub fn spuKoff(s: *mut[] u8, value: u32) {
         i = i + 1;
     }
 }
-
-// write-side effects
 
 pub fn spuHandleWrite(s: *mut[] u8, ram: *mut[] u8, off: u32, val: u32) i32 {
     if (off == R_KONL || off == R_KONH) {
@@ -759,12 +642,6 @@ pub fn spuHandleWrite(s: *mut[] u8, ram: *mut[] u8, off: u32, val: u32) i32 {
         var stat: u32 = getU16(s, R_SPUSTAT);
         stat = (stat & 0xFFC0) | (val & 0x3F);
         setU16(s, R_SPUSTAT, stat);
-        // Drain any pending TFIFO data on every SPUCNT write - covers both
-        // a flush on entering an active mode AND the
-        // hardware-spec behavior (flush on transition to Stop). Critically,
-        // this puts the flush BEFORE the next setStartAddress in
-        // setupDMARead, so data lands at the original TADDR (ps1-tests
-        // spu/memory-transfer testDMAWriteToSpuRam).
         if (true) {
             var ta: u32 = getU32(s, GLOBAL_BASE + G_TADDR);
             const idx: u32 = getU32(s, GLOBAL_BASE + G_TFIFO_IDX);
@@ -789,8 +666,6 @@ pub fn spuHandleWrite(s: *mut[] u8, ram: *mut[] u8, off: u32, val: u32) i32 {
     return 0;
 }
 
-// read TFIFO
-
 pub fn spuReadTfifo(s: *mut[] u8, ram: *mut[] u8) u32 {
     var ta: u32 = getU32(s, GLOBAL_BASE + G_TADDR);
     const lo: u32 = ram[ta] as u32;
@@ -798,8 +673,6 @@ pub fn spuReadTfifo(s: *mut[] u8, ram: *mut[] u8) u32 {
     setU32(s, GLOBAL_BASE + G_TADDR, ta + 2);
     return lo | (hi << 8);
 }
-
-// bus dispatch
 
 pub fn spuRead8(s: *mut[] u8, ram: *mut[] u8, off: u32) u32 {
     if (off >= SPU_REG_SIZE) { return 0; }
@@ -825,7 +698,6 @@ pub fn spuWrite8(s: *mut[] u8, ram: *mut[] u8, off: u32, val: u32) {
 pub fn spuWrite16(s: *mut[] u8, ram: *mut[] u8, off: u32, val: u32) {
     if (off + 1 >= SPU_REG_SIZE) { return; }
     if (spuHandleWrite(s, ram, off, val & 0xFFFF) != 0) { return; }
-    // Skip writes at offset 0x0C inside the voice slot (volumer mirror).
     if ((off & 0xF) == 0xC && off < 0x180) { return; }
     setU16(s, off, val & 0xFFFF);
 }
@@ -840,8 +712,6 @@ pub fn spuWrite32(s: *mut[] u8, ram: *mut[] u8, off: u32, val: u32) {
     setU16(s, off + 2, (val >> 16) & 0xFFFF);
 }
 
-// sample mixer
-
 pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
                     ic: *mut[] u32, cop0: *mut[] u32) u32 {
     const even: u32 = getU32(s, GLOBAL_BASE + G_EVEN_CYC) ^ 1;
@@ -850,26 +720,19 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
     var left: i32 = 0;
     var right: i32 = 0;
 
-    // KON/KOFF are one-shot - zero them after dispatch each tick.
     setU16(s, R_KONL, 0);
     setU16(s, R_KONH, 0);
     setU16(s, R_KOFFL, 0);
     setU16(s, R_KOFFH, 0);
 
-    // Per-voice mode bitmasks (pitch-mod / noise / reverb), read once.
     const pmon: u32 = getU16(s, R_PMONL) | (getU16(s, R_PMONH) << 16);
     const non:  u32 = getU16(s, R_NONL)  | (getU16(s, R_NONH)  << 16);
     const eon:  u32 = getU16(s, R_EONL)  | (getU16(s, R_EONH)  << 16);
 
-    // Advance the noise LFSR once per output sample; noise-mode voices emit
-    // this level (read sign-extended for use as a sample).
     const cnt0: u32 = getU16(s, R_SPUCNT);
     spuStepNoise(s, cnt0);
     const noiseLvl: i32 = getI16(s, GLOBAL_BASE + G_NOISE_LEVEL);
 
-    // Reverb input accumulators - only EON voices feed the reverb.
-    // prevOut carries the prior voice's ADSR-scaled output
-    // for pitch modulation.
     var revL: i32 = 0;
     var revR: i32 = 0;
     var prevOut: i32 = 0;
@@ -912,14 +775,12 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
                     setU16(s, vr + VR_ENVCVOL, 0);
                     adsrLoadRelease(s, v);
                 } else {
-                    // lp == 3
                     setEndx(s, endx(s) | (1 << v));
                     setU32(s, rt + D_CURADDR, getU32(s, rt + D_REPADDR));
                 }
                 spuReadBlock(s, ram, v);
             }
 
-            // Shuffle history if sample index advanced.
             const prev: u32 = getU32(s, rt + D_PREVSI);
             if (prev != sampleIdx) {
                 setI32(s, rt + D_S3, getI32(s, rt + D_S2));
@@ -928,7 +789,6 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
             }
             const cur: i32 = getI16(s, rt + D_BUF0 + sampleIdx * 2);
             setI32(s, rt + D_S0, cur);
-            // 4-tap Gaussian interpolation.
             const gIdx: u32 = (counter >> 4) & 0xFF;
             const g0: i32 = spuGaussLookup(s, 0x0FF - gIdx);
             const g1: i32 = spuGaussLookup(s, 0x1FF - gIdx);
@@ -939,39 +799,28 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
             out = out + ((g2 * getI32(s, rt + D_S1)) >> 15);
             out = out + ((g3 * cur) >> 15);
 
-            // Noise-mode voices output the LFSR level instead of the sample.
             if (((non >> v) & 1) != 0) { out = noiseLvl; }
 
             const envc: i32 = getI16(s, vr + VR_ENVCVOL);
             const lvol: i32 = getI32(s, rt + D_LVOL);
             const rvol: i32 = getI32(s, rt + D_RVOL);
-            // Conceptually: samplel = (out * lvol) * (envcvol / 32767)
-            // i64 fused form: (out * vol * envcvol) >> 30 in one step. A
-            // single float multiply would also work; doing it in i64 avoids
-            // the precision loss of truncating after an intermediate >>15.
             const sl: i32 = (((out as i64) * (lvol as i64) * (envc as i64)) >> 30) as i32;
             const sr: i32 = (((out as i64) * (rvol as i64) * (envc as i64)) >> 30) as i32;
             left = left + sl;
             right = right + sr;
-            // EON voices also feed the reverb input.
             if (((eon >> v) & 1) != 0) { revL = revL + sl; revR = revR + sr; }
 
             var step: u32 = getU16(s, vr + VR_ADSAMPR);
-            // Pitch modulation: scale the step by the previous voice's
-            // ADSR-scaled output (DuckStation/Avocado). Voice 0 has no
-            // predecessor, so PMON has no effect there.
             if (v > 0 && ((pmon >> v) & 1) != 0) {
                 const factor: i32 = prevOut + 0x8000;
                 var sStep: i32 = step as i32;
                 if ((step & 0x8000) != 0) { sStep = (step | 0xFFFF0000) as i32; }
                 step = ((((sStep as i64) * (factor as i64)) >> 15) as u32) & 0xFFFF;
             }
-            // Clamp the pitch step to 0x3FFF (all four reference emulators).
             if (step > 0x3FFF) { step = 0x3FFF; }
             setU32(s, rt + D_PREVSI, counter >> 12);
             setU32(s, rt + D_COUNTER, counter + step);
 
-            // This voice's ADSR-scaled output, for the next voice's PMON.
             thisMod = (((out as i64) * (envc as i64)) >> 15) as i32;
         }
         prevOut = thisMod;
@@ -980,15 +829,10 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
 
     const spucnt: u32 = getU16(s, R_SPUCNT);
     if ((spucnt & 0x4000) == 0) {
-        // SPU disabled - still drain the CD FIFO so the producer
-        // doesn't back up, and return silence to the audio callback.
         const _drain: u32 = spuPopCdSample(s);
         return 0;
     }
 
-    // Mix one CD-audio sample into the voice sum. SPUCNT bit 0 = CD audio
-    // enable; when clear, the FIFO is drained (so producer doesn't back
-    // up) but the sample is muted before scaling.
     const cd: u32 = spuPopCdSample(s);
     if ((spucnt & 0x0001) != 0) {
         var cdl: i32 = (cd & 0xFFFF) as i32;
@@ -1001,20 +845,12 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
         const cdMixR: i32 = (cdr * cdvR) >> 15;
         left  = left  + cdMixL;
         right = right + cdMixR;
-        // CD audio also feeds the reverb input when SPUCNT bit 2 is set.
         if ((spucnt & 0x0004) != 0) { revL = revL + cdMixL; revR = revR + cdMixR; }
     }
 
-    // Reverb pass - gated on SPUCNT.bit 7 (REVERB master enable). The
-    // filter chews two samples per turn (the rotating revbaddr advances
-    // by 2 bytes per call) so it only fires on the even cycle and
-    // caches the result through to the odd cycle. We do the same here:
-    // recompute lrsl/lrsr when even, reuse the cached value otherwise.
     if ((spucnt & 0x0080) != 0) {
         const even: u32 = getU32(s, GLOBAL_BASE + G_EVEN_CYC);
         if (even != 0) {
-            // Reverb input is the EON-voice sum (+ CD when enabled), not the
-            // full mix - matches Avocado/DuckStation.
             const sl16: i32 = sat16(revL);
             const sr16: i32 = sat16(revR);
             const rv: u32 = spuGetReverbSample(s, ram, sl16, sr16);
@@ -1037,15 +873,7 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
     return packed;
 }
 
-// per-scanline tick
-//
-// PS1 CPU is 33.8688 MHz, SPU runs at 44.1 kHz, so 1 sample ≈ 768 CPU
-// cycles. We accumulate cycles and drain one spuGetSample per bucket.
-// This advances ADSR + voice playback at the correct rate; ENDX flips
-// naturally when a voice's release finishes. Samples are discarded for
-// now - actual audio output needs an SDL audio device.
-
-const G_SAMPLE_ACC: u32 = 0x58;        // u32, after G_LRSR
+const G_SAMPLE_ACC: u32 = 0x58;
 const CYC_PER_SAMPLE: u32 = 768;
 
 pub fn spuUpdate(s: *mut[] u8, ram: *mut[] u8,
@@ -1057,19 +885,6 @@ pub fn spuUpdate(s: *mut[] u8, ram: *mut[] u8,
     }
     setU32(s, GLOBAL_BASE + G_SAMPLE_ACC, acc);
 }
-
-// Gaussian interpolation
-//
-// Replaces the previous nearest-neighbor sample lookup with the 4-tap
-// Gaussian filter PSX hardware uses. Lookup table lives at offset
-// SPU_GAUSS_OFF inside the SPU state buffer, populated once at
-// createSpu via spuGaussInit. Per-sample math:
-//
-//   idx = (counter >> 4) & 0xff
-//   out = (table[0x0FF - idx] * s3
-//        + table[0x1FF - idx] * s2
-//        + table[0x100 + idx] * s1
-//        + table[0x000 + idx] * s0) >> 15
 
 pub fn spuGaussRow(s: *mut[] u8, off: u32,
                    a: i32, b: i32, c: i32, d: i32,
@@ -1151,9 +966,3 @@ pub fn spuGaussInit(s: *mut[] u8) {
     spuGaussRow(s, 496, 0x593A, 0x5949, 0x5958, 0x5965, 0x5971, 0x597C, 0x5986, 0x598F);
     spuGaussRow(s, 504, 0x5997, 0x599E, 0x59A4, 0x59A9, 0x59AD, 0x59B0, 0x59B2, 0x59B3);
 }
-
-// NOTE: the SDL audio callback (psone_audio_cb) lives in sdl.jam now.
-// The SPU is clocked CPU-synchronously from runOneFrame (one sample
-// per 768 cycles) for deterministic envelope state; those samples are
-// pushed into an SPSC ring buffer that the callback drains. The SPU
-// has no audio-thread coupling anymore.

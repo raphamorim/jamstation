@@ -1,19 +1,3 @@
-// COP2 / GTE - Geometry Transformation Engine.
-//
-// PSX GTE - fixed-point geometry math with saturation flags. This
-// module covers the register file (32 data +
-// 32 control regs), the register-move instructions (MFC2 / MTC2 /
-// CFC2 / CTC2 / LWC2 / SWC2), and the math ops dispatched by gteExec.
-//
-// Implemented ops: RTPS, RTPT (3xRTPS), NCLIP, OP, MVMVA, NCDS, NCDT,
-// SQR, AVSZ3, AVSZ4, DPCS, INTPL, CDP, NCCS, CC, NCS, NCT, DCPL, DPCT,
-// GPF, GPL, NCCT - all 22 GTE ops.
-//
-// Saturation FLAG bookkeeping is hardware-faithful: every clamp (IR/IR0/SXY/
-// SZ3/RGB/MAC0) ORs its FLAG bit, the 44-bit MAC overflow is truncated
-// per-term (gteCheckMac) and nested between additive terms, and bit 31 is
-// synthesized from the error summary on read.
-//
 // Data register layout (32 × u32):
 //   0  V0  (xy packed, low half of vertex 0)
 //   1  V0Z (z, low 16 bits)
@@ -47,7 +31,7 @@
 
 const { Vec } = import("std/collections");
 
-const GTE_REGS: u32 = 144;     // 0..63 = data/control regs, 64..143 = debug counters
+const GTE_REGS: u32 = 144;
 const D_V0: u32 = 0;
 const D_V0Z: u32 = 1;
 const D_SXY0: u32 = 12;
@@ -62,10 +46,7 @@ const C_OFX: u32 = 24;
 const C_OFY: u32 = 25;
 const C_FLAG: u32 = 31;
 
-// Unsigned Newton-Raphson reciprocal table for the GTE perspective
-// divide. 257 entries - the hardware uses this exact LUT, so a naive
-// integer divide diverges from hardware on the projected SX/SY by up to
-// a few units.
+// Unsigned Newton-Raphson reciprocal table for the GTE perspective divide.
 const GTE_UNR_TABLE: [257]u8 = [
     0xff, 0xfd, 0xfb, 0xf9, 0xf7, 0xf5, 0xf3, 0xf1,
     0xef, 0xee, 0xec, 0xea, 0xe8, 0xe6, 0xe4, 0xe3,
@@ -102,42 +83,30 @@ const GTE_UNR_TABLE: [257]u8 = [
     0x00,
 ];
 
-// Owned GTE-register buffer (zero-initialised). Auto-drops with the Bus.
-pub fn createGte() Vec(u32) { return Vec(u32).filled(0, GTE_REGS); }
+pub fn createGte() Vec(u32) {
+    return Vec(u32).filled(0, GTE_REGS);
+}
 
-// Data and control share the same storage buffer: data at index 0..31,
-// control at index 32..63.
-//
-// Several COP2 data registers have side effects on read/write:
-//
 //   15  SXYP   read -> mirror of SXY2; write -> push SXY FIFO
 //   28  IRGB   write -> unpack 15-bit RGB into IR1..IR3; read -> repack
 //   29  ORGB   read -> repack IR1..IR3 to 15-bit; write -> ignored (RO)
 //   30  LZCS   write -> also compute LZCR (leading sign-bit count)
 //   31  LZCR   read-only
-// Sign-extend a 16-bit value held in a u32 to full 32 bits. Several GTE
-// registers are stored as int16_t, so reading them back via MFC2/CFC2
-// sign-extends the low half.
 pub fn gteSext16(v: u32) u32 {
-    if ((v & 0x8000) != 0) { return v | 0xFFFF0000; }
+    if ((v & 0x8000) != 0) {
+        return v | 0xFFFF0000;
+    }
     return v & 0x0000FFFF;
 }
 
 pub fn gteDataRead(g: *mut[] u32, idx: u32) u32 {
     const i: u32 = idx & 0x1F;
-    if (i == 15) { return g[14]; }                  // SXYP mirrors SXY2
-    // 16-bit signed data registers: vZ (1/3/5) and IR0..IR3 (8..11) are
-    // int16_t, so MFC2 sign-extends the low half.
+    if (i == 15) { return g[14]; }
     if (i == 1 || i == 3 || i == 5 ||
         i == 8 || i == 9 || i == 10 || i == 11) {
         return gteSext16(g[i]);
     }
     if (i == 28 || i == 29) {
-        // Re-pack IR1/IR2/IR3 (>> 7, clamped 0..0x1F) into 15-bit RGB.
-        // IR is stored zero-extended in the low 16 bits, so sign-extend
-        // first (s16ToI64) - otherwise a negative IR reads as a large
-        // positive value and clamps to 0x1F instead of 0 (DuckStation
-        // gte.cpp:343 gives 0 for IR<0).
         var r: i64 = s16ToI64(g[9]) >> 7;
         var grn: i64 = s16ToI64(g[10]) >> 7;
         var b: i64 = s16ToI64(g[11]) >> 7;
@@ -158,15 +127,17 @@ pub fn gteDataWrite(g: *mut[] u32, idx: u32, val: u32) {
         // SXYP - store the value, then push SXY FIFO so the latest
         // entry slides into SXY2 and older entries shift down. Used by
         // the BIOS to pre-load screen-space vertices without RTPS.
-        g[15] = val;                                // SXYP raw
-        g[12] = g[13];                              // SXY0 ← SXY1
-        g[13] = g[14];                              // SXY1 ← SXY2
-        g[14] = val;                                // SXY2 ← new
+        // SXYP raw
+        g[15] = val;
+        // SXY0 ← SXY1
+        g[12] = g[13];
+        // SXY1 ← SXY2
+        g[13] = g[14];
+        // SXY2 ← new
+        g[14] = val;
         return;
     }
     if (i == 28) {
-        // IRGB - unpack 5-bit channels into IR1/IR2/IR3 (<< 7 to map
-        // 0..0x1F -> 0..0xF80).
         const packed: u32 = val & 0x7FFF;
         g[28] = packed;
         g[9]  = (packed & 0x1F) << 7;
@@ -179,8 +150,6 @@ pub fn gteDataWrite(g: *mut[] u32, idx: u32, val: u32) {
         return;
     }
     if (i == 30) {
-        // LZCS - write computes LZCR (count of leading sign bits, or
-        // leading zeros if the value is non-negative).
         g[30] = val;
         g[31] = gteCountLeadingSign(val);
         return;
@@ -188,10 +157,6 @@ pub fn gteDataWrite(g: *mut[] u32, idx: u32, val: u32) {
     g[i] = val;
 }
 
-// Count the number of leading bits that match bit 31 of `v`. Matches
-// the LZCS/LZCR semantic: if v has bit 31 = 0, this is the count of
-// leading zeros; if bit 31 = 1, it's the count of leading ones. Result
-// ranges from 0 to 32 (32 only for v == 0 or v == 0xFFFFFFFF).
 pub fn gteCountLeadingSign(v: u32) u32 {
     if (v == 0) { return 32; }
     if (v == 0xFFFFFFFF) { return 32; }
@@ -208,16 +173,12 @@ pub fn gteCountLeadingSign(v: u32) u32 {
 pub fn gteCtrlRead(g: *mut[] u32, idx: u32) u32 {
     const i: u32 = idx & 0x1F;
     if (i == C_FLAG) {
-        // Synthesize "any-error" bit 31 from the overflow/saturation
-        // bit-mask 0x7F87E000, mask the low garbage.
-        // Games CFC2 r63 and branch on bit 31; without this synthesis
-        // they always see "no error" even when MAC/IR saturated.
         const v: u32 = g[32 + C_FLAG] & 0x7FFFF000;
-        if ((v & 0x7F87E000) != 0) { return v | 0x80000000; }
+        if ((v & 0x7F87E000) != 0) {
+            return v | 0x80000000;
+        }
         return v;
     }
-    // 16-bit signed control registers, sign-extended on read: the three
-    // matrix m33 entries
     // (rt/l/lr -> idx 4/12/20), H (26), DQA (27), ZSF3 (29), ZSF4 (30).
     if (i == 4 || i == 12 || i == 20 ||
         i == 26 || i == 27 || i == 29 || i == 30) {
@@ -229,102 +190,92 @@ pub fn gteCtrlRead(g: *mut[] u32, idx: u32) u32 {
 pub fn gteCtrlWrite(g: *mut[] u32, idx: u32, val: u32) {
     const i: u32 = idx & 0x1F;
     if (i == C_FLAG) {
-        // Bit 31 is read-only "any-error" - strip on write so it can be
-        // resynthesized in gteCtrlRead.
         g[32 + C_FLAG] = val & 0x7FFFF000;
         return;
     }
     g[32 + i] = val;
 }
 
-// Dispatch on the bottom 6 bits of the GTE math opcode. The full table
-// covers 22 ops (RTPS=0x01, NCLIP=0x06, ..., NCCT=0x3F) - all 22 are
-// implemented below. FLAG is cleared at the top of every op.
 pub fn gteExec(g: *mut[] u32, opc: u32) {
-    g[32 + C_FLAG] = 0;        // clear FLAG every instruction
+    // clear
+    g[32 + C_FLAG] = 0;
     const op: u32 = opc & 0x3F;
-    // Per-op histogram of GTE math instructions. Stored at control
-    // register 31 (LZCR) + bits - wait, use g spare slot g[70+].
-    g[70] = g[70] + 1;                        // total GTE ops
+    g[70] = g[70] + 1;
     if (op < 0x40) { g[80 + op] = g[80 + op] + 1; }
-    // Decode sf (bit 19 -> 12 or 0) and lm (bit 10) once per dispatch
-    // so RTPS/RTPT/MVMVA all see the same flags.
     const sf: u32 = ((opc >> 19) & 1) * 12;
     const lm: u32 = (opc >> 10) & 1;
-    if (op == 0x01) { gteRtps(g, 0, sf, lm, 1); } // RTPS
-    if (op == 0x06) { gteNclip(g); }              // NCLIP
-    if (op == 0x0C) { gteOp(g, sf, lm); }         // OP
-    if (op == 0x12) { gteMvmva(g, opc); }         // MVMVA
-    if (op == 0x13) { gteNcds(g, 0, sf, lm); }    // NCDS
-    if (op == 0x16) {                              // NCDT - 3 successive NCDS
-        gteNcds(g, 0, sf, lm);
-        gteNcds(g, 1, sf, lm);
-        gteNcds(g, 2, sf, lm);
-    }
-    if (op == 0x28) { gteSqr(g, sf, lm); }        // SQR
-    if (op == 0x2D) { gteAvsz(g, 3); }            // AVSZ3
-    if (op == 0x2E) { gteAvsz(g, 4); }            // AVSZ4
-    if (op == 0x30) {                              // RTPT - 3 successive RTPS
-        gteRtps(g, 0, sf, lm, 0);
-        gteRtps(g, 1, sf, lm, 0);
-        gteRtps(g, 2, sf, lm, 1);                   // DQ tail only on last vertex
-    }
-    if (op == 0x10) { gteDpcs(g, sf, lm); }       // DPCS
-    if (op == 0x11) { gteIntpl(g, sf, lm); }      // INTPL
-    if (op == 0x14) { gteCdp(g, sf, lm); }        // CDP
-    if (op == 0x1B) { gteNccs(g, 0, sf, lm); }    // NCCS
-    if (op == 0x1C) { gteCc(g, sf, lm); }         // CC
-    if (op == 0x1E) { gteNcs(g, 0, sf, lm); }     // NCS
-    if (op == 0x20) {                              // NCT - 3× NCS
-        gteNcs(g, 0, sf, lm);
-        gteNcs(g, 1, sf, lm);
-        gteNcs(g, 2, sf, lm);
-    }
-    if (op == 0x29) { gteDcpl(g, sf, lm); }       // DCPL
-    if (op == 0x2A) { gteDpct(g, sf, lm); }       // DPCT
-    if (op == 0x3D) { gteGpf(g, sf, lm); }        // GPF
-    if (op == 0x3E) { gteGpl(g, sf, lm); }        // GPL
-    if (op == 0x3F) {                              // NCCT - 3× NCCS
-        gteNccs(g, 0, sf, lm);
-        gteNccs(g, 1, sf, lm);
-        gteNccs(g, 2, sf, lm);
+    match (op) {
+        0x01 { gteRtps(g, 0, sf, lm, 1); }            // RTPS
+        0x06 { gteNclip(g); }                         // NCLIP
+        0x0C { gteOp(g, sf, lm); }                    // OP
+        0x12 { gteMvmva(g, opc); }                    // MVMVA
+        0x13 { gteNcds(g, 0, sf, lm); }               // NCDS
+        0x16 {                                        // NCDT - 3 successive NCDS
+            gteNcds(g, 0, sf, lm);
+            gteNcds(g, 1, sf, lm);
+            gteNcds(g, 2, sf, lm);
+        }
+        0x28 { gteSqr(g, sf, lm); }                   // SQR
+        0x2D { gteAvsz(g, 3); }                       // AVSZ3
+        0x2E { gteAvsz(g, 4); }                       // AVSZ4
+        0x30 {                                        // RTPT - 3 successive RTPS
+            gteRtps(g, 0, sf, lm, 0);
+            gteRtps(g, 1, sf, lm, 0);
+            gteRtps(g, 2, sf, lm, 1);                 // DQ tail only on last vertex
+        }
+        0x10 { gteDpcs(g, sf, lm); }                  // DPCS
+        0x11 { gteIntpl(g, sf, lm); }                 // INTPL
+        0x14 { gteCdp(g, sf, lm); }                   // CDP
+        0x1B { gteNccs(g, 0, sf, lm); }               // NCCS
+        0x1C { gteCc(g, sf, lm); }                    // CC
+        0x1E { gteNcs(g, 0, sf, lm); }                // NCS
+        0x20 {                                        // NCT - 3× NCS
+            gteNcs(g, 0, sf, lm);
+            gteNcs(g, 1, sf, lm);
+            gteNcs(g, 2, sf, lm);
+        }
+        0x29 { gteDcpl(g, sf, lm); }                  // DCPL
+        0x2A { gteDpct(g, sf, lm); }                  // DPCT
+        0x3D { gteGpf(g, sf, lm); }                   // GPF
+        0x3E { gteGpl(g, sf, lm); }                   // GPL
+        0x3F {                                        // NCCT - 3× NCCS
+            gteNccs(g, 0, sf, lm);
+            gteNccs(g, 1, sf, lm);
+            gteNccs(g, 2, sf, lm);
+        }
+        _ {}
     }
 }
 
-// CPU-cycle cost of a COP2 (GTE) math op, keyed by the low 6 bits of the
-// opcode. These are the hardware per-op cycle counts. The CPU dispatcher
-// adds this - instead of the flat 2-cycle base - when it runs a GTE math
-// op, so device timing (DMA, CDROM, timers) advances at the correct rate
-// through GTE-heavy code. Unknown sub-ops fall back to the 2-cycle base.
 pub fn gteOpCycles(opc: u32) u32 {
     const op: u32 = opc & 0x3F;
-    if (op == 0x01) { return 15; }   // RTPS
-    if (op == 0x06) { return 8; }    // NCLIP
-    if (op == 0x0C) { return 6; }    // OP
-    if (op == 0x10) { return 8; }    // DPCS
-    if (op == 0x11) { return 8; }    // INTPL
-    if (op == 0x12) { return 8; }    // MVMVA
-    if (op == 0x13) { return 19; }   // NCDS
-    if (op == 0x14) { return 13; }   // CDP
-    if (op == 0x16) { return 44; }   // NCDT
-    if (op == 0x1B) { return 17; }   // NCCS
-    if (op == 0x1C) { return 11; }   // CC
-    if (op == 0x1E) { return 14; }   // NCS
-    if (op == 0x20) { return 30; }   // NCT
-    if (op == 0x28) { return 5; }    // SQR
-    if (op == 0x29) { return 8; }    // DCPL
-    if (op == 0x2A) { return 17; }   // DPCT
-    if (op == 0x2D) { return 5; }    // AVSZ3
-    if (op == 0x2E) { return 6; }    // AVSZ4
-    if (op == 0x30) { return 23; }   // RTPT
-    if (op == 0x3D) { return 5; }    // GPF
-    if (op == 0x3E) { return 5; }    // GPL
-    if (op == 0x3F) { return 39; }   // NCCT
-    return 2;
+    match (op) {
+        0x01 { return 15; }   // RTPS
+        0x06 { return 8; }    // NCLIP
+        0x0C { return 6; }    // OP
+        0x10 { return 8; }    // DPCS
+        0x11 { return 8; }    // INTPL
+        0x12 { return 8; }    // MVMVA
+        0x13 { return 19; }   // NCDS
+        0x14 { return 13; }   // CDP
+        0x16 { return 44; }   // NCDT
+        0x1B { return 17; }   // NCCS
+        0x1C { return 11; }   // CC
+        0x1E { return 14; }   // NCS
+        0x20 { return 30; }   // NCT
+        0x28 { return 5; }    // SQR
+        0x29 { return 8; }    // DCPL
+        0x2A { return 17; }   // DPCT
+        0x2D { return 5; }    // AVSZ3
+        0x2E { return 6; }    // AVSZ4
+        0x30 { return 23; }   // RTPT
+        0x3D { return 5; }    // GPF
+        0x3E { return 5; }    // GPL
+        0x3F { return 39; }   // NCCT
+        _ { return 2; }       // unknown sub-op
+    }
 }
 
-// Push (MAC1>>4, MAC2>>4, MAC3>>4, CODE) onto the RGB FIFO - used by
-// every colour-producing GTE op. RGB0 ← RGB1, RGB1 ← RGB2, RGB2 ← new.
 pub fn gtePushRgb(g: *mut[] u32, m1: i64, m2: i64, m3: i64) {
     g[20] = g[21];
     g[21] = g[22];
@@ -336,8 +287,6 @@ pub fn gtePushRgb(g: *mut[] u32, m1: i64, m2: i64, m3: i64) {
 }
 
 // Light-matrix transform of vertex vidx into (IR1,IR2,IR3) and (MAC1,MAC2,MAC3).
-// Shared by NCS, NCDS, NCCS - they all start with the same L*V
-// transformation. Stores IR into g[9..11] and MAC into g[D_MAC*].
 pub fn gteApplyLight(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     const vSlot: u32 = vidx * 2;
     const vxy: u32 = g[vSlot];
@@ -383,10 +332,6 @@ pub fn gteApplyLightColor(g: *mut[] u32, sf: u32, lm: u32) {
     const rbk: i64 = s32ToI64(g[32 + 13]);
     const gbk: i64 = s32ToI64(g[32 + 14]);
     const bbk: i64 = s32ToI64(g[32 + 15]);
-    // gteCheckMac nests between the BK<<12 term and each LC*IR term so an
-    // intermediate exceeding 44 bits wraps before the next add. The L*V
-    // first stage is a single gteClampMac (see gteApplyLight) and is
-    // intentionally left unnested, matching hardware.
     const a1a: i64 = gteCheckMac(g, 1, (rbk << 12) + lr1 * ir1);
     const a1b: i64 = gteCheckMac(g, 1, a1a + lr2 * ir2);
     const m1: i64 = gteClampMac(g, 1, a1b + lr3 * ir3, sf);
@@ -673,14 +618,6 @@ pub fn s32ToI64(v: u32) i64 {
     return w;
 }
 
-// FLAG-aware clamps.
-// Each ORs the matching FLAG bit into g[32+C_FLAG] on saturation/overflow
-// and otherwise returns exactly what the plain sat* helpers return, so
-// MAC/IR/SXY/RGB *values* are unchanged - only FLAG gets populated. `i`
-// is the component (1/2/3) selecting the per-channel bit. gteExec clears
-// FLAG at the top of each op; gteCtrlRead synthesizes the bit-31 summary.
-
-// IR1..IR3 saturation -> bit 24/23/22.
 pub fn gteClampIr(g: *mut[] u32, i: u32, v: i64, lm: u32) i64 {
     var lo: i64 = -32768;
     if (lm != 0) { lo = 0; }
@@ -725,8 +662,7 @@ pub fn gteClampRgb(g: *mut[] u32, i: u32, v: i64) u32 {
     return (v as u64 & 0xFF) as u32;
 }
 
-// MAC0 overflow -> bit 15 (neg) / 16 (pos); value is NOT clamped, only
-// flagged.
+// MAC0 overflow -> bit 15 (neg) / 16 (pos); value is NOT clamped, only flagged.
 pub fn gteClampMac0(g: *mut[] u32, v: i64) i64 {
     const lim: i64 = (1 as i64) << 31;
     if (v < (0 - lim)) { g[32 + C_FLAG] = g[32 + C_FLAG] | 0x8000; }
@@ -833,8 +769,6 @@ pub fn gteRtps(g: *mut[] u32, vidx: u32, sf: u32, lm: u32, last: u32) {
     const vy: i64 = s16ToI64((vxy >> 16) & 0xFFFF);
     const vzS: i64 = s16ToI64(vz & 0xFFFF);
 
-    // Rotation matrix elements (packed two-per-u32 in the control regs).
-    // Layout:
     //   C[0] low = RT11, high = RT12
     //   C[1] low = RT13, high = RT21
     //   C[2] low = RT22, high = RT23
@@ -987,9 +921,6 @@ pub fn gteOp(g: *mut[] u32, sf: u32, lm: u32) {
     gteIrTriple(g, mac1, mac2, mac3, lm);
 }
 
-// NCDS - Normal Color Depth Single. Computes per-vertex lit color with
-// far-color (fog) depth interpolation, using the light matrix to
-// transform the input vertex normal. The pipeline:
 //   1. L * V       -> MAC, IR (vertex normal in light space)
 //   2. BK + LC*IR  -> MAC, IR (background + reflected light)
 //   3. ir' = clamp((FC<<12) - (C<<4)*IR), with lm=0
@@ -1007,12 +938,6 @@ pub fn gteOp(g: *mut[] u32, sf: u32, lm: u32) {
 //   DR[6] byte 0 = R, byte 1 = G, byte 2 = B, byte 3 = CODE (RGBC)
 //   DR[8] = IR0 (depth-queue factor)
 //   DR[20..22] = RGB FIFO entries 0/1/2
-//
-// Without this, the BIOS PS-logo polygons all receive colour (0,0,0)
-// and render black on a black background - completely invisible.
-// sf is 0 or 12 - gteClampMac shifts the saturated MAC by sf at every
-// stage; we apply the same shift inline so IR values land in the right
-// magnitude before clamping.
 pub fn gteNcds(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     const vSlot: u32 = vidx * 2;
     const vxy: u32 = g[vSlot];
@@ -1032,10 +957,6 @@ pub fn gteNcds(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     const ll32: i64 = s16ToI64((g[32 + 11] >> 16) & 0xFFFF);
     const ll33: i64 = s16ToI64(g[32 + 12] & 0xFFFF);
 
-    // Stage 1: L * V -> MAC, IR.  gteClampMac applies `>> sf`, so for
-    // sf=12 (the BIOS default) we shift down by 12 before clamping into
-    // the IR range; otherwise IR saturates at 0x7FFF and the downstream
-    // stages clip every channel to white.
     var m1a: i64 = ll11 * vx + ll12 * vy + ll13 * vz;
     var m2a: i64 = ll21 * vx + ll22 * vy + ll23 * vz;
     var m3a: i64 = ll31 * vx + ll32 * vy + ll33 * vz;
@@ -1044,7 +965,6 @@ pub fn gteNcds(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     const ir2a: i64 = gteClampIr(g, 2, m2a, lm);
     const ir3a: i64 = gteClampIr(g, 3, m3a, lm);
 
-    // Stage 2: background-colour + light-colour matrix * (IR from stage 1).
     const lr1: i64 = s16ToI64(g[32 + 16] & 0xFFFF);
     const lr2: i64 = s16ToI64((g[32 + 16] >> 16) & 0xFFFF);
     const lr3: i64 = s16ToI64(g[32 + 17] & 0xFFFF);
@@ -1058,8 +978,6 @@ pub fn gteNcds(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     const gbk: i64 = s32ToI64(g[32 + 14]);
     const bbk: i64 = s32ToI64(g[32 + 15]);
 
-    // BK<<12 + LC*IR with the same nested 44-bit truncation as in the
-    // L*V stage.
     const b1a: i64 = gteCheckMac(g, 1, (rbk << 12) + lr1 * ir1a);
     const b1b: i64 = gteCheckMac(g, 1, b1a + lr2 * ir2a);
     const m1b: i64 = gteClampMac(g, 1, b1b + lr3 * ir3a, sf);
@@ -1073,14 +991,11 @@ pub fn gteNcds(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     const ir2b: i64 = gteClampIr(g, 2, m2b, lm);
     const ir3b: i64 = gteClampIr(g, 3, m3b, lm);
 
-    // Stage 3: vertex colour from RGBC register (DR[6]).
     const rgbc: u32 = g[6];
     const rc: i64 = (rgbc & 0xFF) as i64;
     const gc: i64 = ((rgbc >> 8) & 0xFF) as i64;
     const bc: i64 = ((rgbc >> 16) & 0xFF) as i64;
 
-    // Stage 4: far-colour interpolation ir' = clamp((FC<<12) - (C<<4)*IR).
-    // This stage is shifted by `sf` too, via the same gteClampMac.
     const rfc: i64 = s32ToI64(g[32 + 21]);
     const gfc: i64 = s32ToI64(g[32 + 22]);
     const bfc: i64 = s32ToI64(g[32 + 23]);
@@ -1092,7 +1007,6 @@ pub fn gteNcds(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     const ir2f: i64 = gteClampIr(g, 2, fp2, 0);
     const ir3f: i64 = gteClampIr(g, 3, fp3, 0);
 
-    // Stage 5: final colour = (C<<4)*IR + IR0 * ir'.
     const ir0: i64 = s16ToI64(g[8]);
     var m1c: i64 = (rc << 4) * ir1b + ir0 * ir1f;
     var m2c: i64 = (gc << 4) * ir2b + ir0 * ir2f;
@@ -1104,9 +1018,6 @@ pub fn gteNcds(g: *mut[] u32, vidx: u32, sf: u32, lm: u32) {
     g[D_MAC3] = (m3c as u64 & 0xFFFFFFFF) as u32;
     gteIrTriple(g, m1c, m2c, m3c, lm);
 
-    // Stage 6: RGB FIFO push. Use gtePushRgb (FLAG-aware gteClampRgb) so the
-    // colour-saturation FLAG bits 19/20/21 are set as on hardware and in
-    // DuckStation (gte.cpp:209-224); the old inline clampU8 skipped them.
     gtePushRgb(g, m1c, m2c, m3c);
 }
 
@@ -1125,14 +1036,6 @@ pub fn gteSqr(g: *mut[] u32, sf: u32, lm: u32) {
     gteIrTriple(g, mac1, mac2, mac3, lm);
 }
 
-// MVMVA - Multiply-Vector-by-Matrix and add-Vector. Opcode bits select
-// which matrix (mx: 0=rotation, 1=light, 2=lightColour), which vector
-// (v: 0..2 = V0..V2, 3 = IR vec), and which translation vector
-// (cv: 0=TR, 1=BK, 2=FC, 3=zero). Bit 19 sets sf (shift fraction = 12
-// or 0). Bit 10 sets lm (limit IR to 0..0x7FFF if 1).
-//
-// The CV=FC case is the hardware bug case - most BIOS calls use CV=TR.
-// Result: MAC = (CV << 12) + MX * V; IR = clamp(MAC >> sf).
 pub fn gteMvmva(g: *mut[] u32, opc: u32) {
     const sf: u32 = ((opc >> 19) & 1) * 12;
     const lm: u32 = (opc >> 10) & 1;
@@ -1140,18 +1043,14 @@ pub fn gteMvmva(g: *mut[] u32, opc: u32) {
     const vSel:  u32 = (opc >> 15) & 3;
     const mxSel: u32 = (opc >> 17) & 3;
 
-    // Pick the matrix. mxSel 0/1/2 = rotation / light / light-colour at
-    // control regs 0..4 / 8..12 / 16..20. mxSel 3 is the hardware's
-    // "garbage matrix": a junk mix of RC/IR0/RT13/RT22 that the hardware
-    // actually produces - reproduce it exactly rather than approximate.
     var m11: i64 = 0; var m12: i64 = 0; var m13: i64 = 0;
     var m21: i64 = 0; var m22: i64 = 0; var m23: i64 = 0;
     var m31: i64 = 0; var m32: i64 = 0; var m33: i64 = 0;
     if (mxSel == 3) {
-        const rcg: i64 = (g[6] & 0xFF) as i64;          // R of RGBC
-        const ir0g: i64 = s16ToI64(g[8]);               // IR0
-        const rt13: i64 = s16ToI64(g[32 + 1] & 0xFFFF); // RT13
-        const rt22: i64 = s16ToI64(g[32 + 2] & 0xFFFF); // RT22
+        const rcg: i64 = (g[6] & 0xFF) as i64;
+        const ir0g: i64 = s16ToI64(g[8]);
+        const rt13: i64 = s16ToI64(g[32 + 1] & 0xFFFF);
+        const rt22: i64 = s16ToI64(g[32 + 2] & 0xFFFF);
         m11 = -(rcg << 4); m12 = rcg << 4; m13 = ir0g;
         m21 = rt13; m22 = rt13; m23 = rt13;
         m31 = rt22; m32 = rt22; m33 = rt22;
@@ -1170,7 +1069,6 @@ pub fn gteMvmva(g: *mut[] u32, opc: u32) {
         m33 = s16ToI64(g[32 + mxBase + 4] & 0xFFFF);
     }
 
-    // Pick input vector.
     var vx: i64 = 0;
     var vy: i64 = 0;
     var vz: i64 = 0;
@@ -1187,31 +1085,25 @@ pub fn gteMvmva(g: *mut[] u32, opc: u32) {
         vz = s16ToI64(vzS & 0xFFFF);
     }
 
-    // Pick translation vector.
     var tx: i64 = 0;
     var ty: i64 = 0;
     var tz: i64 = 0;
-    if (cvSel == 0) {                    // TR
+    if (cvSel == 0) {
         tx = s32ToI64(g[32 + 5]);
         ty = s32ToI64(g[32 + 6]);
         tz = s32ToI64(g[32 + 7]);
     }
-    if (cvSel == 1) {                    // BK (background colour)
+    if (cvSel == 1) {
         tx = s32ToI64(g[32 + 13]);
         ty = s32ToI64(g[32 + 14]);
         tz = s32ToI64(g[32 + 15]);
     }
-    if (cvSel == 2) {                    // FC (far colour)
+    if (cvSel == 2) {
         tx = s32ToI64(g[32 + 21]);
         ty = s32ToI64(g[32 + 22]);
         tz = s32ToI64(g[32 + 23]);
     }
-    // cvSel == 3: zero translation.
 
-    // MAC = (CV<<12) + M*V with nested 44-bit truncation between the
-    // additive terms (gteCheckMac). CV=FC (cvSel==2) is the hardware bug
-    // case: the (CV<<12 + M*VX) column is computed only for its FLAG side
-    // effects and dropped from the result, leaving the VY/VZ columns.
     var sm1: i64 = 0; var sm2: i64 = 0; var sm3: i64 = 0;
     if (cvSel == 2) {
         const k1: i64 = gteCheckMac(g, 1, m12 * vy);
@@ -1220,8 +1112,6 @@ pub fn gteMvmva(g: *mut[] u32, opc: u32) {
         sm2 = gteClampMac(g, 2, k2 + m23 * vz, sf);
         const k3: i64 = gteCheckMac(g, 3, m32 * vy);
         sm3 = gteClampMac(g, 3, k3 + m33 * vz, sf);
-        // Dropped VX column: gteClampMac + gteClampIr purely to raise FLAG
-        // bits (the results are discarded, matching hardware).
         const d1: i64 = gteClampMac(g, 1, (tx << 12) + m11 * vx, sf);
         const d2: i64 = gteClampMac(g, 2, (ty << 12) + m21 * vx, sf);
         const d3: i64 = gteClampMac(g, 3, (tz << 12) + m31 * vx, sf);

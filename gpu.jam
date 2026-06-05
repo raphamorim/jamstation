@@ -1,11 +1,3 @@
-// GPU (partial implementation).
-//
-// Implements the GP0/GP1 command machinery and the polygon, line,
-// rectangle, fill, and CPU↔VRAM blit commands. Triangles are
-// point-sampled with texture + gouraud support (gpuRasterPoly ->
-// gpuRasterTri); together with the GTE this renders real game geometry.
-//
-// State buffer layout (80 u32 entries):
 //   [0..15]   command FIFO buffer
 //   [16]      buf_index
 //   [17]      cmd_args_remaining
@@ -37,30 +29,21 @@
 const { irqRaise, IC_VBLANK } = import("irq");
 
 const GPU_STATE_WORDS: u32 = 80;
-const VRAM_PIXELS: u32 = 524288;       // 1024 * 512
-
+const VRAM_PIXELS: u32 = 524288;
 const GP_RECV_CMD:  u32 = 0;
 const GP_RECV_ARGS: u32 = 1;
 const GP_RECV_DATA: u32 = 2;
 
-// Convert a 24-bit BGR colour (CPU side) into the GPU's 15-bit BGR555
-// VRAM format. PSX VRAM stores 1 bit mask + 5 bits each B/G/R.
 pub fn gpuToBgr555(c: u32) u32 {
     return ((c & 0x0000F8) >> 3)
          | ((c & 0x00F800) >> 6)
          | ((c & 0xF80000) >> 9);
 }
 
-// End-of-run diagnostic: how many GP0 commands of each family did the
-// BIOS issue? Family index = top 3 bits of the command byte (0 = misc,
-// 1 = polygon, 2 = line, 3 = rect, ...).
 pub fn gpuFamilyCount(g: *mut[] u32, family: u32) u32 {
     return g[72 + (family & 7)];
 }
 
-// VRAM is a `*mut[] u8` byte buffer storing little-endian u16 BGR555
-// pixels. These helpers convert between a (x, y) pair and a VRAM byte
-// offset and read/write a single pixel.
 pub fn vramWritePixel(vram: *mut[] u8, x: u32, y: u32, bgr555: u32) {
     if (x >= 1024 || y >= 512) { return; }
     const off: u32 = (y * 1024 + x) * 2;
@@ -73,8 +56,6 @@ pub fn vramReadPixel(vram: *mut[] u8, x: u32, y: u32) u32 {
     const off: u32 = (y * 1024 + x) * 2;
     return (vram[off] as u32) | ((vram[off + 1] as u32) << 8);
 }
-
-// GP0 / GP1 reads
 
 pub fn gpuRead32(g: *mut[] u32, vram: *mut[] u8, off: u32) u32 {
     if (off == 0x00) {
@@ -112,10 +93,6 @@ pub fn gpuRead8(g: *mut[] u32, vram: *mut[] u8, off: u32) u32 {
     return gpuRead32(g, vram, off & 0xFFFFFFFC) & 0xFF;
 }
 
-// Pack two adjacent VRAM pixels into a single u32 for the GPUREAD port.
-// For odd-pixel transfers (e.g. 1×1), the high 16 bits are zero - real
-// hardware doesn't read past the rect bounds. ps1-tests gpu/mask-bit
-// verifies this with `vramGet(x,y) == 0x8000` after a single-pixel write.
 pub fn vramPackTwo(g: *mut[] u32, vram: *mut[] u8) u32 {
     const baseX: u32 = g[43] & 0x3FF;
     const baseY: u32 = (g[43] >> 10) & 0x1FF;
@@ -125,9 +102,6 @@ pub fn vramPackTwo(g: *mut[] u32, vram: *mut[] u8) u32 {
     g[38] = g[38] + 1;
     if (g[38] == g[40]) { g[39] = g[39] + 1; g[38] = 0; }
     g[45] = g[45] - 1;
-    // Second half-pixel: only fetch if at least one more real pixel
-    // remains in the transfer. Odd-sized reads (e.g. 1×1) leave the
-    // high half of the final word as zero.
     if (g[45] > 0) {
         var x1: u32 = (baseX + g[38]) & 0x3FF;
         var y1: u32 = (baseY + g[39]) & 0x1FF;
@@ -138,8 +112,6 @@ pub fn vramPackTwo(g: *mut[] u32, vram: *mut[] u8) u32 {
     }
     return data;
 }
-
-// GP0 (command/data) writes
 
 pub fn gpuWrite32(g: *mut[] u32, vram: *mut[] u8, off: u32, val: u32) {
     match (off) {
@@ -157,9 +129,6 @@ pub fn gpuWrite8(g: *mut[] u32, vram: *mut[] u8, off: u32, val: u32) {
     gpuWrite32(g, vram, off, val & 0xFF);
 }
 
-// GP0 dispatch - state machine: RECV_CMD latches a new command word
-// into buf[0], RECV_ARGS appends additional words, RECV_DATA streams
-// pixels for CPU->VRAM.
 pub fn gpuGp0(g: *mut[] u32, vram: *mut[] u8, val: u32) {
     const st: u32 = g[19];
     if (st == GP_RECV_CMD) {
@@ -228,16 +197,10 @@ pub fn gpuGp1(g: *mut[] u32, val: u32) {
     }
 }
 
-// GP0 command parser - branches on the top three bits of buf[0] for
-// the polygon / line / rect families, and falls through to a per-byte
-// switch for everything else.
 pub fn gpuUpdateCmd(g: *mut[] u32, vram: *mut[] u8) {
     const cmd: u32 = (g[0] >> 24) & 0xFF;
     const family: u32 = (g[0] >> 29) & 7;
 
-    // Family histogram for end-of-run diagnostics. We track 8 buckets
-    // (top 3 bits of the command byte). 1 = polygon, 2 = line, 3 =
-    // rect, 4 = blit, 5 = drawmode setup.  Stored at g[72..79].
     if (g[19] == GP_RECV_CMD) {
         g[72 + family] = g[72 + family] + 1;
     }
@@ -250,16 +213,15 @@ pub fn gpuUpdateCmd(g: *mut[] u32, vram: *mut[] u8) {
     }
 
     match (cmd) {
-        // family 0 - misc commands and drawing settings.
-        0x00 | 0x01 { g[19] = GP_RECV_CMD; return; }   // nop / clear cache
-        0x02        { gpuFillRect(g, vram); return; }
+        0x00 | 0x01 {
+            g[19] = GP_RECV_CMD; return;
+        }
+        0x02 {
+            gpuFillRect(g, vram); return;
+        }
 
-        // family 7 (drawing settings) - single-word commands.
         0xE1 {
             g[46] = (g[46] & 0xFFFFF800) | (g[0] & 0x7FF);
-            // Latch E1.bit11 unconditionally into g[70] (the "raw" texture-
-            // disable input). GPUSTAT.15 is the gated output: g[71] & g[70].
-            // GP1(0x09) updates the gate without touching g[70].
             g[70] = (g[0] >> 11) & 1;
             g[46] = (g[46] & 0xFFFF7FFF) | ((g[71] & g[70]) << 15);
             g[60] = (g[46] & 0xF) << 6;
@@ -289,7 +251,6 @@ pub fn gpuUpdateCmd(g: *mut[] u32, vram: *mut[] u8) {
             return;
         }
         0xE5 {
-            // Sign-extend the 11-bit signed offsets.
             var ox: u32 = g[0] & 0x7FF;
             var oy: u32 = (g[0] >> 11) & 0x7FF;
             if ((ox & 0x400) != 0) { ox = ox | 0xFFFFF800; }
@@ -300,11 +261,6 @@ pub fn gpuUpdateCmd(g: *mut[] u32, vram: *mut[] u8) {
             return;
         }
         0xE6 {
-            // GP0(0xE6) - Mask Bit Setting. Two bits matter:
-            //   bit 0: Set Mask while drawing (force pixel bit 15 = 1)
-            //   bit 1: Check Mask before draw (skip if existing pixel bit 15 = 1)
-            // These reflect into GPUSTAT bits 11 and 12 respectively. ps1-tests
-            // gpu/mask-bit verifies write-back of the 0x8000 pixel bit.
             g[46] = (g[46] & 0xFFFFE7FF) | (((g[0] & 0x03) << 11) & 0x1800);
             g[58] = g[0] & 0x01;            // set-mask flag (raster-time)
             g[59] = (g[0] >> 1) & 0x01;     // check-mask flag
@@ -312,18 +268,13 @@ pub fn gpuUpdateCmd(g: *mut[] u32, vram: *mut[] u8) {
             return;
         }
 
-        // VRAM blits.
         0x80 { gpuVramToVram(g, vram); return; }
         0xA0 { gpuCpuToVram(g, vram); return; }
         0xC0 { gpuVramToCpu(g, vram); return; }
-
-        // Unrecognized - drop and return to idle to avoid a permanent stall.
         _    { g[19] = GP_RECV_CMD; }
     }
 }
 
-// 0x02 fill rect in VRAM. The colour is taken straight from buf[0]
-// (no dither), and the area is masked to a 16-pixel grid.
 pub fn gpuFillRect(g: *mut[] u32, vram: *mut[] u8) {
     if (g[19] == GP_RECV_CMD) {
         g[19] = GP_RECV_ARGS;
@@ -348,7 +299,6 @@ pub fn gpuFillRect(g: *mut[] u32, vram: *mut[] u8) {
     g[19] = GP_RECV_CMD;
 }
 
-// 0x80 VRAM-to-VRAM copy.
 pub fn gpuVramToVram(g: *mut[] u32, vram: *mut[] u8) {
     if (g[19] == GP_RECV_CMD) {
         g[19] = GP_RECV_ARGS;
@@ -375,8 +325,6 @@ pub fn gpuVramToVram(g: *mut[] u32, vram: *mut[] u8) {
     g[19] = GP_RECV_CMD;
 }
 
-// 0xA0 CPU->VRAM transfer. Header is 3 words (cmd, dest XY, size XY)
-// then `size` 16-bit words come over GP0 packed two per u32.
 pub fn gpuCpuToVram(g: *mut[] u32, vram: *mut[] u8) {
     if (g[19] == GP_RECV_CMD) {
         g[19] = GP_RECV_ARGS;
@@ -399,13 +347,6 @@ pub fn gpuCpuToVram(g: *mut[] u32, vram: *mut[] u8) {
         g[19] = GP_RECV_DATA;
         return;
     }
-    // RECV_DATA - one 32-bit word delivers two VRAM pixels. GP0(0xA0)
-    // writes the destination directly, bypassing the GP0(0xE6) mask
-    // bits - same as all the other draw commands here. This is done so
-    // Musashi's FMV (which leaves check-mask set when uploading decoded
-    // frames) doesn't silently drop writes to pixels that previously had
-    // bit 15 set. The strict spec says masks SHOULD apply, but no real
-    // game relies on it.
     const x0: u32 = (g[22] + g[28]) & 0x3FF;
     const y0: u32 = (g[23] + g[29]) & 0x1FF;
     vramWritePixel(vram, x0, y0, g[20] & 0xFFFF);
@@ -424,8 +365,6 @@ pub fn gpuCpuToVram(g: *mut[] u32, vram: *mut[] u8) {
     }
 }
 
-// 0xC0 VRAM->CPU transfer. Sets up the source rectangle; the data comes
-// out via gpuRead32 / vramPackTwo over subsequent reads.
 pub fn gpuVramToCpu(g: *mut[] u32, vram: *mut[] u8) {
     if (g[19] == GP_RECV_CMD) {
         g[19] = GP_RECV_ARGS;
@@ -445,20 +384,9 @@ pub fn gpuVramToCpu(g: *mut[] u32, vram: *mut[] u8) {
     g[41] = ys;
     g[42] = ((xs * ys) + 1) & 0xFFFFFFFE;
     g[43] = x0 | (y0 << 10);
-    // Track ACTUAL pixel count so vramPackTwo knows when the last word
-    // carries a single real pixel + a zero padding half (e.g. for 1×1
-    // reads). g[42] is rounded UP to even; g[45] keeps the true count.
     g[45] = xs * ys;
     g[19] = GP_RECV_CMD;
 }
-
-// polygon / line / rect command parsing
-//
-// We parse the variant flags (textured, gouraud, 4-vert) to compute the
-// right argument count, latch all the args, then stub the rasterization
-// out. This keeps the GP0 FIFO state machine in sync with whatever the
-// BIOS / a game sends; without GTE we can't render most game polygons
-// anyway, and the BIOS uses mostly rectangles for its splash screen.
 
 pub fn gpuPolyCmd(g: *mut[] u32, vram: *mut[] u8) {
     if (g[19] == GP_RECV_CMD) {
@@ -482,18 +410,19 @@ pub fn gpuPolyCmd(g: *mut[] u32, vram: *mut[] u8) {
     gpuRasterPoly(g, vram);
 }
 
-// Sign-extend an 11-bit PSX-screen coordinate (top 5 bits of a 16-bit
-// xy word are garbage; the low 11 bits are the signed value).
 pub fn gpuSe11(v: u32) u32 {
     if ((v & 0x400) != 0) { return v | 0xFFFFF800; }
     return v & 0x7FF;
 }
 
-pub fn gpuVertX(xy: u32) u32 { return gpuSe11(xy & 0xFFFF); }
-pub fn gpuVertY(xy: u32) u32 { return gpuSe11((xy >> 16) & 0xFFFF); }
+pub fn gpuVertX(xy: u32) u32 {
+    return gpuSe11(xy & 0xFFFF);
+}
 
-// Cross-product of edges (b-a) and (c-a). Result is the signed twice-
-// area of triangle abc. Use i64 to dodge overflow at ±2048 coords.
+pub fn gpuVertY(xy: u32) u32 {
+    return gpuSe11((xy >> 16) & 0xFFFF);
+}
+
 pub fn gpuEdge(ax: u32, ay: u32, bx: u32, by: u32, cx: u32, cy: u32) i64 {
     const ax64: i64 = sext32(ax);
     const ay64: i64 = sext32(ay);
@@ -504,8 +433,6 @@ pub fn gpuEdge(ax: u32, ay: u32, bx: u32, by: u32, cx: u32, cy: u32) i64 {
     return (bx64 - ax64) * (cy64 - ay64) - (by64 - ay64) * (cx64 - ax64);
 }
 
-// Sign-extend a u32 (interpreted as i32) to i64. Used so the edge
-// function's intermediate products stay in range.
 pub fn sext32(v: u32) i64 {
     var w: i64 = v as i64;
     if ((v & 0x80000000) != 0) {
@@ -514,13 +441,9 @@ pub fn sext32(v: u32) i64 {
     return w;
 }
 
-// Top-left rule - when an edge result lands exactly on zero, only the
-// pixel "owns" the edge if the edge is a top or left edge. This stops
-// shared edges between adjacent triangles from drawing twice.
 pub fn gpuTopLeftRule(z: i64, ax: u32, ay: u32, bx: u32, by: u32) bool {
     if (z < 0) { return true; }
     if (z != 0) { return false; }
-    // Use raw signed compare via sext32 helper.
     const ays: i64 = sext32(ay);
     const bys: i64 = sext32(by);
     const axs: i64 = sext32(ax);
@@ -530,7 +453,6 @@ pub fn gpuTopLeftRule(z: i64, ax: u32, ay: u32, bx: u32, by: u32) bool {
     return false;
 }
 
-// Min / max of three i32 values (passed as u32, signed compare).
 pub fn gpuMin3(a: u32, b: u32, c: u32) u32 {
     var m: u32 = a;
     if (sext32(b) < sext32(m)) { m = b; }
@@ -545,9 +467,6 @@ pub fn gpuMax3(a: u32, b: u32, c: u32) u32 {
     return m;
 }
 
-// Polygon dispatcher - reads the command flags and triggers one or
-// two triangles. Handles monochrome and textured variants; gouraud
-// shading falls back to flat-shaded with the base colour.
 pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
     const flags: u32 = (g[0] >> 24) & 0xFF;
     const isQuad: bool = (flags & 0x08) != 0;
@@ -576,9 +495,7 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
     var uu1: u32 = 0;  var vv1: u32 = 0;
     var uu2: u32 = 0;  var vv2: u32 = 0;
     var uu3: u32 = 0;  var vv3: u32 = 0;
-    // Per-vertex shaded colours. For non-gouraud prims c0/c1/c2/c3 are
-    // identical to the base colour, which lets the rasterizer use the
-    // same code path for both.
+
     var c0: u32 = g[0] & 0xFFFFFF;
     var c1: u32 = c0;
     var c2: u32 = c0;
@@ -594,7 +511,6 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
     //   mono shaded     buf[0]=col0+cmd, then per-vert (xy, colN+pad)
     //   tex shaded      buf[0]=col0+cmd, then per-vert (xy, page/clut+uv, colN)
     if (isTex && isGour) {
-        // texture + gouraud (cmd 0x34, 0x3C, 0x3E)
         v0x = gpuVertX(g[1]); v0y = gpuVertY(g[1]);
         uu0 = g[2] & 0xFF;  vv0 = (g[2] >> 8) & 0xFF;
         const clut: u32 = (g[2] >> 16) & 0xFFFF;
@@ -618,12 +534,6 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
         g[46] = (g[46] & 0xFFFFFE00) | (page & 0x1FF);
         g[70] = (page >> 11) & 1;
         g[46] = (g[46] & 0xFFFF7FFF) | ((g[71] & g[70]) << 15);
-        // The polygon's tpage byte also rewrites the GLOBAL texp_x/y/d
-        // (the derived fields textured rectangles
-        // read from). Without this, FMVs that draw the decoded frame
-        // as a texture-mapped polygon then composite it with a
-        // textured rect end up sampling the wrong VRAM region for the
-        // rect - texel 0 on every pixel -> black FMV.
         g[60] = tpx;
         g[61] = tpy;
         g[62] = depth;
@@ -636,7 +546,6 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
             uu3 = g[11] & 0xFF;  vv3 = (g[11] >> 8) & 0xFF;
         }
     } else if (isTex) {
-        // textured flat (cmd 0x24, 0x25, 0x26, 0x27, 0x2C, 0x2D, 0x2E, 0x2F)
         v0x = gpuVertX(g[1]); v0y = gpuVertY(g[1]);
         uu0 = g[2] & 0xFF;  vv0 = (g[2] >> 8) & 0xFF;
         const clut: u32 = (g[2] >> 16) & 0xFFFF;
@@ -694,18 +603,13 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
 
     const baseColor: u32 = g[0] & 0xFFFFFF;
 
-    // Textured polys read transparency mode from the texture page
-    // register's bits 5-6 (overrides GPUSTAT for this primitive);
-    // untextured / shaded polys read it from GPUSTAT bits 5-6.
     const isTransp: bool = (flags & 0x02) != 0;
     var transpMode: u32 = (g[46] >> 5) & 3;
-    // Use the texture-page transp mode for ALL textured polys, not
-    // just flat ones. The tpage word sits at buf[4] for flat-textured and
-    // at buf[5] for shaded-textured (the extra per-vertex colour words
-    // shift it), so pick the right word by isGour.
     if (isTex) {
         var page: u32 = (g[4] >> 16) & 0xFFFF;
-        if (isGour) { page = (g[5] >> 16) & 0xFFFF; }
+        if (isGour) {
+            page = (g[5] >> 16) & 0xFFFF;
+        }
         transpMode = (page >> 5) & 3;
     }
 
@@ -723,10 +627,6 @@ pub fn gpuRasterPoly(g: *mut[] u32, vram: *mut[] u8) {
     }
 }
 
-// Rasterize one triangle with optional texture sampling. Pixels inside
-// the triangle's three half-planes (top-left rule applied) get a colour
-// either from the base colour (untextured) or by sampling the texture
-// page at the barycentric-interpolated uv.
 pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
                     isTex: bool, isRaw: bool, isTransp: bool,
                     transpMode: u32, isGour: bool,
@@ -743,8 +643,6 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
     var by: u32 = by0 + oy;
     var cx: u32 = cx0 + ox;
     var cy: u32 = cy0 + oy;
-    // UV and per-vertex colour stay paired with their vertex when we
-    // flip winding.
     var bu2: u32 = bu;  var bv2: u32 = bv;
     var cu2: u32 = cu;  var cv2: u32 = cv;
     var bc2: u32 = bc;
@@ -767,8 +665,9 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
     const xmax: u32 = gpuMax3(ax, bx, cx);
     const ymax: u32 = gpuMax3(ay, by, cy);
     // Reject only triangles wider/taller than the GPU's real limits
-    // (2048 / 1024). The earlier 1024/512 dropped valid large polygons.
-    if (sext32(xmax - xmin) > 2048 || sext32(ymax - ymin) > 1024) { return; }
+    if (sext32(xmax - xmin) > 2048 || sext32(ymax - ymin) > 1024) {
+        return;
+    }
 
     const absArea: i64 = gpuAbsI64(gpuEdge(ax, ay, bx, by, cx, cy));
     const dx1: u32 = g[48];
@@ -790,10 +689,6 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
                     !gpuTopLeftRule(z2, ax, ay, bx, by)) {
                     var color: u32 = 0;
                     if (isTex) {
-                        // Barycentric interpolation for uv. Each zN is
-                        // signed; combine with the corresponding uv,
-                        // sum, divide by area. We use the absolute area
-                        // since the edges may carry negative sign.
                         const tx: i64 = (z0 * (au as i64) + z1 * (bu2 as i64)
                                        + z2 * (cu2 as i64));
                         const ty: i64 = (z0 * (av as i64) + z1 * (bv2 as i64)
@@ -837,9 +732,6 @@ pub fn gpuRasterTri(g: *mut[] u32, vram: *mut[] u8,
                             }
                             color = gpuModulate(texel, modc);
                         }
-                        // Texel bit 15 -> blend per transparency mode.
-                        // For untextured polys, transparency applies
-                        // unconditionally when isTransp is set.
                         if (isTransp && (texel & 0x8000) != 0) {
                             const back: u32 = vramReadPixel(vram,
                                 x & 0x3FF, y & 0x1FF);
@@ -899,8 +791,6 @@ pub fn gpuAbsI64(v: i64) i64 {
 
 // 4x4 ordered dither kernel.
 // Indexed by `dy * 4 + dx` where `dx = (x - xmin) & 3`, `dy = (y - ymin) & 3`.
-// Values added to each interpolated channel before clamping reduce visible
-// banding on gouraud gradients (the BIOS's diamond logo uses this heavily).
 pub fn gpuDitherKernel(idx: u32) i64 {
     match (idx) {
         0  { return -4; }
@@ -922,9 +812,6 @@ pub fn gpuDitherKernel(idx: u32) i64 {
     }
 }
 
-// Saturate one shaded channel: divide the barycentric numerator by the
-// triangle area, apply the dither offset, then clamp to [0, 0xFF].
-// Order matters: divide first, dither, clamp.
 pub fn gpuSatChan(num: i64, area: i64, dith: i64) u32 {
     if (area == 0) { return 0; }
     var quot: i64 = num / area;
@@ -934,10 +821,6 @@ pub fn gpuSatChan(num: i64, area: i64, dith: i64) u32 {
     return quot as u32;
 }
 
-// Divide an i64 dividend by an i64 divisor, clamping the (truncated-to-
-// zero) result to 0..maxOut. Native LLVM signed divide via Jam's `/`
-// operator - previously this was a 64-iteration shift-and-subtract loop
-// (the inner-pixel hot path on every shaded / textured polygon).
 pub fn gpuDivClamp(num: i64, den: i64, maxOut: u32) u32 {
     if (den == 0) { return 0; }
     var q: i64 = num / den;
@@ -952,24 +835,21 @@ pub fn gpuLineCmd(g: *mut[] u32, vram: *mut[] u8) {
     const isPoly: bool = (flags & 0x08) != 0;
     if (g[19] == GP_RECV_CMD) {
         g[19] = GP_RECV_ARGS;
-        // Poly-lines (bit 0x08) drain words until a vertex word masks to
-        // 0x50005000; single segments take 2 verts (3 if gouraud). g[17]
-        // is unused on the poly-line path - it ends on the terminator
-        // below, not on an arg count.
-        if (isPoly) { g[17] = 2; return; }
+        if (isPoly) {
+            g[17] = 2; return;
+        }
         var args: u32 = 2;
-        if (isGour) { args = args + 1; }
+        if (isGour) {
+            args = args + 1;
+        }
         g[17] = args;
         return;
     }
-    // RECV_ARGS.
     if (isPoly) {
         // A poly-line ends when the most-recently received word masks to
         // 0x50005000, and it draws NOTHING (the poly-line render path is
         // not implemented). Bound the FIFO write index so we don't
-        // overflow the 16-word buffer - with no draw the words are never
-        // read back, so overwriting one slot is observably the same while
-        // keeping jam's state intact.
+        // overflow the 16-word buffer.
         const last: u32 = g[g[16] - 1];
         if ((last & 0xF000F000) == 0x50005000) {
             g[19] = GP_RECV_CMD;
@@ -997,10 +877,7 @@ pub fn gpuLineCmd(g: *mut[] u32, vram: *mut[] u8) {
     g[19] = GP_RECV_CMD;
 }
 
-// Bresenham line rasterizer - split on whether dx or dy dominates
-// (i.e. shallow vs. steep slope) and on direction, so the inner loop
-// always increments by 1 in the dominant axis and uses Bresenham's
-// error term to step in the minor axis.
+// Bresenham line rasterizer.
 pub fn gpuPlotLine(g: *mut[] u32, vram: *mut[] u8,
                    x0: u32, y0: u32, x1: u32, y1: u32, color: u32) {
     const sx0: i64 = sext32(x0);
@@ -1089,7 +966,7 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
         const flags: u32 = (g[0] >> 24) & 0xFF;
         const sizeBits: u32 = (flags >> 3) & 3;
         const isTex: bool = (flags & 0x04) != 0;
-        var args: u32 = 1;         // x/y
+        var args: u32 = 1;
         if (sizeBits == 0) { args = args + 1; }
         if (isTex)         { args = args + 1; }
         g[17] = args;
@@ -1102,7 +979,7 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
     const isTex: bool = (flags & 0x04) != 0;
     const isRaw: bool = (flags & 0x01) != 0;
     const isTransp: bool = (flags & 0x02) != 0;
-    const transpMode: u32 = (g[46] >> 5) & 3;     // GPUSTAT bits 5-6
+    const transpMode: u32 = (g[46] >> 5) & 3;
     var bufIdx: u32 = 1;
     const xy: u32 = g[bufIdx];
     bufIdx = bufIdx + 1;
@@ -1124,15 +1001,9 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
         }
         _ {}
     }
-    // Order matters: add the drawing offset first, *then* sign-extend
-    // the 11-bit screen-space position. SE-after-offset is what the
-    // hardware does - anything that overflows 11 bits wraps.
     var x: u32 = gpuSe11((xy & 0xFFFF) + g[52]);
     var y: u32 = gpuSe11(((xy >> 16) & 0xFFFF) + g[53]);
 
-    // Drawing-area bounds. Pixels outside the (draw_x1..draw_x2,
-    // draw_y1..draw_y2) box are skipped: the iteration limits are
-    // clamped against the drawing area.
     const dx1: i64 = sext32(g[48]);
     const dy1: i64 = sext32(g[49]);
     const dx2: i64 = sext32(g[50]);
@@ -1164,9 +1035,6 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
             iy = iy + 1;
         }
     } else {
-        // Textured rect: sample each pixel from VRAM via the current
-        // texture page + CLUT setup. uvword low 16 bits hold u, v;
-        // high 16 hold the CLUT location.
         const uu0: u32 = uvword & 0xFF;
         const vv0: u32 = (uvword >> 8) & 0xFF;
         const clut: u32 = (uvword >> 16) & 0xFFFF;
@@ -1189,9 +1057,6 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
                         if (!isRaw) {
                             color = gpuModulate(texel, g[0] & 0xFFFFFF);
                         }
-                        // When the rect's transparency flag is set, texel
-                        // bit 15 selects whether THIS pixel blends. When
-                        // the flag isn't set, no blending.
                         var thisTransp: bool = false;
                         if (isTransp) {
                             thisTransp = (texel & 0x8000) != 0;
@@ -1213,23 +1078,14 @@ pub fn gpuRectCmd(g: *mut[] u32, vram: *mut[] u8) {
     g[19] = GP_RECV_CMD;
 }
 
-// Apply the GP0(0xE2) texture window to a texel coordinate, then wrap to
-// the 256x256 page:
-//   t = (t & ~mask) | (offset & mask); t &= 0xff
-// The window regs are pre-shifted to pixel units in g[54..57]
-// (mask_x, mask_y, off_x, off_y). With no window set (mask 0) this is a
-// pass-through, so it is always safe to apply.
 pub fn gpuTexWinX(g: *mut[] u32, t: u32) u32 {
     return ((t & (~g[54])) | (g[56] & g[54])) & 0xFF;
 }
+
 pub fn gpuTexWinY(g: *mut[] u32, t: u32) u32 {
     return ((t & (~g[55])) | (g[57] & g[55])) & 0xFF;
 }
 
-// Fetch one 16-bit BGR555 texel from VRAM, decoding CLUT-indexed
-// formats. `depth` is the texture page colour mode: 0 = 4bpp, 1 = 8bpp,
-// 2/3 = 15bpp direct. (tpx, tpy) is the texture page top-left in VRAM
-// pixels; (clutx, cluty) is the CLUT row's top-left.
 pub fn gpuFetchTexel(vram: *mut[] u8, tx: u32, ty: u32,
                      tpx: u32, tpy: u32,
                      clutx: u32, cluty: u32, depth: u32) u32 {
@@ -1249,10 +1105,6 @@ pub fn gpuFetchTexel(vram: *mut[] u8, tx: u32, ty: u32,
     return vramReadPixel(vram, tpx + tx, tpy + ty);
 }
 
-// Modulate a BGR555 texel by a 24-bit BGR colour. PSX texture blending
-// is multiply-then-double: out = clamp(tex * mod / 128). At mod = 0x80
-// (the "neutral" value the BIOS uses for plain texture rendering) the
-// texel passes through unchanged.
 pub fn gpuModulate(texel: u32, mod: u32) u32 {
     const tr: u32 = (texel & 0x1F) << 3;
     const tg: u32 = ((texel >> 5) & 0x1F) << 3;
@@ -1260,9 +1112,6 @@ pub fn gpuModulate(texel: u32, mod: u32) u32 {
     const mr: u32 = mod & 0xFF;
     const mg: u32 = (mod >> 8) & 0xFF;
     const mb: u32 = (mod >> 16) & 0xFF;
-    // Modulation rounds to nearest: round((tex * mod) / 128). +0x40
-    // before >>7 gives round-half-up, which is correct for non-negative
-    // channels (tex, mod are unsigned here).
     var cr: u32 = ((tr * mr) + 0x40) >> 7;
     var cg: u32 = ((tg * mg) + 0x40) >> 7;
     var cb: u32 = ((tb * mb) + 0x40) >> 7;
@@ -1272,16 +1121,10 @@ pub fn gpuModulate(texel: u32, mod: u32) u32 {
     return gpuToBgr555(cr | (cg << 8) | (cb << 16));
 }
 
-// Semi-transparency blend.
-// `fore` is a BGR555 foreground colour, `back` the existing VRAM pixel;
-// `mode` is the 2-bit semi-transparency mode out of GPUSTAT bits 5-6
-// (or for textured polys, out of the texture-page register):
 //   0  B/2 + F/2
 //   1  B + F
 //   2  B - F
 //   3  B + F/4
-// We unpack each channel to 8 bits, blend with saturating arithmetic,
-// then re-pack to BGR555.
 pub fn gpuBlend(fore: u32, back: u32, mode: u32) u32 {
     const fr: u32 = (fore & 0x1F) << 3;
     const fg: u32 = ((fore >> 5) & 0x1F) << 3;
@@ -1316,39 +1159,14 @@ pub fn gpuBlend(fore: u32, back: u32, mode: u32) u32 {
     return gpuToBgr555(cr | (cg << 8) | (cb << 16));
 }
 
-// frame pacing
-//
-// Each call advances the GPU's scanline cycle counter. When we cross a
-// horizontal-draw / hblank boundary we tick `line`; at scanline 240 we
-// raise the VBLANK IRQ.
-
-// Removed: gpuUpdate() was a dead alternative scanline counter that
-// never got called from main.jam - runOneFrame handles scanline pacing
-// directly. The function had two competing accumulators (one fractional
-// 11/7 path, one ×2 path), neither correct. Keeping the constants in
-// case a future per-cycle GPU tick is added.
-
-// struct wrapper
-//
-// `Gpu` owns the 80-u32 state buffer inline (vs the old heap alloc)
-// and exposes the public surface as methods. The internal command-
-// state machine plus the rectangle/CPU↔VRAM blit paths are too
-// indexed-access-heavy to refactor field-by-field without high
-// regression risk - same trade-off as the CDROM wrap. Callers get
-// `bus.gpu.method(...)` ergonomics.
 pub const Gpu = struct {
-    // 80 u32 entries = 320 bytes. Spelled as a literal because Jam's
-    // array type currently requires an integer literal in size
-    // position (no const-folding for `[GPU_STATE_WORDS]u32` yet).
     buf: [80]u32,
 
     pub fn init() Self {
         var s: Self = Self { buf: [0; 80] };
         s.buf[19] = GP_RECV_CMD;
-        // Initial GPUSTAT: only bit 23 set (display disabled).
-        // Reads OR 0x1C000000 on the fly.
         s.buf[46] = 0x00800000;
-        s.buf[47] = 1;            // default display_mode
+        s.buf[47] = 1;
         return s;
     }
 
@@ -1380,16 +1198,10 @@ pub const Gpu = struct {
         gpuWrite32(self.buf.asMutPtr(), vram, off, val);
     }
 
-    // DMA channel 2 GPU path (linked-list + request modes) calls
-    // these per word from dma.jam.
     pub fn gp0(self: Self, vram: *mut[] u8, val: u32) {
         gpuGp0(self.buf.asMutPtr(), vram, val);
     }
 
-    // Internal slot access - used by main.jam's frame loop to peek
-    // display-mode / disp_x / etc. fields directly. Bypasses the
-    // method API for the small set of read-only readouts the host
-    // pump needs each frame.
     pub fn bufPtr(self: Self) *mut[] u32 {
         return self.buf.asMutPtr();
     }

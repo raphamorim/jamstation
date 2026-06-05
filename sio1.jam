@@ -1,51 +1,5 @@
-// SIO1 serial port (link cable / serial-port) at 0x1F801050..0x1F80105F.
-// We build the real device per psx-spx so games
-// that wait on its events (Harvest Moon opens class 0xF0000009 spec 0x20
-// = SIO COMMAND_COMPLETE) can complete the SIO transaction loop.
-//
-// Register map:
-//   0x00 SIO_DATA  R/W  (RX FIFO read / TX FIFO write)         8-bit
-//   0x04 SIO_STAT  R    Status register                        32-bit
-//   0x08 SIO_MODE  R/W  Baud / parity / character length       16-bit
-//   0x0A SIO_CTRL  R/W  Control register                       16-bit
-//   0x0E SIO_BAUD  R/W  Baud reload value                      16-bit
-//
-// SIO_STAT bits (psx-spx):
-//   0    TX_RDY1   TX FIFO not full
-//   1    RX_NE     RX FIFO has data
-//   2    TX_RDY2   TX shift idle (TX FIFO empty)
-//   3    RX_PERR   parity error (sticky; cleared by CTRL.ACK)
-//   4    RX_OVERR  FIFO overrun (sticky)
-//   5    RX_BSB    bad stop bit (sticky)
-//   6    RX_INPUT  current SI/RX input level
-//   7    DSR_LVL   DSR input level (0 = no remote)
-//   8    CTS_LVL   CTS input level
-//   9    IRQ       interrupt request (set by HW, cleared by CTRL.ACK)
-//   10   reserved
-//   11+  baud-timer countdown bits
-//
-// SIO_CTRL bits:
-//   0    TX_EN     transmit enable
-//   1    DTR_LVL   DTR output level
-//   2    RX_EN     receive enable
-//   3    SO_LVL    TX manual output level (loopback)
-//   4    ACK_IRQ   write 1 -> clear STAT[3,4,5,9]; self-clears
-//   5    RTS_LVL   RTS output level
-//   6    RESET     master reset
-//   7    reserved
-//   8-9  RX_IM     RX interrupt mode (bytes to receive before IRQ)
-//   10   TX_IE     TX interrupt enable (IRQ when TX FIFO empties)
-//   11   RX_IE     RX interrupt enable (IRQ at RX threshold)
-//   12   DSR_IE    DSR interrupt enable
-//   13-15 reserved
-//
-// With no link cable connected, every TX byte echoes 0xFF onto the RX
-// line after a short delay; if the appropriate CTRL.x_IE bit is set, we
-// raise IC_SIO.
-
 const { irqRaise, IC_SIO } = import("irq");
 
-// CTRL bits.
 const CTRL_TXEN:   u32 = 0x0001;
 const CTRL_DTR:    u32 = 0x0002;
 const CTRL_RXEN:   u32 = 0x0004;
@@ -55,7 +9,6 @@ const CTRL_TX_IE:  u32 = 0x0400;
 const CTRL_RX_IE:  u32 = 0x0800;
 const CTRL_DSR_IE: u32 = 0x1000;
 
-// STAT bits.
 const STAT_TXR1:   u32 = 0x0001;
 const STAT_RXNE:   u32 = 0x0002;
 const STAT_TXR2:   u32 = 0x0004;
@@ -64,21 +17,8 @@ const STAT_OVERR:  u32 = 0x0010;
 const STAT_BSB:    u32 = 0x0020;
 const STAT_IRQ:    u32 = 0x0200;
 
-// IRQ delay (CPU cycles). 200 ≈ ~6 µs at 33 MHz, plausible for one byte
-// at link-cable baud rates. Real hardware delay depends on SIO_BAUD; for
-// games that only use SIO1 as a presence probe the exact value doesn't
-// matter as long as IRQ eventually fires.
 const SIO_IRQ_DELAY: u32 = 200;
 
-// Aggregate SIO1 state. The RX FIFO is an 8-byte ring buffer with
-// 8-bit head/tail indexes (wrap is `& 0x07` for indexing; the indexes
-// themselves are u8 and we compare them with the empty test
-// `head == tail`).
-//
-// `pad` pushes the struct above kByValueMaxBytes (16), forcing the
-// ByPointer ABI - `mut Sio1` parameters take a pointer to live
-// storage so writes propagate. Otherwise an undersized struct would
-// be passed by value and mutations would land in a snapshot.
 pub const Sio1 = struct {
     stat:           u32,
     mode:           u16,
@@ -121,10 +61,6 @@ pub const Sio1 = struct {
         return self.rxHead == self.rxTail;
     }
 
-    // STAT compose: internal field carries the sticky/irq bits; on
-    // read we OR in the dynamic bits - TX_RDY1 always 1 (FIFO never
-    // full since we transmit immediately), TX_RDY2 = 1 when no TX in
-    // flight, RX_NE = 1 when RX FIFO has data.
     pub fn readStat(self: Self) u32 {
         var stat: u32 = self.stat;
         stat = stat | STAT_TXR1;
@@ -133,27 +69,16 @@ pub const Sio1 = struct {
         return stat;
     }
 
-    // SIO_DATA write: push a byte through the transmit path. If
-    // CTRL.TX_EN is clear, drop. Otherwise schedule the IRQ deadline;
-    // with no remote link cable the response byte 0xFF is staged in
-    // the RX FIFO.
     pub fn writeData(self: mut Self, val: u32) {
         if ((self.ctrl as u32 & CTRL_TXEN) == 0) { return; }
-        // Stage the loopback response immediately (real HW transmits
-        // then latches the line level into RX; we just push 0xFF on
-        // the line since DSR is low).
         self.rxPush(0xFF);
         self.txPending = 1;
         self.cyclesUntilIrq = SIO_IRQ_DELAY;
     }
 
-    // SIO_CTRL write. RESET clears the buffer entirely; ACK clears
-    // the sticky error bits and IRQ. TX_EN / RX_EN flips just gate
-    // transmission.
     pub fn writeCtrl(self: mut Self, val: u32) {
         const v: u32 = val & 0xFFFF;
         if ((v & CTRL_RESET) != 0) {
-            // Preserve MODE/BAUD, clear everything else.
             const mode: u16 = self.mode;
             const baud: u16 = self.baud;
             self.stat = 0;
@@ -169,10 +94,7 @@ pub const Sio1 = struct {
         }
         self.ctrl = v as u16;
         if ((v & CTRL_ACKN) != 0) {
-            // Clear sticky STAT bits PERR/OVERR/BSB/IRQ.
             self.stat = self.stat & (~(STAT_PERR | STAT_OVERR | STAT_BSB | STAT_IRQ));
-            // Self-clear the ACK bit so a re-read of CTRL doesn't
-            // keep signaling.
             self.ctrl = self.ctrl & ((~CTRL_ACKN) as u16);
         }
     }
@@ -204,10 +126,6 @@ pub const Sio1 = struct {
     pub fn write16(self: mut Self, off: u32, val: u32) { self.write32(off, val & 0xFFFF); }
     pub fn write8(self: mut Self, off: u32, val: u32)  { self.write32(off, val & 0xFF); }
 
-    // Per-cycle tick. Mirrors pad's pattern: count down cycles_until_irq,
-    // then raise STAT.IRQ and the IC_SIO line. We respect the
-    // CTRL.x_IE bits so a game that didn't enable interrupts doesn't
-    // see spurious IRQs.
     pub fn update(self: mut Self, ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
         if (self.cyclesUntilIrq == 0) { return; }
         if (self.cyclesUntilIrq > cyc) {
@@ -217,8 +135,6 @@ pub const Sio1 = struct {
         self.cyclesUntilIrq = 0;
         self.txPending = 0;
         const ctrl: u32 = self.ctrl as u32;
-        // TX completion triggers if TX_IE or RX_IE is enabled (the
-        // response byte we staged in writeData is "received").
         if ((ctrl & (CTRL_TX_IE | CTRL_RX_IE)) != 0) {
             self.stat = self.stat | STAT_IRQ;
             irqRaise(ic, cop0, IC_SIO);

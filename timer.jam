@@ -1,15 +1,4 @@
-// Three 16-bit timers at 0x1F801100 / 0x1F801110 / 0x1F801120, each
-// exposing three registers (counter, mode, target). They count at
-// different clock sources - system clock, dotclock, hblank - and can
-// raise IRQs (lines 4 / 5 / 6 = TIMER0 / TIMER1 / TIMER2) on
-// target-hit or 0xFFFF wraparound.
-
 const { irqRaise, IC_TIMER0, IC_TIMER1, IC_TIMER2 } = import("irq");
-
-// Per-timer state. Each channel has its own counter, target, and a
-// pile of mode-register bits (sync / IRQ / clock-source). The 0/1
-// flag bits stay u32 so they round-trip cleanly through the mode
-// register's pack/unpack without per-field width juggling.
 pub const TimerChannel = struct {
     counter:       f32,
     target:        u32,
@@ -38,9 +27,6 @@ pub const TimerChannel = struct {
     }
 };
 
-// Aggregate timer state for the chip. Two shared blank-line flags
-// (`hblank` / `vblank`) drive sync-mode behavior; `channels` carries the
-// three 16-bit timers.
 pub const Timer = struct {
     hblank:     u32,
     vblank:     u32,
@@ -62,9 +48,6 @@ pub const Timer = struct {
         };
     }
 
-    // Refresh the Timer 0 dot-clock divisor from the GPU display mode
-    // (GP1 08h, low 24 bits). hdiv table {256:10, 320:8, 512:5, 640:4},
-    // or 7 for the 368-wide (bit 6) mode.
     pub fn setDotclock(self: mut Self, dm: u32) {
         if ((dm & 0x40) != 0) {
             self.dotDiv = 11.0 / 7.0 / 7.0;
@@ -78,9 +61,6 @@ pub const Timer = struct {
         self.dotDiv = 11.0 / 7.0 / div;
     }
 
-    // Compose the mode register from individual flag fields.
-    // Side effect: clears
-    // `targetReached` and `maxReached` (they latch until read).
     pub fn getMode(self: mut Self, idx: u32) u32 {
         var v: u32 = 0;
         v = v | ((self.channels[idx].syncEnable    & 1) << 0);
@@ -99,10 +79,6 @@ pub const Timer = struct {
         return v;
     }
 
-    // Mode write - decompose the value into the per-flag fields,
-    // then reset side-state (counter, irq, fired, etc.).
-    // Also seeds `paused` from hblank/vblank for sync
-    // modes.
     pub fn setMode(self: mut Self, idx: u32, val: u32) {
         self.channels[idx].syncEnable   = (val >> 0) & 1;
         self.channels[idx].syncMode     = (val >> 1) & 3;
@@ -145,17 +121,8 @@ pub const Timer = struct {
         }
     }
 
-    // IRQ delivery logic - call after every counter advance and
-    // every register write. Sets targetReached / maxReached as
-    // appropriate, fires the matching IRQ line if its mask bit is
-    // enabled, honours one-shot vs repeat, and resets the counter
-    // on target-hit if resetTarget is set.
     pub fn handleIrq(self: mut Self, idx: u32,
                      ic: *mut[] u32, cop0: *mut[] u32) {
-        // Compare the FLOAT counter directly to the target and to 65535.0f
-        // with strict `>`. Using `>=` (toward hardware/DuckStation) would
-        // fire the timer IRQ one tick earlier on every exact landing - a
-        // per-IRQ delivery-timing divergence. Stick with `>`.
         const counter: f32 = self.channels[idx].counter;
         const target:  u32 = self.channels[idx].target;
         var fireIrq: u32 = 0;
@@ -203,7 +170,6 @@ pub const Timer = struct {
         }
     }
 
-    // Bus reads - register layout per timer is:
     //   +0 counter (16-bit)
     //   +4 mode    (16-bit, read also clears targetReached / maxReached)
     //   +8 target  (16-bit)
@@ -246,22 +212,12 @@ pub const Timer = struct {
         self.write32(ic, cop0, off, val & 0xFF);
     }
 
-    // Per-cycle advance. The caller passes how many CPU cycles
-    // have just been executed. Timer 1 with clk_source=1 (hblank)
-    // is driven by `hblankBegin` instead; timer 0 has a dotclock
-    // mode we approximate as system clock.
     pub fn update(self: mut Self, ic: *mut[] u32, cop0: *mut[] u32) {
         self.updateCyc(ic, cop0, 2);
     }
 
     pub fn updateCyc(self: mut Self, ic: *mut[] u32, cop0: *mut[] u32,
                  cyc: u32) {
-        // IGNORE the cyc arg and advance all three timers by a hardcoded 2
-        // per instruction - NOT the real per-instruction cycle count.
-        // Feeding the real `cyc` (fetchCyc+2 = 20 for BIOS-resident code)
-        // makes the sysclk timers run ~10× too fast in BIOS/kernel loops,
-        // drifting any timer value the game reads. Pass 2. (`cyc` kept for
-        // signature parity.)
         self.updateOne(0, 2, ic, cop0);
         self.updateOne(1, 2, ic, cop0);
         self.updateOne(2, 2, ic, cop0);
@@ -273,13 +229,6 @@ pub const Timer = struct {
         // Timer 1 sourced from hblank is incremented in hblankBegin.
         if (idx == 1 && (self.channels[idx].clkSource & 1) != 0) { return; }
         const cf: f32 = cyc as f32;
-        // Advance the float counter. Timer 2 with clk_source>=2 ticks at
-        // sysclk/8 (`+= cyc/8`). Timer 0 with clk_source bit0 set ticks at
-        // the GPU dot-clock (`+= cyc * dotDiv`, dotDiv = (11/7)/hdiv) instead
-        // of full sysclk - matches the reference emulators (the dot-clock is
-        // slower than sysclk, so a plain `+= cyc` would run T0 several× too
-        // fast). No integer subtick or leap-past-target adjustment: the float
-        // overshoot/reset is handled directly by handleIrq.
         if (idx == 2 && self.channels[idx].clkSource >= 2) {
             self.channels[idx].counter = self.channels[idx].counter + cf / 8.0;
         } else if (idx == 0 && (self.channels[idx].clkSource & 1) != 0) {
@@ -290,15 +239,11 @@ pub const Timer = struct {
         self.handleIrq(idx, ic, cop0);
     }
 
-    // Hblank / vblank entry/exit hooks called by the GPU's
-    // frame-pacing.
     pub fn hblankBegin(self: mut Self, ic: *mut[] u32, cop0: *mut[] u32) {
         self.hblank = 1;
 
         if ((self.channels[1].clkSource & 1) != 0 &&
             self.channels[1].paused == 0) {
-            // Increment the hblank-sourced T1 counter by 1.0 each
-            // hblank; handleIrq's float overflow/target checks reset it.
             self.channels[1].counter = self.channels[1].counter + 1.0;
             self.handleIrq(1, ic, cop0);
         }
