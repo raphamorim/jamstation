@@ -23,7 +23,7 @@ const {
 } = import("cpu");
 
 // Force device modules into this module's codegen context so bus.jam's
-// createBus body (which calls gpuAlloc / createDma / etc.) resolves.
+// createBus body (which calls Gpu.init / createDma / etc.) resolves.
 const { Gpu } = import("gpu");
 const { createGte, gteExec, gteDivide,
         gteDataRead, gteDataWrite, gteCtrlWrite, gteCtrlRead,
