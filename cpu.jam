@@ -1133,7 +1133,6 @@ pub fn cpuIrqPending(cop0: *mut[] u32) bool {
     return (sr & cause & 0x0000FF00) != 0;
 }
 
-// One CPU cycle: latch PC, fetch, advance, dispatch.
 pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     c.savedPc = c.pc;
     c.delaySlot = c.branch;
@@ -1143,20 +1142,17 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     if ((c.savedPc & 3) != 0) {
         cop0Write(cop0, C0_BADVADDR, c.savedPc);
         raiseException(c, cop0, CAUSE_ADEL);
-        // Stop here: the PC is misaligned, so we cannot fetch this cycle.
+        // stop!
+        // the PC is misaligned, so we cannot fetch this cycle.
         // raiseException has already redirected PC to the exception vector;
-        // the next cycle fetches from there. Mirrors the IBE branch below
-        // and every reference emulator (mednafen `goto OpDone`, DuckStation
-        // FlushPipeline). Without the return we'd fall through and fetch from
-        // the misaligned/vector address, double-faulting or double-executing.
+        // the next cycle fetches from there.
         return;
     }
 
+    // this was verified by ps1-tests cpu/code-in-io
     // Instruction fetch is allowed from cached RAM/BIOS and from a few
     // IO regions that happen to respond as if they're memory (SPU and
-    // DMA register banks). Everything else - scratchpad, MDEC, IRQ
-    // controller, GPU, CDROM, etc. - triggers Bus Error on Instruction
-    // (excode 6). Verified by ps1-tests cpu/code-in-io.
+    // DMA register banks).
     const pcPhys: u32 = c.savedPc & 0x1FFFFFFF;
     const inRam:  bool = pcPhys < 0x00800000;
     const inBios: bool = pcPhys >= 0x1FC00000 && pcPhys < 0x1FC80000;
@@ -1168,36 +1164,11 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         return;
     }
 
-    // Take an external interrupt before issuing the next instruction -
-    // checked here after fetch and
-    // before dispatch. CAUSE_INT has code 0 (already in CAUSE bits 6..2
-    // when raised), so we just trip the exception vector.
-    //
-    // `return` after the exception so the current cycle does NOT
-    // dispatch the vector's first instruction - that happens on the
-    // next cycle. Without the return, every IRQ
-    // handler would run 1 instruction ahead.
-
-    //
-    // Fetch-access cost (bus access cycles):
-    // reading an opcode from the BIOS ROM costs 18 cycles (BIOS bus
-    // delay=18); RAM/scratchpad/IO cost 0. This is the dominant
-    // per-instruction timing difference from a flat model - BIOS code,
-    // where the CD/IO polling loops live, advances device clocks ~10×
-    // faster per instruction.
     var fetchCyc: u64 = 0;
     if (inBios) { fetchCyc = 18; }
 
     if (cpuIrqPending(cop0)) {
-        // Hardware quirk: a COP2 (GTE) math op "wins" over a pending IRQ -
-        // it executes before the interrupt is taken, and because EPC
-        // points back at it, it re-runs after the handler returns.
-        // Handle this by executing the op here when the
-        // instruction about to run (at c.pc == savedPc) is a GTE math
-        // op: primary 0x12 with the COP2 command bit set (0x4A......).
         const irqOpc: u32 = busRead32(bus, c.pc);
-        // Charge fetch + (GTE op cycles if the op won); execute() does
-        // not run on an IRQ-taken cycle, so there is no +2 base here.
         var irqCyc: u64 = fetchCyc;
         if ((irqOpc & 0xFE000000) == 0x4A000000) {
             // Commit the pending delayed load as the first statement of this
@@ -1220,9 +1191,6 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
 
     c.pc = c.nextPc;
     c.nextPc = c.nextPc + 4;
-    // Total cost = fetch cycles + instruction cycles. Most
-    // instructions cost 2; the COP2 math path
-    // below adds the remainder of its GTE op cost on top of this base.
     c.cycles = c.cycles + fetchCyc + 2;
 
     dispatch(c, opc, bus, regs, cop0);
@@ -1240,8 +1208,7 @@ pub fn run(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
     commitLoad(c, regs);
 }
 
-// BIOS A/B-table hooks
-
+// TODO: Revisit
 // Emit one BIOS console byte. std/fmt.print's `{b}` interpolation on a
 // `[]u8` slice dispatches to a raw byte-write (same `@emitWriteBytes`
 // path the literal-string `print("...")` form uses, write(1, ...) under
@@ -1285,8 +1252,6 @@ pub fn biosHook(c: mut Cpu, bus: Bus, regs: *mut[] u32) {
         }
     }
 }
-
-// MIPS instruction encoders (for hand-assembling tests)
 
 pub fn encR(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, fn_: u32) u32 {
     return ((op  & 0x3F) << 26)

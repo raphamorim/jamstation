@@ -1,7 +1,5 @@
-// CUE-sheet parser.
-//
-// A .cue text file describes how one or more .bin files map to CD-ROM
-// tracks. The minimum we need to parse is:
+// .cue text file describes how one or more .bin files map to CD-ROM
+// tracks.
 //
 //   FILE "track.bin" BINARY
 //     TRACK 01 MODE2/2352
@@ -12,18 +10,11 @@
 // Each TRACK has a mode (MODE1/2048, MODE1/2352, MODE2/2336, MODE2/2352,
 // AUDIO, etc.) and one or two INDEX entries (00 = pregap start, 01 =
 // track data start, MSF format).
-//
-// We use fixed-size tables (max 16 files, 99 tracks) instead of
-// linked lists - Jam's stdlib doesn't ship one and a CD can't have more
-// than 99 tracks anyway. Each track stores absolute LBA start/end so the
-// disc-read path can look up by LBA.
 
-// All file I/O goes through std.fs - no raw libc file ABI in this module.
 const { File, exists, canonicalize } = import("std/fs");
 const { Vec } = import("std/collections");
 const { Box } = import("std/box");
 
-// Track-mode enum (subset we actually use).
 pub const TRACK_MODE_UNKNOWN: u32 = 0;
 pub const TRACK_MODE_AUDIO:    u32 = 1;
 pub const TRACK_MODE_MODE1_2048: u32 = 2;
@@ -35,54 +26,42 @@ pub const MAX_FILES:  u32 = 16;
 pub const MAX_TRACKS: u32 = 99;
 pub const SECTOR:     u32 = 2352;
 
-// Per-file metadata. `file` is the libc FILE* (kept open while the CUE
-// is live); `startLba` is the absolute LBA where this file's first
-// sector lands.
-// Internal types - not exported (other modules treat Cue as an opaque
-// `*mut[] u8` blob and use the cueXxx functions to interact).
 pub const CueFile = struct {
-    file:     File,         // std.fs.File handle
-    sectors:  u32,          // file_size / SECTOR
-    startLba: u32,          // LBA where this file's sector 0 lands
-    pathLo:   u32,          // path stored separately, see Cue.pathBuf
+    file:     File,
+    sectors:  u32,
+    // LBA where this file's sector 0 lands
+    startLba: u32,
+    pathLo:   u32,
     pathHi:   u32,
 };
 
 pub const CueTrack = struct {
     number:   u32,
-    mode:     u32,          // TRACK_MODE_*
+    mode:     u32,
     pregap:   u32,
-    startLba: u32,          // absolute LBA, inclusive
-    endLba:   u32,          // absolute LBA, exclusive
-    index0:   i32,          // -1 if not specified
+    startLba: u32,
+    endLba:   u32,
+    index0:   i32,
     index1:   i32,
-    fileIdx:  u32,          // which entry in files[]
+    fileIdx:  u32,
 };
 
 pub const Cue = struct {
-    // Vec instead of raw `*mut[] T` so each backing buffer auto-drops
-    // when the enclosing Box(Cue) is destroyed (Box.drop -> @dropInPlace
-    // -> field walk -> Vec.drop). Cue's own `cfn drop` is the iterate-and-
-    // close-files cleanup that Vec can't synthesize for a File handle.
     files:     Vec(CueFile),
     tracks:    Vec(CueTrack),
     fileCount: u32,
     trackCount: u32,
-    // Concatenated path strings, NUL-terminated; pathLo/pathHi index into here.
     pathBuf:   Vec(u8),
     pathBufLen: u32,
     pathBufCap: u32,
-    // Parser scratch state (readByte loop).
     file:      File,
-    cur:       u32,         // current character (sentinel-extended)
-    rootPath:  Vec(u8),     // directory of the .cue, used to resolve BIN paths
+    // current character
+    cur:       u32,
+    // directory of the .cue
+    rootPath:  Vec(u8),
     rootLen:   u32,
 
-    // Close every open per-file handle before the Vec backings get
-    // freed by the auto-drop. The Vec drop itself doesn't know how to
-    // close a File - that's our responsibility. The user-side cleanup
-    // path is `cueClose(c)`; this `cfn drop` is the safety net for any
-    // path that bypasses cueClose (e.g. test teardown).
+    // TODO: File in std will apply it's own drop so we don't need this
     cfn drop(self: mut Self) {
         var i: u32 = 0;
         while (i < self.fileCount) {
@@ -96,12 +75,12 @@ pub const Cue = struct {
     }
 };
 
-// helpers
-
 pub fn isAlpha(c: u32) bool {
-    if (c >= 0x41 && c <= 0x5A) { return true; }
-    if (c >= 0x61 && c <= 0x7A) { return true; }
-    return false;
+    match (c) {
+        0x41..=0x5A { return true; }   // A-Z
+        0x61..=0x7A { return true; }   // a-z
+        _ { return false; }
+    }
 }
 
 pub fn isDigit(c: u32) bool {
@@ -122,12 +101,11 @@ pub fn strEqAscii(a: *mut[] u8, b: *const[] u8, n: u32) bool {
     return true;
 }
 
-// Parse "MM:SS:FF" into an LBA (75 frames per second, 60 sec per min).
 pub fn parseMsf(raw: *mut[] u8) u32 {
     var c: *mut[] Cue = raw as *mut[] Cue;
     if (!isDigit(c[0].cur)) { return 0; }
     const m: u32 = parseNumber(raw);
-    if (c[0].cur != 0x3A) { return 0; }     // ':'
+    if (c[0].cur != 0x3A) { return 0; }
     c[0].cur = c[0].file.readByte() as u32 & 0xFF;
     const s: u32 = parseNumber(raw);
     if (c[0].cur != 0x3A) { return 0; }

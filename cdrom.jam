@@ -233,9 +233,6 @@ pub const Cdrom = struct {
         self.respW = 0;
     }
 
-    // Status byte: SPINDLE always, plus
-    // READ while the sector pump is active, SHELLOPEN if no disc,
-    // IDERROR if mode bit 4 is set.
     pub fn getStat(self: Self) u32 {
         var s: u32 = CD_STAT_SPINDLE;
         if (self.readOngoing != 0) { s = s | CD_STAT_READ; }
@@ -244,16 +241,10 @@ pub const Cdrom = struct {
         return s;
     }
 
-    // register I/O
-
-    // Status register at offset 0 (always, regardless of bank).
     pub fn readStatus(self: Self) u32 {
         var r: u32 = (self.index as u32) & 0x3;
         // bit 2 (ADPBUSY): XA-ADPCM streaming active. Set when a ReadN/ReadS
         // runs in XA mode.
-        // (Brave Fencer's FMV polls this; jam hardcoding 0 made the game
-        // branch away from the decode path - the SECOND trace-diff divergence,
-        // instr ~368.37M.)
         if (self.xaPlaying != 0) { r = r | 0x04; }
         if (self.paramEmpty()) { r = r | 0x08; }
         if (!self.paramFull())  { r = r | 0x10; }
@@ -308,14 +299,6 @@ pub const Cdrom = struct {
                 var delay: u32 = CD_DELAY_FR;
                 if ((val & 0xFF) == CDL_INIT) { delay = CD_DELAY_INIT_FR; }
                 self.delay = delay;
-                // A command write does NOT raise BUSYSTS: `state` was just set
-                // to TX_RESP1 two lines above, so any "if reading, mark busy"
-                // check sees TX_RESP1, not READ, and never fires. We must not
-                // assert busy either: doing so on the mid-read GetlocL/Getstat
-                // polls that the BFM/Suikoden FMV loader spams makes the game
-                // see the drive busy when it should be idle, so it re-reads the
-                // resource sectors forever and never triggers the MDEC decode
-                // (FMV black-screen).
             }
             // Push parameter byte.
             2 { self.pushParam(val); }
@@ -344,16 +327,11 @@ pub const Cdrom = struct {
         self.write8(off + 3, (val >> 24) & 0xFF);
     }
 
-    // state-machine tick
-
-    // Handle the command response - dispatch the queued command
-    // after the TX_RESP1 delay elapses.
     pub fn executeCommand(self: mut Self, disc: *mut[] Disc,
                           ic: *mut[] u32, cop0: *mut[] u32) {
         const cmd: u32 = self.pendingCmd as u32;
         self.busy = 0;
 
-        // Response-1 prechecks, before dispatch:
         // (1) disc-required commands with no disc -> INT5(11h,80h),
         // (3) wrong parameter count -> INT5(03h,20h), unknown command ->
         // INT5(03h,40h). (Version checks are omitted - jam models a
@@ -412,14 +390,9 @@ pub const Cdrom = struct {
             self.errorOut(CD_STAT_SPINDLE, CD_ERR_INVALID_SUBFUNC);
             return;
         }
-        // Single-INT3 status commands.
         if (cmd == CDL_GETSTAT || cmd == CDL_MUTE || cmd == CDL_DEMUTE ||
             cmd == CDL_SETMODE || cmd == CDL_RESET || cmd == CDL_SETLOC) {
             if (cmd == CDL_SETMODE) {
-                // SetMode: a 1x<->2x speed change
-                // costs a big ~650ms drive resync, charged to the next read.
-                // FMV setup (SetMode double-speed -> ReadN) relies on it;
-                // without it the first STR sector arrives too early.
                 const prevSpeed: u32 = self.mode as u32 & MODE_SPEED;
                 self.mode = self.popParam() as u8;
                 if (prevSpeed != (self.mode as u32 & MODE_SPEED)) {
@@ -430,9 +403,6 @@ pub const Cdrom = struct {
                 const m: u32 = self.popParam();
                 const s: u32 = self.popParam();
                 const f: u32 = self.popParam();
-                // Validate the MSF before accepting:
-                // BCD-valid nibbles, seconds < 0x60, frame < 0x75. Invalid
-                // MSF -> INT5(stat, 0x10) instead of an INT3 success.
                 const bcdOk: bool = ((m & 0x0F) <= 9) && ((m >> 4) <= 9) &&
                                     ((s & 0x0F) <= 9) && ((s >> 4) <= 9) &&
                                     ((f & 0x0F) <= 9) && ((f >> 4) <= 9);
@@ -448,7 +418,6 @@ pub const Cdrom = struct {
             self.ifr = 3;
             self.pushResp(self.getStat());
             if (cmd == CDL_SETMODE) {
-                // SetMode hard-resets the state machine to IDLE.
                 self.state        = CD_STATE_IDLE as u8;
                 self.prevState    = CD_STATE_IDLE as u8;
                 self.readOngoing  = 0;
@@ -458,7 +427,6 @@ pub const Cdrom = struct {
             self.state = self.prevState;
             return;
         }
-        // CdlPause: two-phase. INT3+stat, then delayed INT2+stat.
         if (cmd == CDL_PAUSE) {
             self.ifr = 3;
             self.pushResp(self.getStat());
@@ -478,10 +446,6 @@ pub const Cdrom = struct {
             self.ifr = 3;
             self.pushResp(self.getStat());
             self.state = CD_STATE_TX_RESP2 as u8;
-            // Init's 2nd-response delay is
-            // CD_DELAY_1MS (33869), NOT CD_DELAY_INIT_FR (81102). The 47233-cyc
-            // gap made jam's Init INT2 fire late, slipping the CD IRQ at ~164.8M
-            // (the next trace divergence after the GPU-acc/-ffast-math one).
             self.delay = CD_DELAY_1MS;
             return;
         }
@@ -489,11 +453,6 @@ pub const Cdrom = struct {
             self.ifr = 3;
             self.pushResp(self.getStat());
             self.state = CD_STATE_TX_RESP2 as u8;
-            // seek precision is set in resp2 on success, not
-            // here in resp1. SeekL's 2nd-response delay is
-            // CD_DELAY_1MS (NOT FR) - the FR=50401 vs 1MS=33869 gap (16532
-            // cyc) made jam's SeekL INT2 fire ~8266 instrs late, the root of
-            // the FMV CD-INT divergence at ~102.7M.
             self.delay = CD_DELAY_1MS;
             return;
         }
@@ -515,8 +474,6 @@ pub const Cdrom = struct {
             self.state        = CD_STATE_READ as u8;
             self.prevState    = CD_STATE_READ as u8;
             self.readOngoing  = 1;
-            // A read in XA-ADPCM mode marks the drive
-            // as XA-streaming (status bit2 ADPBUSY). The game polls this.
             if ((self.mode as u32 & MODE_XA_ADPCM) != 0) { self.xaPlaying = 1; }
             self.delay = self.readDelay();
             return;
@@ -551,9 +508,6 @@ pub const Cdrom = struct {
         }
         if (cmd == CDL_GETLOCP) {
             self.ifr = 3;
-            // GetLocP: track/index from
-            // the disc; subtract the 25-sector seek slop FIRST, then derive
-            // both the relative (within-track) and absolute MSF from it.
             const lbaRaw: u32 = self.lba;
             const track: u32 = discTrackNumber(disc, lbaRaw);
             const trackLba: u32 = discTrackLba(disc, track);
@@ -583,7 +537,6 @@ pub const Cdrom = struct {
             return;
         }
         if (cmd == CDL_GETTN) {
-            // GetTN: stat, first-track = 1 (raw), last = BCD(track count).
             self.ifr = 3;
             self.pushResp(self.getStat());
             self.pushResp(1);
@@ -597,8 +550,6 @@ pub const Cdrom = struct {
                 self.errorOut(CD_STAT_SPINDLE, CD_ERR_INVALID_SUBFUNC);
                 return;
             }
-            // GetTD: look up the track's absolute LBA ->
-            // MM:SS; INT5 if past the last track (TS_FAR = 0xFFFFFFFF here).
             const track: u32 = (bcd & 0x0F) + ((bcd >> 4) & 0x0F) * 10;
             const f: u32 = discTrackLba(disc, track);
             if (f == 0xFFFFFFFF) {
@@ -642,7 +593,7 @@ pub const Cdrom = struct {
             self.ifr = 3;
             self.pushResp(self.getStat());
             self.state = CD_STATE_TX_RESP2 as u8;
-            self.delay = CD_DELAY_1MS;   // SeekP: 1MS, not FR
+            self.delay = CD_DELAY_1MS;
             return;
         }
 
@@ -696,8 +647,6 @@ pub const Cdrom = struct {
         return CD_DELAY_READ_SS;
     }
 
-    // Second-phase response for two-stage commands (Init / GetID /
-    // Seek / Pause).
     pub fn executeResp2(self: mut Self, disc: *mut[] Disc) {
         const cmd: u32 = self.pendingCmd as u32;
         if (cmd == CDL_INIT) {
@@ -707,10 +656,6 @@ pub const Cdrom = struct {
             return;
         }
         if (cmd == CDL_SEEKL) {
-            // Query the seek TARGET (pendingLba)
-            // FIRST; TS_FAR -> INVALID_SUBFUNC, TS_AUDIO -> SEEK_FAILED, and
-            // the seek is NOT committed on error. On success commit and
-            // set seek precision = 1.
             const tsl: u32 = discQuery(disc, self.pendingLba);
             if (tsl == 3) {
                 self.errorOut(CD_STAT_SPINDLE | CD_STAT_SEEKERROR,
@@ -734,9 +679,6 @@ pub const Cdrom = struct {
             return;
         }
         if (cmd == CDL_SEEKP) {
-            // SeekP: INT2(stat), commit
-            // the seek, seek precision = 0. No seek-error check (SeekP is
-            // the audio-seek command and may land on CDDA tracks).
             self.ifr = 2;
             self.pushResp(self.getStat());
             self.processSetloc();
@@ -749,8 +691,6 @@ pub const Cdrom = struct {
             return;
         }
         if (cmd == CDL_STOP) {
-            // Stop: rewind to LBA 150 and
-            // pause, then INT2(stat).
             self.pendingLba = 150;
             self.processSetloc();
             self.readOngoing = 0;
@@ -762,7 +702,6 @@ pub const Cdrom = struct {
             return;
         }
         if (cmd == CDL_MOTORON || cmd == CDL_SETSESSION || cmd == CDL_READTOC) {
-            // Each sends a second INT2(stat).
             self.ifr = 2;
             self.pushResp(self.getStat());
             self.state = CD_STATE_IDLE as u8;
@@ -826,7 +765,6 @@ pub const Cdrom = struct {
         self.busy       = 0;
     }
 
-    // Per-scanline tick. Advances the response/read state machine.
     pub fn update(self: mut Self, disc: *mut[] Disc, spu: *mut[] u8,
                   ic: *mut[] u32, cop0: *mut[] u32, cyc: u32) {
         var delay: u32 = self.delay;
@@ -837,15 +775,6 @@ pub const Cdrom = struct {
         }
         if (self.state == CD_STATE_IDLE as u8) { return; }
         if (self.state == CD_STATE_PLAY as u8) { return; }
-        // Hold off until the game acks the previous INT. Re-assert the CPU
-        // IRQ each tick while it is pending AND enabled: if IER bit 0 was
-        // clear when the sector fired (so no IRQ reached the CPU) and the
-        // game enables it afterwards, this delivers the pending INT1 instead
-        // of wedging the drive forever with an unacked, never-delivered INT.
-        // All four reference emulators guarantee a queued INT1 is eventually
-        // delivered (DuckStation cdrom.cpp:1806 "there isn't much that can
-        // stop an INT1 once it's been queued"). Idempotent: irqRaise only ORs
-        // I_STAT, so re-raising an already-set bit each tick is harmless.
         if ((self.ifr as u32 & 0x1F) != 0) {
             if ((self.ifr as u32 & self.ier as u32 & 0x1F) != 0) {
                 irqRaise(ic, cop0, IC_CDROM);
@@ -855,11 +784,9 @@ pub const Cdrom = struct {
         }
         if (self.state == CD_STATE_TX_RESP1 as u8) {
             self.executeCommand(disc, ic, cop0);
-            // Switching to READ after a non-read
-            // command in TX_RESP1 incurs a delay.
             if (self.state == CD_STATE_READ as u8) {
                 self.processSetloc();
-                // First sector after a command uses the ongoing-read delay
+                // first sector after a command uses the ongoing-read delay
                 // (= readDelay + 4ms). The speed-switch resync delay is
                 // computed but then overwritten by this ongoing-read delay,
                 // so it never applies; adding pendingSpeedSwitch (~650ms once)
@@ -871,11 +798,7 @@ pub const Cdrom = struct {
             self.executeResp2(disc);
             if (self.state == CD_STATE_READ as u8) {
                 self.processSetloc();
-                // First sector after a command uses the ongoing-read delay
-                // (= readDelay + 4ms). The speed-switch resync delay is
-                // computed but then overwritten by this ongoing-read delay,
-                // so it never applies; adding pendingSpeedSwitch (~650ms once)
-                // delayed the first FMV sector. Drop it; just consume it.
+                // same
                 self.delay = self.readDelay() + 4 * 33869;
                 self.pendingSpeedSwitch = 0;
             }
@@ -890,8 +813,6 @@ pub const Cdrom = struct {
     pub fn handleRead(self: mut Self, disc: *mut[] Disc, spu: *mut[] u8) {
         self.processSetloc();
         if (self.hasDisc == 0) {
-            // Report no-disc as SHELLOPEN (0x10), giving INT5(11h,80h)
-            // - not SPINDLE (which would give 03h,80h).
             self.errorOut(CD_STAT_SHELLOPEN, CD_ERR_NO_DISC);
             return;
         }
@@ -901,20 +822,11 @@ pub const Cdrom = struct {
                           CD_ERR_INVALID_SUBFUNC);
             return;
         }
-        // XA-ADPCM audio sectors are decoded to the SPU, but we STILL deliver
-        // the sector via INT1 + the data FIFO. INT1 fires for EVERY data-track
-        // sector regardless of submode (XA is decoded on a separate parallel
-        // path), as on real hardware
-        // when no audio filter is set. Suppressing audio-sector INT1s here
-        // (the previous "filter" behaviour, ported from Avocado's filtered
-        // model) desynced games that do SOFTWARE de-interleaving - they expect
-        // one interrupt per sector to track stream position, so dropping the
-        // audio INT1s stalled FMV streaming. submode is at sector offset 0x12
-        // (bit 2 = Audio, bit 6 = Real-time).
         const submode: u32 = self.dataBuf[18] as u32;
         const isXaAudio: bool = (submode & 0x04) != 0 && (submode & 0x40) != 0;
         if ((self.mode as u32 & MODE_XA_ADPCM) != 0 && isXaAudio) {
-            self.tryDecodeXa(spu);       // SPU CD-audio; fall through to deliver INT1
+            // SPU CD-audio; fall through to deliver INT1
+            self.tryDecodeXa(spu);
         }
 
         var rIdx: u32 = 24;
@@ -929,15 +841,15 @@ pub const Cdrom = struct {
         self.ifr = 1;
         self.pushResp(self.getStat());
 
-        self.pendingLba = lba + 1;   // advance deferred via pendingLba; lba promoted on the next processSetloc (so GetLocL/P returns the current sector, not the next)
+        self.pendingLba = lba + 1;
         self.delay = self.readDelay();
     }
 
     pub fn tryDecodeXa(self: mut Self, spu: *mut[] u8) {
+        // TODO: Revist this
         // Copy the current sector into a scratch buffer because the XA
         // helpers want a *mut[] u8 / *const[] u8 they can stride
-        // through. Same shape as the old code; only the source is now
-        // `self.dataBuf` instead of `d[C_DATA_BUF + i]`.
+        // through.
         var scratch: [2352]u8 = [0; 2352];
         var i: u32 = 0;
         while (i < 2352) {
@@ -961,18 +873,6 @@ pub const Cdrom = struct {
                                       monoBuf.asMutPtr(),
                                       self.xaLh.asMutPtr(),
                                       self.xaRh.asMutPtr());
-        // Resample from the sector's native rate (37800 Hz, or 18900 Hz for an
-        // f18khz sector) to the SPU's 44100 Hz output rate before pushing. The
-        // SPU CD FIFO is drained one entry per 44100 Hz output sample, so
-        // pushing native-rate samples 1:1 plays XA ~17% too fast and overruns
-        // the FIFO (most samples dropped -> warble). The resampler is
-        // conceptually a 7×-upsample -
-        // whose `(k+1)/8` integer-divides to 0, making it a sample-and-hold of
-        // the previous source sample - then decimate by m=f18khz?3:6, yielding
-        // `resampleCount` samples at 44100 Hz. Output j samples source index
-        // q-1 where q=(j*m)/7; q==0 uses the previous sector's last output
-        // sample (the `ls` seed, carried in xaPrevL/R). n (2016 stereo / 4032
-        // mono) bounds the source; q-1 never reaches it for any valid j.
         const f18: bool = xaSectorIs18kHz(scratch.asPtr());
         var m: u32 = 6;
         if (f18) { m = 3; }
@@ -990,7 +890,7 @@ pub const Cdrom = struct {
             outR = lsR;
             if (q != 0) {
                 var si: u32 = q - 1;
-                if (si >= n) { si = n - 1; }   // n = native sample count (2016/4032)
+                if (si >= n) { si = n - 1; }
                 if (stereo) {
                     outL = leftBuf[si];
                     outR = rightBuf[si];
@@ -1011,12 +911,10 @@ pub const Cdrom = struct {
         self.xaPrevR = outR;
     }
 
-    // Read one sector at `lba` into the dataBuf. Returns 1 on success.
     pub fn discReadAt(self: Self, disc: *mut[] Disc, lba: u32) i32 {
         return discRead(disc, lba, self.dataBuf.asMutPtr());
     }
 
-    // Read one byte from the data FIFO (the 0x1F801802 register).
     pub fn readData(self: mut Self) u32 {
         if (self.dataReq == 0) { return 0; }
         var rIdx: u32 = self.dataRidx;
@@ -1027,8 +925,6 @@ pub const Cdrom = struct {
         return v as u32;
     }
 };
-
-// free helpers (no state required)
 
 // Binary-to-BCD encoder. Inputs 0..99.
 pub fn bcdEnc(v: u32) u32 {
@@ -1043,7 +939,6 @@ pub fn bcdValid(b: u32) bool {
 }
 
 // CD-ROM controller version-ID table, 4 bytes per version. Index 1 = C0A.
-// `version` is unused for v1 - would index a table for other versions.
 pub fn versionByteForIdx(version: u32, n: u32) u32 {
     if (n == 0) { return 0x94; }
     if (n == 1) { return 0x09; }
