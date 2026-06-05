@@ -860,22 +860,70 @@ pub fn dispatchCop0(c: mut Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) {
 pub fn dispatch(c: mut Cpu, opc: u32, bus: Bus,
                 regs: *mut[] u32, cop0: *mut[] u32) {
     const p: u32 = opPrim(opc);
-    if (p == 0x00) { dispatchSpecial(c, opc, bus, regs, cop0); return; }
-    if (p == 0x01) { iRegimm(c, opc, regs); return; }
-    if (p == 0x02) { iJ(c, opc, regs); return; }
-    if (p == 0x03) { iJal(c, opc, regs); return; }
-    if (p == 0x04) { iBeq(c, opc, regs); return; }
-    if (p == 0x05) { iBne(c, opc, regs); return; }
-    if (p == 0x06) { iBlez(c, opc, regs); return; }
-    if (p == 0x07) { iBgtz(c, opc, regs); return; }
-    if (p == 0x08) { iAddi(c, opc, regs, cop0); return; }
-    if (p == 0x09) { iAddiu(c, opc, regs); return; }
-    if (p == 0x0A) { iSlti(c, opc, regs); return; }
-    if (p == 0x0B) { iSltiu(c, opc, regs); return; }
-    if (p == 0x0C) { iAndi(c, opc, regs); return; }
-    if (p == 0x0D) { iOri(c, opc, regs); return; }
-    if (p == 0x0E) { iXori(c, opc, regs); return; }
-    if (p == 0x0F) { iLui(c, opc, regs); return; }
+    if (p == 0x00) {
+        dispatchSpecial(c, opc, bus, regs, cop0);
+        return;
+    }
+    if (p == 0x01) {
+        iRegimm(c, opc, regs);
+        return;
+    }
+    if (p == 0x02) {
+        iJ(c, opc, regs);
+        return;
+    }
+    if (p == 0x03) {
+        iJal(c, opc, regs);
+        return;
+    }
+    if (p == 0x04) {
+        iBeq(c, opc, regs);
+        return;
+    }
+    if (p == 0x05) {
+        iBne(c, opc, regs);
+        return;
+    }
+    if (p == 0x06) {
+        iBlez(c, opc, regs);
+        return;
+    }
+    if (p == 0x07) {
+        iBgtz(c, opc, regs);
+        return;
+    }
+    if (p == 0x08) {
+        iAddi(c, opc, regs, cop0);
+        return;
+    }
+    if (p == 0x09) {
+        iAddiu(c, opc, regs);
+        return;
+    }
+    if (p == 0x0A) {
+        iSlti(c, opc, regs);
+        return;
+    }
+    if (p == 0x0B) {
+        iSltiu(c, opc, regs);
+        return;
+    }
+    if (p == 0x0C) {
+        iAndi(c, opc, regs);
+        return;
+    }
+    if (p == 0x0D) {
+        iOri(c, opc, regs);
+        return;
+    }
+    if (p == 0x0E) {
+        iXori(c, opc, regs);
+        return;
+    }
+    if (p == 0x0F) {
+        iLui(c, opc, regs);
+        return;
+    }
     if (p == 0x10) {
         const sr10: u32 = cop0Read(cop0, C0_SR);
         if ((sr10 & 0x10000000) == 0 && (sr10 & 0x02) != 0) {
@@ -914,18 +962,54 @@ pub fn dispatch(c: mut Cpu, opc: u32, bus: Bus,
         commitLoad(c, regs);
         return;
     }
-    if (p == 0x20) { iLb(c, opc, bus, regs); return; }
-    if (p == 0x21) { iLh(c, opc, bus, regs, cop0); return; }
-    if (p == 0x22) { iLwl(c, opc, bus, regs); return; }
-    if (p == 0x23) { iLw(c, opc, bus, regs, cop0); return; }
-    if (p == 0x24) { iLbu(c, opc, bus, regs); return; }
-    if (p == 0x25) { iLhu(c, opc, bus, regs, cop0); return; }
-    if (p == 0x26) { iLwr(c, opc, bus, regs); return; }
-    if (p == 0x28) { iSb(c, opc, bus, regs, cop0); return; }
-    if (p == 0x29) { iSh(c, opc, bus, regs, cop0); return; }
-    if (p == 0x2A) { iSwl(c, opc, bus, regs, cop0); return; }
-    if (p == 0x2B) { iSw(c, opc, bus, regs, cop0); return; }
-    if (p == 0x2E) { iSwr(c, opc, bus, regs, cop0); return; }
+    if (p == 0x20) {
+        iLb(c, opc, bus, regs);
+        return;
+    }
+    if (p == 0x21) {
+        iLh(c, opc, bus, regs, cop0);
+        return;
+    }
+    if (p == 0x22) {
+        iLwl(c, opc, bus, regs);
+        return;
+    }
+    if (p == 0x23) {
+        iLw(c, opc, bus, regs, cop0);
+        return;
+    }
+    if (p == 0x24) {
+        iLbu(c, opc, bus, regs);
+        return;
+    }
+    if (p == 0x25) {
+        iLhu(c, opc, bus, regs, cop0);
+        return;
+    }
+    if (p == 0x26) {
+        iLwr(c, opc, bus, regs);
+        return;
+    }
+    if (p == 0x28) {
+        iSb(c, opc, bus, regs, cop0);
+        return;
+    }
+    if (p == 0x29) {
+        iSh(c, opc, bus, regs, cop0);
+        return;
+    }
+    if (p == 0x2A) {
+        iSwl(c, opc, bus, regs, cop0);
+        return;
+    }
+    if (p == 0x2B) {
+        iSw(c, opc, bus, regs, cop0);
+        return;
+    }
+    if (p == 0x2E) {
+        iSwr(c, opc, bus, regs, cop0);
+        return;
+    }
     if (p == 0x30) {
         const sr30: u32 = cop0Read(cop0, C0_SR);
         if ((sr30 & 0x10000000) == 0) {
