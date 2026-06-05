@@ -39,7 +39,6 @@ const { Vec } = import("std/collections");
 const { Timer } = import("timer");
 const { Mcd } = import("mcd");
 const { Mdec } = import("mdec");
-const { busBiosPtr } = import("bus");
 
 // File I/O via std.fs - no raw libc file ABI in the boot harness.
 const { File, exists } = import("std/fs");
@@ -555,7 +554,7 @@ fn emuLoadBios(bus: Bus) i32 {
     var path: []u8 = "SCPH1001.BIN";
     match (File.open(path)) {
         Some(f) {
-            var biosPtr: *mut[] u8 = busBiosPtr(bus);
+            var biosPtr: *mut[] u8 = bus.bios.ptr;
             const got: u64 = f.read(biosPtr[0..0x80000]);
             f.close();
             if (got != 0x80000) { return 0; }
