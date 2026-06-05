@@ -1,28 +1,17 @@
-// CD-ROM disc image. Supports two backends:
-//
 //   1. Raw .bin (Mode2/2352): single-file image, one data track. The
 //      historical layout for our test discs and most plain dumps.
 //   2. .cue + .bin(s): multi-track support via the CUE parser in
 //      cue.jam. Required for games shipping CDDA tracks after the
 //      data track (Brave Fencer Musashi, Wipeout, etc.).
 //
-// Disc.cue is non-null when we loaded a .cue. discRead then routes
-// through cueRead, which handles per-track file offsets, pregaps, and
-// audio/data type tagging. With raw .bin we treat the whole file as a
-// single Mode2/2352 data track.
-//
 // LBA convention follows the PSX BIOS:
 //   LBA = 150 -> start of track 1 data (00:02:00 on the disc)
 //   LBA = 150 + N -> Nth sector of the data track in the .bin file
-// We subtract the 150-sector lead-in when seeking inside the .bin -
-// real discs prefix the data with 2 seconds (150 sectors) of pregap
-// that's not part of the image file.
 
 const { Cue, createCue, cueReset, cueParse, cueRead, cueQuery,
         cueGetTrackCount, cueGetTrackLba, cueGetTrackNumber } = import("cue");
 
 const { Box } = import("std/box");
-// File I/O exclusively via std.fs - no raw libc file ABI in this module.
 const { File, exists } = import("std/fs");
 const { print } = import("std/fmt");
 
@@ -30,25 +19,14 @@ const SECTOR_SIZE: u32 = 2352;
 const LEAD_IN_SECTORS: u32 = 150;
 
 pub const Disc = struct {
-    file: File,        // std.fs.File - valid when a raw .bin is loaded
-    loaded: u8,        // 1 once discOpen succeeds
-    isCue: u8,         // 1 if cue-loaded (cuePtr is valid)
+    file: File,
+    loaded: u8,
+    isCue: u8,
     pad1: u8,
     pad2: u8,
-    // Always-allocated Box(Cue). For non-cue discs it sits empty
-    // (fileCount=0). For cue discs, cueParse writes into it in place.
-    // Auto-drop chain: Box(Disc).drop -> @dropInPlace -> field walk ->
-    // Box(Cue).drop -> @dropInPlace on Cue -> Cue.cfn drop closes files
-    // -> field walk drops each Vec backing. Holding the Box here (vs a
-    // raw `*mut[] u8`) is what makes the cleanup chain self-sufficient.
     cuePtr: Box(Cue),
 };
 
-// Owning heap-allocated Disc. Bus stores it as a `Box(Disc)` and the
-// auto-drop fires when the Bus goes out of scope. Internal helpers
-// (discOpen / discRead / ...) still take a raw `*mut[] Disc` so the
-// callsites can keep the `d[0].field` idiom; callers extract the raw
-// pointer with `box.ptrMut()`.
 pub fn createDisc() Box(Disc) {
     return Box(Disc).init(Disc {
         file:    File { handle: 0 as *mut[] u8 },
@@ -60,12 +38,6 @@ pub fn createDisc() Box(Disc) {
     });
 }
 
-// Reset open-file resources before either reopening this Disc with a new
-// image or letting the owning Bus go out of scope. For a cue disc we
-// invoke cueReset which closes every per-cue-track file handle and
-// zeros the file/track counters - the Cue's Vec backings stay live
-// (Box(Cue).drop frees them on scope exit). For a raw .bin we close
-// the single std.fs.File handle the Disc holds directly.
 pub fn discClose(d: *mut[] Disc) {
     if (d[0].isCue != 0) {
         cueReset(d[0].cuePtr.ptrMut());
@@ -76,7 +48,6 @@ pub fn discClose(d: *mut[] Disc) {
     d[0].loaded = 0;
 }
 
-// Detect .cue extension on a path. Case-insensitive on the suffix bytes.
 pub fn pathEndsWithCue(p: []u8) bool {
     var n: u32 = 0;
     while (p.ptr[n] != 0) { n = n + 1; }
@@ -94,11 +65,9 @@ pub fn pathEndsWithCue(p: []u8) bool {
     return false;
 }
 
-// Open a disc image. Paths ending in `.cue` parse the cue sheet (which
-// opens its own .bin files); everything else is treated as a raw
-// single-track Mode2/2352 .bin.
 pub fn discOpen(d: *mut[] Disc, path: []u8) i32 {
     if (pathEndsWithCue(path)) {
+        // TODO: Revisit
         // Reuse the always-allocated Box(Cue) at d[0].cuePtr - cueParse
         // populates it in place, so we don't have to deal with assigning
         // a new Box over the old one (jam doesn't auto-drop on field
@@ -122,17 +91,13 @@ pub fn discOpen(d: *mut[] Disc, path: []u8) i32 {
             print("Opened disc image: {path}\n");
             return 1;
         }
-        None { return 0; }
+        None {
+            return 0;
+        }
     }
     return 0;
 }
 
-// Read one 2352-byte sector at `lba` (absolute, including lead-in) into
-// `buf`. Returns 1 on success, 0 on out-of-range or no-disc.
-// Fill a 2352-byte buffer with the PSX CD-ROM pregap sector layout:
-// byte 0 = 0x00, bytes 1..10 = 0xFF (sync pattern), byte 11 = 0x00, rest
-// zero. Some games inspect the sync pattern
-// when reading pregap sectors and would otherwise see all-zero data.
 pub fn fillPregapSector(buf: *mut[] u8) {
     var i: u32 = 0;
     while (i < SECTOR_SIZE) { buf[i] = 0; i = i + 1; }
@@ -141,7 +106,9 @@ pub fn fillPregapSector(buf: *mut[] u8) {
 }
 
 pub fn discRead(d: *mut[] Disc, lba: u32, buf: *mut[] u8) i32 {
-    if (d[0].loaded == 0) { return 0; }
+    if (d[0].loaded == 0) {
+        return 0;
+    }
     if (d[0].isCue != 0) {
         return cueRead(d[0].cuePtr.ptrMut() as *mut[] u8, lba, buf);
     }
@@ -153,41 +120,55 @@ pub fn discRead(d: *mut[] Disc, lba: u32, buf: *mut[] u8) i32 {
     var f: File = d[0].file;
     f.seek(off, 0);
     const got: u64 = f.read(buf[0..SECTOR_SIZE]);
-    if (got != SECTOR_SIZE as u64) { return 0; }
+    if (got != SECTOR_SIZE as u64) {
+        return 0;
+    }
     return 1;
 }
 
 pub fn discLoaded(d: *mut[] Disc) i32 {
-    if (d[0].loaded == 0) { return 0; }
+    if (d[0].loaded == 0) {
+        return 0;
+    }
     return 1;
 }
 
-// track info (for CDROM GetTN/GetTD/GetLocP/seek)
-// Route to the cue track table when cue-loaded; a raw .bin is a single
-// Mode2/2352 data track starting at the lead-in (LBA 150).
-
 pub fn discTrackCount(d: *mut[] Disc) u32 {
-    if (d[0].loaded == 0) { return 0; }
-    if (d[0].isCue != 0) { return cueGetTrackCount(d[0].cuePtr.ptrMut() as *mut[] u8); }
+    if (d[0].loaded == 0) {
+        return 0;
+    }
+    if (d[0].isCue != 0) {
+        return cueGetTrackCount(d[0].cuePtr.ptrMut() as *mut[] u8);
+    }
     return 1;
 }
 
 // Absolute start LBA of `track` (track 0 = lead-out / total). Returns
 // 0xFFFFFFFF for a track past the end (cue's TS_FAR sentinel).
 pub fn discTrackLba(d: *mut[] Disc, track: u32) u32 {
-    if (d[0].isCue != 0) { return cueGetTrackLba(d[0].cuePtr.ptrMut() as *mut[] u8, track); }
-    if (track > 1) { return 0xFFFFFFFF; }
+    if (d[0].isCue != 0) {
+        return cueGetTrackLba(d[0].cuePtr.ptrMut() as *mut[] u8, track);
+    }
+    if (track > 1) {
+        return 0xFFFFFFFF;
+    }
     return LEAD_IN_SECTORS;
 }
 
 pub fn discTrackNumber(d: *mut[] Disc, lba: u32) u32 {
-    if (d[0].isCue != 0) { return cueGetTrackNumber(d[0].cuePtr.ptrMut() as *mut[] u8, lba); }
+    if (d[0].isCue != 0) {
+        return cueGetTrackNumber(d[0].cuePtr.ptrMut() as *mut[] u8, lba);
+    }
     return 1;
 }
 
-// Track state at `lba`: 0=DATA, 1=AUDIO, 2=PREGAP, 3=FAR (matches cueQuery).
+// Track state at `lba`: 0=DATA, 1=AUDIO, 2=PREGAP, 3=FAR
 pub fn discQuery(d: *mut[] Disc, lba: u32) u32 {
-    if (d[0].isCue != 0) { return cueQuery(d[0].cuePtr.ptrMut() as *mut[] u8, lba); }
-    if (lba < LEAD_IN_SECTORS) { return 2; }    // pregap
-    return 0;                                    // data
+    if (d[0].isCue != 0) {
+        return cueQuery(d[0].cuePtr.ptrMut() as *mut[] u8, lba);
+    }
+    if (lba < LEAD_IN_SECTORS) {
+        return 2;
+    }
+    return 0;
 }

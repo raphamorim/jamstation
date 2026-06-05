@@ -323,8 +323,6 @@ fn fillPregap(buf: *mut[] u8) {
     while (i < 11) { buf[i] = 0xFF; i = i + 1; }
 }
 
-// read a sector at the given absolute LBA. Returns 1 on
-// success, 0 on out-of-range or read failure.
 pub fn cueRead(raw: *mut[] u8, lba: u32, buf: *mut[] u8) i32 {
     var c: *mut[] Cue = raw as *mut[] Cue;
     const ti: u32 = cueFindTrack(raw, lba);
@@ -333,7 +331,7 @@ pub fn cueRead(raw: *mut[] u8, lba: u32, buf: *mut[] u8) i32 {
         if (c[0].trackCount > 0 && lba >= c[0].tracks.ptr[c[0].trackCount - 1].endLba) {
             return 0;
         }
-        // Pregap: fill zero + sync at bytes [1..10].
+        // fill zero + sync at bytes [1..10].
         fillPregap(buf);
         return 1;
     }
@@ -378,7 +376,6 @@ pub fn cueParse(raw: *mut[] u8, path: []u8) i32 {
         pi = pi + 1;
     }
     canonicalize(path, resolved.asMutPtr());
-    // Compute root path = resolved path up to last '/' or '\\'.
     var i: u32 = 0;
     var lastSlash: u32 = 0;
     while (resolved[i] != 0) {
@@ -400,11 +397,14 @@ pub fn cueParse(raw: *mut[] u8, path: []u8) i32 {
         const kn: u32 = parseKeyword(raw, kwbuf.asMutPtr());
         if (kn == 0) { break; }
         const kw: u32 = kwId(kwbuf.asMutPtr());
-        if (kw == 1) {                          // FILE
+        // FILE
+        if (kw == 1) {
             cueParseFile(raw);
-        } else if (kw == 2) {                   // TRACK
+        // TRACK
+        } else if (kw == 2) {
             cueParseTrack(raw);
-        } else if (kw == 3) {                   // INDEX
+        // INDEX
+        } else if (kw == 3) {
             cueParseIndex(raw);
         } else {
             // REM / PREGAP / POSTGAP / FLAGS - skip to end of line.
@@ -420,18 +420,17 @@ pub fn cueParse(raw: *mut[] u8, path: []u8) i32 {
     return 0;
 }
 
-// FILE "path" BINARY -> push a CueFile, open + size it.
 pub fn cueParseFile(raw: *mut[] u8) {
     var c: *mut[] Cue = raw as *mut[] Cue;
     skipWs(raw);
-    if (c[0].cur != 0x22) { return; }       // expect '"'
+    if (c[0].cur != 0x22) {
+        // expect '"'
+        return;
+    }
     c[0].cur = c[0].file.readByte() as u32 & 0xFF;
 
-    // 512 bytes covers any realistic path made of rootPath + name.
-    // Loop below bounds itself to 510 to leave room for NUL.
     var nameBuf: [512]u8 = [0; 512];
     var ni: u32 = 0;
-    // Prefix with the .cue's directory.
     while (ni < c[0].rootLen) {
         nameBuf[ni] = c[0].rootPath.ptr[ni];
         ni = ni + 1;
@@ -444,12 +443,10 @@ pub fn cueParseFile(raw: *mut[] u8) {
     nameBuf[ni] = 0;
     c[0].cur = c[0].file.readByte() as u32 & 0xFF;     // consume closing '"'
 
-    // Skip type keyword (BINARY / WAVE / etc.) - we only treat as binary.
     while (isSpace(c[0].cur)) { c[0].cur = c[0].file.readByte() as u32 & 0xFF; }
     while (isAlpha(c[0].cur)) { c[0].cur = c[0].file.readByte() as u32 & 0xFF; }
 
     if (c[0].fileCount >= MAX_FILES) { return; }
-    // nameBuf is a NUL-terminated path of length `ni`; view it as []u8.
     var namePtr: *const[] u8 = nameBuf.asPtr();
     var nameSlice: []u8 = namePtr[0..ni];
     if (!exists(nameSlice)) { return; }
@@ -463,7 +460,6 @@ pub fn cueParseFile(raw: *mut[] u8) {
         }
         None { return; }
     }
-    // nameBuf auto-drops on function-scope exit.
 }
 
 // TRACK NN MODE -> push a CueTrack tagged with the current file.

@@ -1,16 +1,3 @@
-// DMA controller.
-//
-// Seven 32-bit channels share a 0x80-byte register file at 0x1F801080.
-// Channel writes that flip the CHCR busy/trigger bits kick off a
-// transfer immediately. We support burst, request, and linked-list
-// sync modes on the GPU channel (channel 2); MDEC, CD-ROM, and SPU
-// channels are stubbed enough to not stall the BIOS.
-//
-// dma.jam does NOT import bus.jam (that would form a cycle through
-// bus.jam -> dma.jam -> bus.jam). Instead the Bus type is redeclared
-// structurally and we reach into bus.ram.ptr / bus.gpu directly, calling
-// gpuGp0 / vram helpers from gpu.jam where necessary.
-
 const { Gpu } = import("gpu");
 const { irqRaise, IC_DMA } = import("irq");
 const { Vec } = import("std/collections");
@@ -26,10 +13,7 @@ const SPU_TFIFO_OFF: u32 = 0x1A8;
 // d[21]    = DPCR
 // d[22]    = DICR
 // d[23..28]= per-channel "done" pulse flags
-// d[29]    = SPU DMA (ch4) remaining cycles before completion. Lets the
-//           channel stay "busy" while the test polls CHCR - ps1-tests
-//           spu/memory-transfer testDMAWriteTiming asserts that the
-//           transfer is observable in-flight (loopCount > 0).
+// d[29]    = SPU DMA (ch4) remaining cycles before completion.
 const DMA_STATE_WORDS: u32 = 30;
 const F_SPU_REMAIN: u32 = 29;
 
@@ -56,14 +40,9 @@ pub fn createDma() Vec(u32) {
     return b;
 }
 
-pub fn chBase(ch: u32) u32 { return ch * 3; }
-
-// direct RAM access (DMA never targets BIOS/scratchpad)
-//
-// The DMA controller bypasses the bus's address-space mapping when
-// reading sources or writing destinations - addresses in the channel
-// MADR register are physical RAM offsets (0..0x001FFFFF). We do the
-// 2 MB wrap explicitly here so dma.jam doesn't need to import bus.jam.
+pub fn chBase(ch: u32) u32 {
+    return ch * 3;
+}
 
 pub fn ramRead32(bus: Bus, addr: u32) u32 {
     const off: u32 = addr & 0x001FFFFC;
@@ -83,19 +62,17 @@ pub fn ramWrite32(bus: Bus, addr: u32, val: u32) {
     p[off + 3] = ((val >> 24) & 0xFF) as u8;
 }
 
-// IO surface
-
-// Per-channel CHCR hardwiring masks. Channels
-// 0..5 expose the full 32-bit CHCR through these mask bits; channel 6
-// (OTC) hardwires bit 1 to 1 and only allows bits 24, 28, 30 to be set
-// via writes - everything else reads back as zero. ps1-tests dma/otc-test
-// exercises this exactly.
 pub fn chcrHw1(ch: u32) u32 {
-    if (ch == 6) { return 0x00000002; }
+    if (ch == 6) {
+        return 0x00000002;
+    }
     return 0x00000000;
 }
+
 pub fn chcrHw0(ch: u32) u32 {
-    if (ch == 6) { return 0x50000002; }
+    if (ch == 6) {
+        return 0x50000002;
+    }
     return 0x71770703;
 }
 
@@ -120,30 +97,17 @@ pub fn dmaRead32(d: *mut[] u32, off: u32) u32 {
     return 0;
 }
 
-// Sub-offset byte/halfword reads must extract from the aligned 32-bit
-// register, special-casing 0x75/0x76
-// = DICR bytes. The old `dmaRead32(off) & mask` returned 0 for any offset not
-// 0x70/0x74 (dmaRead32's default) - so a `lbu`/`lhu` of the DICR enable bits
-// at 0x1F8010F5/F6 read 0, and Brave Fencer's per-frame DICR-enable RMW then
-// wrote the per-channel IRQ enables back as 0 -> DMA-completion IRQs stopped
-// firing -> the FMV's STR clock callback never ran -> black screen. (3rd
-// trace-diff divergence, instr 368,822,179; the write side already handled
-// these sub-offsets, only the read side was broken.)
 pub fn dmaRead16(d: *mut[] u32, off: u32) u32 {
     const shift: u32 = (off & 2) * 8;
     return (dmaRead32(d, off & 0xFFFFFFFC) >> shift) & 0xFFFF;
 }
+
 pub fn dmaRead8(d: *mut[] u32, off: u32) u32 {
     const shift: u32 = (off & 3) * 8;
     return (dmaRead32(d, off & 0xFFFFFFFC) >> shift) & 0xFF;
 }
 
 pub fn dmaWriteDicr(d: *mut[] u32, val: u32) {
-    // Preserve only bit 31 (IRQSI master flag) from the prior state,
-    // write-1-to-clear the channel flags, and copy the rest of the new
-    // value verbatim.
-    // Do NOT pre-recompute IRQSI here - dmaUpdate's edge detector
-    // requires `prev = old IRQSI` to fire a 0->1 transition.
     const ack: u32 = val & DICR_FLAGS;
     var flags: u32 = d[22] & DICR_FLAGS;
     flags = (flags & (~ack)) & DICR_FLAGS;
@@ -195,13 +159,6 @@ pub fn dmaWrite8(d: *mut[] u32, bus: Bus, cop0: *mut[] u32, off: u32, val: u32) 
     dmaWrite32(d, bus, cop0, off, val & 0xFF);
 }
 
-// Trigger a channel's transfer when CHCR is written with the busy bit
-// set. After the burst completes we immediately call dmaUpdate to fold
-// the per-channel d[23..28] "done" flags into DICR.FLAG bits and raise
-// IC_DMA if enabled - this folding ideally happens every CPU cycle,
-// but our scanline-granularity update missed the window where the game
-// polls DICR right after CHCR (Brave Fencer's audio bank loader does
-// exactly this around 0x80042510).
 pub fn dmaTrigger(d: *mut[] u32, bus: Bus, cop0: *mut[] u32, ch: u32) {
     match (ch) {
         0 { dmaDoMdecIn(d, bus); }
@@ -212,31 +169,30 @@ pub fn dmaTrigger(d: *mut[] u32, bus: Bus, cop0: *mut[] u32, ch: u32) {
         6 { dmaDoOtc(d, bus); }
         _ {}
     }
-    // No store-time dmaUpdate: the CHCR write only runs the transfer and
-    // defers all IRQ folding to the per-instruction dmaUpdate. The
-    // old store-time call here was a workaround for the obsolete per-scanline
-    // update granularity; with per-instruction dmaUpdate (main.jam) it's
-    // redundant and caused DMA IRQs to fire re-entrantly mid-store, ahead of
-    // the per-instruction update. The next instruction's dmaUpdate folds the
-    // done-flag one instruction later, which DICR polls still see.
 }
 
 pub fn chcrBusy(d: *mut[] u32, ch: u32) bool {
     return (d[chBase(ch) + F_CHCR] & CHCR_BUSY) != 0;
 }
+
 pub fn chcrTdir(d: *mut[] u32, ch: u32) bool {
     return (d[chBase(ch) + F_CHCR] & CHCR_TDIR) != 0;
 }
+
 pub fn chcrSync(d: *mut[] u32, ch: u32) u32 {
     return (d[chBase(ch) + F_CHCR] & CHCR_SYNC) >> 9;
 }
+
 pub fn chcrStep(d: *mut[] u32, ch: u32) u32 {
     if ((d[chBase(ch) + F_CHCR] & CHCR_STEP) != 0) { return 0xFFFFFFFC; }
+
     return 4;
 }
+
 pub fn bcrSize(d: *mut[] u32, ch: u32) u32 {
     return d[chBase(ch) + F_BCR] & 0xFFFF;
 }
+
 pub fn bcrBlocks(d: *mut[] u32, ch: u32) u32 {
     return (d[chBase(ch) + F_BCR] >> 16) & 0xFFFF;
 }
@@ -245,8 +201,6 @@ pub fn dmaClear(d: *mut[] u32, ch: u32) {
     d[chBase(ch) + F_CHCR] = d[chBase(ch) + F_CHCR] & (~(CHCR_BUSY | CHCR_TRIG));
     d[chBase(ch) + F_BCR]  = 0;
 }
-
-// per-channel transfer routines
 
 pub fn dmaDoGpu(d: *mut[] u32, bus: Bus) {
     if (!chcrBusy(d, 2)) { return; }
@@ -310,11 +264,6 @@ pub fn dmaDoGpuLinked(d: *mut[] u32, bus: Bus) {
     }
 }
 
-// DMA0: RAM -> MDEC input port. Each word from RAM is sent to the MDEC
-// data port (0x1F801820), which buffers it as command parameters or
-// command body. When all words for the active MDEC command are
-// delivered, MDEC's internal state machine runs the decode and fills
-// its output buffer (mdec.jam:mdecWrite32).
 pub fn dmaDoMdecIn(d: *mut[] u32, bus: Bus) {
     if (!chcrBusy(d, 0)) { return; }
     const size: u32 = bcrSize(d, 0) * bcrBlocks(d, 0);
@@ -333,7 +282,6 @@ pub fn dmaDoMdecIn(d: *mut[] u32, bus: Bus) {
     d[23] = size;
 }
 
-// DMA1: MDEC output port -> RAM.
 pub fn dmaDoMdecOut(d: *mut[] u32, bus: Bus) {
     if (!chcrBusy(d, 1)) { return; }
     const size: u32 = bcrSize(d, 1) * bcrBlocks(d, 1);
@@ -362,11 +310,7 @@ pub fn dmaDoCdrom(d: *mut[] u32, bus: Bus) {
     // CD->RAM is SyncMode 0 (burst: BCR low 16 = word count) or SyncMode 1
     // (block: low = block size in words, high = block count; total =
     // size*blocks). The old code used only bcrSize, so a SyncMode-1 read
-    // transferred ONE block instead of all of them - matching the original
-    // port but diverging from all four reference emulators (and the SPU
-    // channel here, which already multiplies). Under-reading made the game
-    // re-kick DMA3 per block, draining a partially-consumed FIFO into zero
-    // words.
+    // transferred ONE block instead of all of them.
     var size: u32 = 0;
     match (chcrSync(d, 3)) {
         0 { size = bcrSize(d, 3); if (size == 0) { size = 0x10000; } }
@@ -435,33 +379,22 @@ pub fn dmaDoSpu(d: *mut[] u32, bus: Bus) {
         }
     }
     d[chBase(4) + F_MADR] = addr;
-    // The SPU transfer completes instantly, FULLY clears CHCR
-    // (BUSY off), and raises the ch4 completion IRQ on the NEXT dmaUpdate
-    // (spu_irq_delay is set then immediately zeroed -> IC_DMA ~1 instr later).
-    // The old jam model kept BUSY for `words*8` cycles (d[F_SPU_REMAIN]) and
-    // only THEN raised the IRQ - an in-flight-DMA nicety for ps1-tests
-    // (testDMAWriteTiming), but it DEFERRED the completion IC_DMA by the whole
-    // transfer time. Brave Fencer's FMV kicks an SPU DMA (CHCR @1f8010c8 =
-    // 0x01000201) then polls I_STAT a few instructions later expecting that
-    // IC_DMA; the deferral made jam miss the poll, so the game never dispatched
-    // its DMA-IRQ handler - which is what advances the FMV's STR frame clock
-    // (0x800d24d0) - and the video stayed black.
-    // The fix: clear CHCR now + raise the ch4 done flag immediately so
-    // dmaUpdate folds it into DICR.DMA4FL -> IC_DMA on the next instruction.
     d[chBase(4) + F_CHCR] = 0;
     d[chBase(4) + F_BCR]  = 0;
     d[27] = 1;
 }
 
 pub fn dmaDoOtc(d: *mut[] u32, bus: Bus) {
-    // OTC runs only when all three gates are set: DPCR.DMA6EN (master
-    // enable, bit 27 of DPCR), CHCR.TRIG (bit 28), CHCR.BUSY (bit 24).
-    // ps1-tests dma/otc-test verifies that disabling DPCR master holds
-    // the transfer back; previously we only gated on BUSY.
-    if ((d[21] & 0x08000000) == 0) { return; }       // DPCR.DMA6EN
+    if ((d[21] & 0x08000000) == 0) {
+        return;
+    }
     const cr: u32 = d[chBase(6) + F_CHCR];
-    if ((cr & CHCR_TRIG) == 0) { return; }
-    if ((cr & CHCR_BUSY) == 0) { return; }
+    if ((cr & CHCR_TRIG) == 0) {
+        return;
+    }
+    if ((cr & CHCR_BUSY) == 0) {
+        return;
+    }
     var size: u32 = bcrSize(d, 6);
     if (size == 0) { size = 0x10000; }
     var addr: u32 = d[chBase(6) + F_MADR];
@@ -479,9 +412,6 @@ pub fn dmaDoOtc(d: *mut[] u32, bus: Bus) {
     d[28] = size;
 }
 
-// Tick the SPU DMA cycle countdown. Called from dmaUpdate so each CPU
-// step bleeds off a few cycles; once the channel has paid the full
-// ~16 cycles/word it finishes (BUSY=0) and the done-pulse fires.
 pub fn dmaTickSpu(d: *mut[] u32, delta: u32) {
     if (d[F_SPU_REMAIN] == 0) { return; }
     if (delta >= d[F_SPU_REMAIN]) {
@@ -493,40 +423,55 @@ pub fn dmaTickSpu(d: *mut[] u32, delta: u32) {
     }
 }
 
-// Called once per CPU instruction (main.jam). MDEC-in/out (ch0/ch1) are
-// the only channels that genuinely DELAY: the mdec-in/out irq-delay
-// decrements by 1 per call and raises the completion flag only when it
-// reaches 0 - so the MDEC DMA-done IRQ fires `size` instructions AFTER
-// the transfer.
-// d[23]/d[24] hold that remaining-instruction COUNT (set to `size` by the
-// transfer). All other channels fire on the next update (their delay is
-// zeroed before the !delay test = immediate). Brave Fencer's FMV chains the
-// next MDEC frame-decode off this IRQ; jam's old immediate fire landed it
-// before the handler was ready, so the decode pipeline never re-fed the
-// MDEC -> black video.
 pub fn dmaUpdate(d: *mut[] u32, ic: *mut[] u32, cop0: *mut[] u32) {
     if (d[23] != 0) {
         d[23] = d[23] - 1;
-        if (d[23] == 0 && (d[22] & 0x00010000) != 0) { d[22] = d[22] | 0x01000000; }
+        if (d[23] == 0 && (d[22] & 0x00010000) != 0) {
+            d[22] = d[22] | 0x01000000;
+        }
     }
     if (d[24] != 0) {
         d[24] = d[24] - 1;
-        if (d[24] == 0 && (d[22] & 0x00020000) != 0) { d[22] = d[22] | 0x02000000; }
+        if (d[24] == 0 && (d[22] & 0x00020000) != 0) {
+            d[22] = d[22] | 0x02000000;
+        }
     }
-    if (d[25] != 0) { d[25] = 0; if ((d[22] & 0x00040000) != 0) { d[22] = d[22] | 0x04000000; } }
-    if (d[26] != 0) { d[26] = 0; if ((d[22] & 0x00080000) != 0) { d[22] = d[22] | 0x08000000; } }
-    if (d[27] != 0) { d[27] = 0; if ((d[22] & 0x00100000) != 0) { d[22] = d[22] | 0x10000000; } }
-    if (d[28] != 0) { d[28] = 0; if ((d[22] & 0x00400000) != 0) { d[22] = d[22] | 0x40000000; } }
+    if (d[25] != 0) {
+        d[25] = 0;
+        if ((d[22] & 0x00040000) != 0) {
+            d[22] = d[22] | 0x04000000;
+        }
+    }
+    if (d[26] != 0) {
+        d[26] = 0;
+        if ((d[22] & 0x00080000) != 0) {
+            d[22] = d[22] | 0x08000000;
+        }
+    }
+    if (d[27] != 0) {
+        d[27] = 0;
+        if ((d[22] & 0x00100000) != 0) {
+            d[22] = d[22] | 0x10000000;
+        }
+    }
+    if (d[28] != 0) {
+        d[28] = 0;
+        if ((d[22] & 0x00400000) != 0) {
+            d[22] = d[22] | 0x40000000;
+        }
+    }
 
     const prev:   bool = (d[22] & DICR_IRQSI) != 0;
     const irqEn:  bool = (d[22] & DICR_IRQEN) != 0;
     const forceB: bool = (d[22] & DICR_FORCE) != 0;
     const flagsB: bool = (d[22] & DICR_FLAGS) != 0;
-
     const signal: bool = forceB || (flagsB && irqEn);
-
-    if (signal && !prev) { irqRaise(ic, cop0, IC_DMA); }
+    if (signal && !prev) {
+        irqRaise(ic, cop0, IC_DMA);
+    }
 
     d[22] = d[22] & (~DICR_IRQSI);
-    if (signal) { d[22] = d[22] | DICR_IRQSI; }
+    if (signal) {
+        d[22] = d[22] | DICR_IRQSI;
+    }
 }
