@@ -1,34 +1,19 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Raphael Amorim
 
-// MIPS R3000A core for the PSX.
-//
-// Covers the primary integer ISA: shifts (SLL/SRL/SRA/SLLV/SRLV/SRAV),
+// it covers the primary integer ISA: shifts (SLL/SRL/SRA/SLLV/SRLV/SRAV),
 // jumps and branches (J/JAL/JR/JALR/BEQ/BNE/BLEZ/BGTZ/BLTZ/BGEZ/BLTZAL/
 // BGEZAL), ALU R-type (ADD/ADDU/SUB/SUBU/AND/OR/XOR/NOR/SLT/SLTU),
 // ALU I-type (ADDI/ADDIU/ANDI/ORI/XORI/SLTI/SLTIU/LUI), MULT/MULTU/
 // DIV/DIVU, MFHI/MTHI/MFLO/MTLO, loads (LB/LBU/LH/LHU/LW/LWL/LWR),
 // stores (SB/SH/SW/SWL/SWR), COP0 MFC0/MTC0/RFE, SYSCALL/BREAK.
 //
-// Notably stubbed:
-//   - COP2 (GTE 3D math coprocessor) raises coprocessor-unusable on
-//     every access. For boot-and-trace this is correct; a real game
-//     will fault out as soon as it touches the GTE.
-//
-// The 32 GPRs and 16 COP0 registers live in their own `*mut[] u32`
-// heap buffers, threaded as separate arguments so the Cpu struct
-// stays small and cheap to copy. `Cpu` and `Bus` are declared
-// structurally in every module that names them in a function
-// signature - Jam v0.1.0 lacks reliable zero-arg type exports.
+// stubbed:
+//   - COP2 raises coprocessor-unusable on every access
 
 const { busRead32, busRead16, busRead8,
         busWrite32, busWrite16, busWrite8 } = import("bus");
 
-// Even though cpu.jam doesn't call into these directly, the module
-// resolver only registers pub prototypes from modules in the *root*
-// import set. Forcing an import here brings each device module's pub
-// fns into the codegen context so bus.jam's createBus/dispatch helpers
-// resolve cleanly when cpu.jam is the root module.
 const { Gpu } = import("gpu");
 const { createDma } = import("dma");
 const { createIrq } = import("irq");
@@ -41,7 +26,6 @@ const { Mcd } = import("mcd");
 const { Sio1 } = import("sio1");
 const { Mdec } = import("mdec");
 const { Disc } = import("disc");
-
 const { Vec } = import("std/collections");
 const { print } = import("std/fmt");
 
@@ -51,9 +35,6 @@ const Cpu = struct {
     savedPc: u32,
     hi: u32,
     lo: u32,
-    // Pending load: the R3000 has a one-slot load-delay queue - a
-    // value read from memory becomes visible in the destination
-    // register only after the *next* instruction commits.
     loadD: u32,
     loadV: u32,
     branch: u8,
@@ -63,7 +44,6 @@ const Cpu = struct {
     cycles: u64,
 };
 
-// COP0 register indices.
 const C0_BPC:      u32 = 3;
 const C0_BDA:      u32 = 5;
 const C0_JUMPDEST: u32 = 6;
@@ -80,10 +60,9 @@ const SR_IEC: u32 = 0x00000001;
 const SR_ISC: u32 = 0x00010000;
 const SR_BEV: u32 = 0x00400000;
 
-// Cause codes, already pre-shifted into bits 6..2 of CAUSE.
 const CAUSE_INT:     u32 = 0x00;
-const CAUSE_IBE:     u32 = 0x18;   // Bus Error on Instruction fetch
-const CAUSE_DBE:     u32 = 0x1C;   // Bus Error on Data access
+const CAUSE_IBE:     u32 = 0x18;
+const CAUSE_DBE:     u32 = 0x1C;
 const CAUSE_ADEL:    u32 = 0x10;
 const CAUSE_ADES:    u32 = 0x14;
 const CAUSE_SYSCALL: u32 = 0x20;
@@ -92,18 +71,11 @@ const CAUSE_RI:      u32 = 0x28;
 const CAUSE_CPU:     u32 = 0x2C;
 const CAUSE_OV:      u32 = 0x30;
 
-// register file
-//
-// 32 GPRs + 16 COP0 registers - both live in heap-allocated `Vec(u32)`
-// buffers that auto-drop with their owning scope. Callers pass `regs.ptr`
-// (typed `*mut[] u32`) into the gprRead/Write/cop0Read/Write helpers so
-// the hot loop stays as a single `LDR` per access (no per-call Vec
-// indirection in the helpers).
 pub fn createRegFile(n: u32) Vec(u32) { return Vec(u32).filled(0, n); }
 
 pub fn gprRead(regs: *mut[] u32, idx: u32) u32 { return regs[idx]; }
 pub fn gprWrite(regs: *mut[] u32, idx: u32, val: u32) {
-    if (idx == 0) { return; }       // $0 is hardwired to zero
+    if (idx == 0) { return; }
     regs[idx] = val;
 }
 pub fn cop0Read(cop0: *mut[] u32, idx: u32) u32 { return cop0[idx]; }
@@ -120,16 +92,12 @@ pub fn freshCpu() Cpu {
     return c;
 }
 
-// Build a Cpu with PC pointing into KSEG0 RAM (0x80000000) - used by the
-// unit tests so we don't fault out reading from an empty BIOS region.
 pub fn freshCpuAt(pc: u32) Cpu {
     var c: Cpu = freshCpu();
     c.pc = pc;
     c.nextPc = pc + 4;
     return c;
 }
-
-// sign-extension and signed compare helpers
 
 pub fn signExt16(v: u32) u32 {
     if ((v & 0x8000) != 0) { return v | 0xFFFF0000; }
@@ -153,14 +121,6 @@ pub fn signedGtZero(a: u32) bool { return a != 0 && (a & 0x80000000) == 0; }
 pub fn signedLeZero(a: u32) bool { return a == 0 ||  (a & 0x80000000) != 0; }
 pub fn signedGeZero(a: u32) bool { return (a & 0x80000000) == 0; }
 
-// integer division
-//
-// MIPS DIV / DIVU semantics: division by zero produces -1 (signed) or
-// 0xFFFFFFFF (unsigned) for the quotient; signed INT_MIN / -1 stays at
-// INT_MIN. We lower to LLVM's hardware sdiv / udiv via Jam's `/`
-// operator, after handling those special cases - `sdiv INT_MIN, -1` is
-// UB in LLVM, so we sidestep it explicitly.
-
 pub fn divU32(a: u32, b: u32) u32 {
     if (b == 0) { return 0xFFFFFFFF; }
     return a / b;
@@ -181,7 +141,6 @@ pub fn divI32(a: u32, b: u32) u32 {
         if ((a & 0x80000000) != 0) { return 1; }
         return 0xFFFFFFFF;
     }
-    // MIPS quirk: INT_MIN / -1 == INT_MIN (no overflow trap).
     if (a == 0x80000000 && b == 0xFFFFFFFF) { return 0x80000000; }
     return ((a as i32) / (b as i32)) as u32;
 }
@@ -191,8 +150,6 @@ pub fn modI32(a: u32, b: u32) u32 {
     if (a == 0x80000000 && b == 0xFFFFFFFF) { return 0; }
     return ((a as i32) % (b as i32)) as u32;
 }
-
-// exception machinery
 
 pub fn raiseException(c: mut Cpu, cop0: *mut[] u32, cause: u32) {
     var sr: u32 = cop0Read(cop0, C0_SR);
@@ -220,12 +177,9 @@ pub fn raiseException(c: mut Cpu, cop0: *mut[] u32, cause: u32) {
 pub fn cop0Rfe(cop0: *mut[] u32) {
     var sr: u32 = cop0Read(cop0, C0_SR);
     const mode: u32 = sr & 0x3F;
-    // Clear only bits 0-3, preserve bits 4-5 (old-mode pair).
     sr = (sr & 0xFFFFFFF0) | (mode >> 2);
     cop0Write(cop0, C0_SR, sr);
 }
-
-// instruction-field accessors
 
 pub fn opPrim(opc: u32) u32 { return (opc >> 26) & 0x3F; }
 pub fn opRs  (opc: u32) u32 { return (opc >> 21) & 0x1F; }
@@ -243,8 +197,6 @@ pub fn doBranch(c: mut Cpu, offsetShifted: u32) {
     c.branchTaken = 1;
 }
 
-// Commit any pending delayed load. Called by every instruction that
-// doesn't itself issue a new delayed load.
 pub fn commitLoad(c: mut Cpu, regs: *mut[] u32) {
     if (c.loadD != 0) {
         gprWrite(regs, c.loadD, c.loadV);
@@ -252,8 +204,6 @@ pub fn commitLoad(c: mut Cpu, regs: *mut[] u32) {
     c.loadD = 0;
     c.loadV = 0;
 }
-
-// instruction implementations
 
 pub fn iLui(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     commitLoad(c, regs);
@@ -291,8 +241,6 @@ pub fn iAddi(c: mut Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) {
     const r: u32 = s + imm;
     const ovf: u32 = (s ^ r) & (imm ^ r);
     if ((ovf & 0x80000000) != 0) {
-        // Skip the rd write on overflow so the
-        // exception handler sees the pre-state.
         raiseException(c, cop0, CAUSE_OV);
         return;
     }
@@ -314,8 +262,6 @@ pub fn iSltiu(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     if (s < opImmS(opc)) { v = 1; }
     gprWrite(regs, opRt(opc), v);
 }
-
-// branches
 
 pub fn iJ(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     commitLoad(c, regs);
@@ -363,25 +309,16 @@ pub fn iBgtz(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     if (signedGtZero(s)) { doBranch(c, opImmS(opc) << 2); }
 }
 
-// REGIMM family - split on rt(opc):
-//   0x00 BLTZ    0x01 BGEZ    0x10 BLTZAL    0x11 BGEZAL
 pub fn iRegimm(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     const s: u32 = gprRead(regs, opRs(opc));
     const variant: u32 = opRt(opc);
     commitLoad(c, regs);
     c.branch = 1;
 
-    // Link only on the two explicit AL variants (0x10/0x11). For
-    // unknown rt values the op is treated as a plain
-    // BLTZ/BGEZ depending on bit 16 - no link.
     if (variant == 0x10 || variant == 0x11) {
         gprWrite(regs, 31, c.nextPc);
     }
 
-    // REGIMM default: branch type is decided by bit 16
-    // (= rt & 1). Even-numbered rt -> BLTZ semantics, odd -> BGEZ.
-    // (An earlier version only matched 0x00/0x10 for BLTZ and treated
-    // 0x02 / 0x12 as BGEZ, which was wrong.)
     var take: bool = false;
     if ((variant & 1) == 0) {
         take = signedLtZero(s);
@@ -390,8 +327,6 @@ pub fn iRegimm(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     }
     if (take) { doBranch(c, opImmS(opc) << 2); }
 }
-
-// loads
 
 pub fn iLb(c: mut Cpu, opc: u32, bus: Bus, regs: *mut[] u32) {
     const s: u32 = gprRead(regs, opRs(opc));
@@ -478,8 +413,6 @@ pub fn iLwr(c: mut Cpu, opc: u32, bus: Bus, regs: *mut[] u32) {
     c.loadV = value;
 }
 
-// stores
-
 pub fn iSb(c: mut Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     const s: u32 = gprRead(regs, opRs(opc));
     const t: u32 = gprRead(regs, opRt(opc));
@@ -548,8 +481,6 @@ pub fn iSwr(c: mut Cpu, opc: u32, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) 
     busWrite32(bus, cop0, aligned, v);
 }
 
-// SPECIAL family
-
 pub fn iSll(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     const t: u32 = gprRead(regs, opRt(opc));
     commitLoad(c, regs);
@@ -562,8 +493,6 @@ pub fn iSrl(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     gprWrite(regs, opRd(opc), t >> opSa(opc));
 }
 
-// SRA - arithmetic right shift. Jam's `>>` on u32 is logical; we
-// manually back-fill the vacated bits with the original sign bit.
 pub fn iSra(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     const t: u32 = gprRead(regs, opRt(opc));
     const sa: u32 = opSa(opc);
@@ -653,8 +582,6 @@ pub fn iMtlo(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     c.lo = s;
 }
 
-// MULT - signed 32×32 -> 64. Sign-flip the operands to positive, do an
-// unsigned 32×32 -> 64 with Jam's native u64, then sign-flip the result.
 pub fn umul64(a: u32, b: u32) u64 {
     return (a as u64) * (b as u64);
 }
@@ -796,27 +723,13 @@ pub fn iSltu(c: mut Cpu, opc: u32, regs: *mut[] u32) {
     gprWrite(regs, opRd(opc), v);
 }
 
-// COP0
-
 pub fn iMfc0(c: mut Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) {
     const v: u32 = cop0Read(cop0, opRd(opc));
-    // mfc0 commits the pending load unconditionally -
-    // a prior load to this same rt commits (briefly visible) before the
-    // new delayed load is queued. The loads' `if loadD != rt` guard is
-    // a different hazard; mfc* must not share it.
     commitLoad(c, regs);
     c.loadD = opRt(opc);
     c.loadV = v;
 }
 
-// COP0 mtc0 write mask, per cop0 register index. CAUSE (r13) is mostly
-// read-only - only the software-IRQ bits 8-9 are writable, bit 10
-// (IP2, the IC-driven external IRQ) MUST be preserved. Without this,
-// a kernel ISR that clears software IRQs by writing CAUSE clobbers
-// IP2 and silently drops the pending CD-DMA / VBlank IRQ. The other
-// register masks are mostly 0 (read-only) or 0xFFFFFFFF (fully
-// writable). We only special-case CAUSE because the others' wrong
-// values don't manifest as a stall.
 pub fn cop0WriteMask(idx: u32) u32 {
     if (idx == C0_CAUSE) { return 0x00000300; }
     if (idx == C0_BADVADDR) { return 0; }
@@ -838,27 +751,16 @@ pub fn iRfe(c: mut Cpu, regs: *mut[] u32, cop0: *mut[] u32) {
     cop0Rfe(cop0);
 }
 
-// COP2 (GTE) dispatch. Sub-opcode in bits 25..21 (rs field) selects the
-// register-move; otherwise it's a math operation whose body lives in
-// `gteExec`.
-//
-//   rs = 0x00  MFC2  data register -> CPU register (delayed load)
-//   rs = 0x02  CFC2  control register -> CPU register (delayed load)
-//   rs = 0x04  MTC2  CPU register -> data register
-//   rs = 0x06  CTC2  CPU register -> control register
-//   rs >= 0x10 COP2 imm - math op (RTPS, NCLIP, NCDS, ...)
 pub fn iCop2Unimpl(c: mut Cpu, opc: u32, bus: Bus,
                    regs: *mut[] u32, cop0: *mut[] u32) {
     const rs: u32 = opRs(opc);
     if (rs == 0x00) {
-        // MFC2 - unconditional pending-load commit.
         commitLoad(c, regs);
         c.loadD = opRt(opc);
         c.loadV = gteDataRead(bus.gte.ptr, opRd(opc));
         return;
     }
     if (rs == 0x02) {
-        // CFC2 - unconditional pending-load commit.
         commitLoad(c, regs);
         c.loadD = opRt(opc);
         c.loadV = gteCtrlRead(bus.gte.ptr, opRd(opc));
@@ -876,19 +778,11 @@ pub fn iCop2Unimpl(c: mut Cpu, opc: u32, bus: Bus,
         gteCtrlWrite(bus.gte.ptr, opRd(opc), v);
         return;
     }
-    // COP2 math op (RTPS, NCLIP, ...) - bottom 25 bits encode the
-    // operation; gteExec dispatches on the low 6.
     commitLoad(c, regs);
     gteExec(bus.gte.ptr, opc);
-    // GTE math ops cost more than the 2-cycle base step() already charged
-    // (RTPS=15, NCDT=44, ...); add the remainder so device timing stays
-    // accurate through GTE-heavy code.
     c.cycles = c.cycles + (gteOpCycles(opc) as u64) - 2;
 }
 
-// LWC2 / SWC2 (primary 0x32 / 0x3A) - load/store a single COP2 data
-// register from/to memory. Used by some BIOS routines around RTPS
-// calls. These go through the standard bus + GTE data path.
 pub fn iCop2Lwc(c: mut Cpu, opc: u32, bus: Bus,
                 regs: *mut[] u32, cop0: *mut[] u32) {
     const s: u32 = gprRead(regs, opRs(opc));
@@ -912,9 +806,6 @@ pub fn iCop2Swc(c: mut Cpu, opc: u32, bus: Bus,
         raiseException(c, cop0, CAUSE_ADES);
         return;
     }
-    // Drop the write while the cache is isolated. Real R3000 routes the
-    // access to the I-cache instead of memory; emulators just no-op the
-    // store.
     if ((cop0Read(cop0, C0_SR) & SR_ISC) != 0) { return; }
     busWrite32(bus, cop0, addr, gteDataRead(bus.gte.ptr, opRt(opc)));
 }
@@ -923,8 +814,6 @@ pub fn illegal(c: mut Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) {
     commitLoad(c, regs);
     raiseException(c, cop0, CAUSE_RI);
 }
-
-// decode + dispatch
 
 pub fn dispatchSpecial(c: mut Cpu, opc: u32, bus: Bus,
                       regs: *mut[] u32, cop0: *mut[] u32) {
@@ -961,16 +850,10 @@ pub fn dispatchSpecial(c: mut Cpu, opc: u32, bus: Bus,
 }
 
 pub fn dispatchCop0(c: mut Cpu, opc: u32, regs: *mut[] u32, cop0: *mut[] u32) {
-    // Dispatch purely on rs (the CO/CT/MFC/MTC selector); the
-    // R3000 fn field is ignored for RFE since TLB ops don't exist on
-    // PSX. rs=0x10 -> RFE regardless of fn.
     const rs: u32 = opRs(opc);
     if (rs == 0x00) { iMfc0(c, opc, regs, cop0); return; }
     if (rs == 0x04) { iMtc0(c, opc, regs, cop0); return; }
     if (rs == 0x10) { iRfe(c, regs, cop0); return; }
-    // Unknown COP0 rs - real R3000 silently treats this as a NOP
-    // (verified via ps1-tests cpu/cop testCop0InvalidOpcode). Raising
-    // CAUSE_RI here would be more aggressive than hardware.
     commitLoad(c, regs);
 }
 
@@ -993,16 +876,9 @@ pub fn dispatch(c: mut Cpu, opc: u32, bus: Bus,
     if (p == 0x0D) { iOri(c, opc, regs); return; }
     if (p == 0x0E) { iXori(c, opc, regs); return; }
     if (p == 0x0F) { iLui(c, opc, regs); return; }
-    // COPx instructions gate on SR.CUx (bits 28-31). Real R3000 raises
-    // CAUSE_CPU (excode 0xB) when an instruction targets a disabled
-    // coprocessor - even for COP1/COP3 which the PSX doesn't physically
-    // wire up (the CU bits still cover them). COP0 is always considered
-    // usable in kernel mode (KUc=0) regardless of CU0. Test reference:
-    // JaCzekanski/ps1-tests cpu/cop verifies this exact behavior.
     if (p == 0x10) {
         const sr10: u32 = cop0Read(cop0, C0_SR);
         if ((sr10 & 0x10000000) == 0 && (sr10 & 0x02) != 0) {
-            // User mode without CU0 -> coprocessor unusable.
             commitLoad(c, regs);
             raiseException(c, cop0, CAUSE_CPU);
             return;
@@ -1010,8 +886,6 @@ pub fn dispatch(c: mut Cpu, opc: u32, bus: Bus,
         dispatchCop0(c, opc, regs, cop0); return;
     }
     if (p == 0x11) {
-        // COP1 - not present on PSX, but the SR.CU1 bit still gates the
-        // CAUSE_CPU exception. With CU1 set, the op silently no-ops.
         const sr11: u32 = cop0Read(cop0, C0_SR);
         if ((sr11 & 0x20000000) == 0) {
             commitLoad(c, regs);
@@ -1031,7 +905,6 @@ pub fn dispatch(c: mut Cpu, opc: u32, bus: Bus,
         iCop2Unimpl(c, opc, bus, regs, cop0); return;
     }
     if (p == 0x13) {
-        // COP3 - same as COP1: not present, gated by CU3.
         const sr13: u32 = cop0Read(cop0, C0_SR);
         if ((sr13 & 0x80000000) == 0) {
             commitLoad(c, regs);
@@ -1053,17 +926,7 @@ pub fn dispatch(c: mut Cpu, opc: u32, bus: Bus,
     if (p == 0x2A) { iSwl(c, opc, bus, regs, cop0); return; }
     if (p == 0x2B) { iSw(c, opc, bus, regs, cop0); return; }
     if (p == 0x2E) { iSwr(c, opc, bus, regs, cop0); return; }
-    // COPx load/store opcodes (LWC0/1/2/3, SWC0/1/2/3). COP2 (the GTE)
-    // gets the swallow stub; the other coprocessors don't exist on the
-    // PSX, so we raise coprocessor-unusable as before.
-    // LWCx/SWCx all gate on SR.CUx. If the corresponding CU bit is set,
-    // the load/store either runs (COP2 only on PSX) or is a silent NOP
-    // for COP0/COP1/COP3. If CU is clear, raise CAUSE_CPU.
-    // Note: COP0 also accepts !CU0 in kernel mode (KUc=0).
     if (p == 0x30) {
-        // LWC0 - gated by SR.CU0 alone (LWCx/SWCx don't get the kernel-
-        // mode exemption that COPx ops have, per ps1-tests cpu/cop and
-        // psx-spx).
         const sr30: u32 = cop0Read(cop0, C0_SR);
         if ((sr30 & 0x10000000) == 0) {
             commitLoad(c, regs); raiseException(c, cop0, CAUSE_CPU); return;
@@ -1092,7 +955,6 @@ pub fn dispatch(c: mut Cpu, opc: u32, bus: Bus,
         commitLoad(c, regs); return;
     }
     if (p == 0x38) {
-        // SWC0 - same as LWC0, gated by CU0 alone.
         const sr38: u32 = cop0Read(cop0, C0_SR);
         if ((sr38 & 0x10000000) == 0) {
             commitLoad(c, regs); raiseException(c, cop0, CAUSE_CPU); return;
@@ -1123,12 +985,6 @@ pub fn dispatch(c: mut Cpu, opc: u32, bus: Bus,
     illegal(c, opc, regs, cop0); return;
 }
 
-// IRQ pending: true when SR.IEC is set and an enabled IRQ bit in the
-// pending mask matches an enabled bit in CAUSE. Checks the full IM/IP
-// field (SR & CAUSE bits 8..15) like all four reference emulators; on
-// PSX only bits 8-10 are ever used (SW IRQs at 8/9, the consolidated
-// external IRQ at 10), so this is identical in practice but spec-correct.
-// The IC reevaluates CAUSE bit 10 whenever it sees a state change.
 pub fn cpuIrqPending(cop0: *mut[] u32) bool {
     const sr: u32 = cop0Read(cop0, C0_SR);
     if ((sr & SR_IEC) == 0) { return false; }
@@ -1145,17 +1001,9 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
     if ((c.savedPc & 3) != 0) {
         cop0Write(cop0, C0_BADVADDR, c.savedPc);
         raiseException(c, cop0, CAUSE_ADEL);
-        // stop!
-        // the PC is misaligned, so we cannot fetch this cycle.
-        // raiseException has already redirected PC to the exception vector;
-        // the next cycle fetches from there.
         return;
     }
 
-    // this was verified by ps1-tests cpu/code-in-io
-    // Instruction fetch is allowed from cached RAM/BIOS and from a few
-    // IO regions that happen to respond as if they're memory (SPU and
-    // DMA register banks).
     const pcPhys: u32 = c.savedPc & 0x1FFFFFFF;
     const inRam:  bool = pcPhys < 0x00800000;
     const inBios: bool = pcPhys >= 0x1FC00000 && pcPhys < 0x1FC80000;
@@ -1174,11 +1022,6 @@ pub fn step(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
         const irqOpc: u32 = busRead32(bus, c.pc);
         var irqCyc: u64 = fetchCyc;
         if ((irqOpc & 0xFE000000) == 0x4A000000) {
-            // Commit the pending delayed load as the first statement of this
-            // GTE-wins branch (DuckStation flushes the load on every
-            // exception) so the handler observes the loaded value (without
-            // this it commits one instruction late, at the handler's first
-            // instruction).
             commitLoad(c, regs);
             gteExec(bus.gte.ptr, irqOpc);
             irqCyc = irqCyc + (gteOpCycles(irqOpc) as u64);
@@ -1211,14 +1054,6 @@ pub fn run(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
     commitLoad(c, regs);
 }
 
-// TODO: Revisit
-// Emit one BIOS console byte. std/fmt.print's `{b}` interpolation on a
-// `[]u8` slice dispatches to a raw byte-write (same `@emitWriteBytes`
-// path the literal-string `print("...")` form uses, write(1, ...) under
-// the hood - unbuffered, so no flushing needed even when stdout is
-// redirected to a file). The fixed-size buf must go through asMutPtr()
-// before slicing because jam's `[..]` operator requires a many-item
-// pointer base, not a fixed-size array.
 pub fn biosPutc(ch: u32) {
     var buf: [1]u8 = [0; 1];
     buf[0] = (ch & 0xFF) as u8;
