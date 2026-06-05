@@ -227,7 +227,6 @@ pub fn sdlQuit(s: Sdl) {
 // (0 on failure). SDL_AudioSpec is laid out by memcpying the C-struct
 // layout into a 32-byte buffer.
 // Local little-endian 8-byte writer for SDL_AudioSpec's pointer slots.
-// Kept here so sdl.jam doesn't have to pull in spu.jam's setU64.
 pub fn setU64Le(buf: *mut[] u8, off: u32, v: u64) {
     buf[off]     = (v         & 0xFF) as u8;
     buf[off + 1] = ((v >>  8) & 0xFF) as u8;
