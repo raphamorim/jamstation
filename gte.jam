@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Raphael Amorim
+
 // Data register layout (32 × u32):
 //   0  V0  (xy packed, low half of vertex 0)
 //   1  V0Z (z, low 16 bits)

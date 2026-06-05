@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Raphael Amorim
+
 const { Gpu } = import("gpu");
 const { irqRaise, IC_DMA } = import("irq");
 const { Vec } = import("std/collections");
