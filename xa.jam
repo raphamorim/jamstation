@@ -36,22 +36,9 @@ pub fn xaWrap16(v: i32) i32 {
     return ((v & 0xFFFF) ^ 0x8000) - 0x8000;
 }
 
-pub fn xaClampI16(v: i32) i32 {
-    if (v < -32768) { return -32768; }
-    if (v >  32767) { return  32767; }
-    return v;
-}
-
 // Sub-mode byte at sector offset 0x12: bit 2 set = real-time audio.
 pub fn xaSectorIsAudio(secBuf: *mut[] u8) bool {
     return (secBuf[0x12] & 0x04) != 0;
-}
-
-// Form-2 bit (sub-mode byte bit 0) - form-2 sectors don't have ECC and
-// always carry audio/video. The XA fetch path skips non-form-2 sectors
-// even when MODE_XA_ADPCM is set.
-pub fn xaSectorIsForm2(secBuf: *mut[] u8) bool {
-    return (secBuf[0x12] & 0x01) != 0;
 }
 
 // File/channel match per CDL_SETFILTER. The sub-header (offsets
@@ -69,13 +56,6 @@ pub fn xaSectorIsStereo(secBuf: *mut[] u8) bool {
 // Sampling frequency: bit 2 = 18.9 kHz (1) vs 37.8 kHz (0).
 pub fn xaSectorIs18kHz(secBuf: *mut[] u8) bool {
     return ((secBuf[0x13] >> 2) & 1) != 0;
-}
-
-// 4-bit ADPCM bit count per block (bit 4 of coding info): 0 = 4-bit,
-// 1 = 8-bit. We only support 4-bit (the dominant XA encoding); 8-bit
-// would require a different nibble extraction.
-pub fn xaSector4Bit(secBuf: *mut[] u8) bool {
-    return ((secBuf[0x13] >> 4) & 1) == 0;
 }
 
 // Decode one 28-sample block. `idx` is the byte offset to the start of

@@ -83,13 +83,6 @@ pub fn ramWrite32(bus: Bus, addr: u32, val: u32) {
     p[off + 3] = ((val >> 24) & 0xFF) as u8;
 }
 
-pub fn ramWrite16(bus: Bus, addr: u32, val: u32) {
-    const off: u32 = addr & 0x001FFFFE;
-    var p: *mut[] u8 = bus.ram.ptr;
-    p[off]     = (val        & 0xFF) as u8;
-    p[off + 1] = ((val >> 8) & 0xFF) as u8;
-}
-
 // IO surface
 
 // Per-channel CHCR hardwiring masks. Channels

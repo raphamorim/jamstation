@@ -20,8 +20,7 @@ const { Cdrom } = import("cdrom");
 const { Disc, discAlloc, discOpen } = import("disc");
 const { dmaAlloc, dmaTickSpu, dmaUpdate } = import("dma");
 const { padAlloc, padUpdate, padSetButtons } = import("pad");
-const { spuAlloc, spuRamAlloc, setU64, spuStepAdsrCpu,
-        spuGetSample } = import("spu");
+const { spuAlloc, spuRamAlloc, spuGetSample } = import("spu");
 const { Sio1 } = import("sio1");
 const { Mdec } = import("mdec");
 const { irqAlloc, irqRaise, IC_VBLANK } = import("irq");
@@ -33,8 +32,8 @@ const {
     allocRegFile,
     gprRead, gprWrite,
     cop0Read, cop0Write,
-    run, runHooked,
-    step, biosHook, biosHookDiag, commitLoad,
+    run,
+    step, biosHook, commitLoad,
     encR, encI, encJ
 } = import("cpu");
 
@@ -48,12 +47,6 @@ const { File, exists } = import("std/fs");
 const { Args, args, next, exit } = import("std").process;
 const { print } = import("std/fmt");
 
-// File I/O comes from std/fs (loadExe / dumpVramPpm / fileExists). All
-// console output routes through std/fmt.print, which lowers to a direct
-// unbuffered write(1, ...) via the `@emitWriteBytes` intrinsic - no
-// libc stdio buffering, so no fflush needed.
-
-// Locally-redeclared shape matching cpu.jam.
 const Cpu = struct {
     pc: u32,
     nextPc: u32,
@@ -72,15 +65,8 @@ const Cpu = struct {
 const C0_SR:    u32 = 12;
 const C0_PRID:  u32 = 15;
 
-// PSX clock: 33.8688 MHz. At 60 fps that's ~564480 cycles per frame.
-const CYCLES_PER_FRAME: u32 = 564480;
 const VRAM_WIDTH:  i32 = 1024;
 const VRAM_HEIGHT: i32 = 512;
-
-// Maximum on-screen resolution we support - 640×480 is the largest the
-// PSX can produce (interlaced 640H × 480V). The SDL window is sized to
-// this and the active display region is read out of the GPU's
-// display_mode register each frame so different resolutions all fit.
 const SCREEN_W: i32 = 640;
 const SCREEN_H: i32 = 480;
 
@@ -128,8 +114,8 @@ fn readU32At(buf: *mut[] u8, off: u32) u32 {
 fn loadExe(path: []u8, bus: Bus, regs: *mut[] u32, c: mut Cpu) {
     match (File.open(path)) {
         Some(f) {
-            // 0x800 = 2 KB PSX-EXE header (fixed by the platform). The
-            // [0; N] array literal already zero-fills; no memset needed.
+            // 0x800 = 2 KB PSX-EXE header
+            // [0; N] array literal already zero-fills; no memset needed
             var hdr: [2048]u8 = [0; 2048];
             var hp: *mut[] u8 = hdr.asMutPtr();
             const hdrBytes: u64 = f.read(hp[0..0x800]);
@@ -146,7 +132,7 @@ fn loadExe(path: []u8, bus: Bus, regs: *mut[] u32, c: mut Cpu) {
             const spBase:  u32 = readU32At(hdr.asMutPtr(), 0x30);
             const spOff:   u32 = readU32At(hdr.asMutPtr(), 0x34);
 
-            // Body is runtime-sized (length from the header). Read into a
+            // Body is runtime-sized. Read into a
             // Vec(u8), then stream byte-by-byte into RAM.
             var body: Vec(u8) = Vec(u8).withCapacity(fileSz);
             var bp: *mut[] u8 = body.ptr;
@@ -345,48 +331,6 @@ fn runOneFrame(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
     return audioLen / 4;     // stereo samples produced this frame
 }
 
-// Dump the full 1024x512 VRAM as a binary PPM (P6 / 24-bit RGB) at
-// `path`. BGR555 -> RGB888 expansion is done inline so the output is
-// viewable with any image viewer. Used as an end-of-run diagnostic so
-// we can confirm what the BIOS/game actually rendered without staring
-// at the SDL window.
-fn dumpVramPpm(path: []u8, vram: *mut[] u8) {
-    match (File.create(path)) {
-        Some(f) {
-            var hdr: []u8 = "P6\n1024 512\n255\n";
-            f.write(hdr);
-            // 3072 = 1024 px × 3 bytes (RGB24). VRAM width is fixed.
-            var row: [3072]u8 = [0; 3072];
-            var y: u32 = 0;
-            while (y < 512) {
-                var x: u32 = 0;
-                while (x < 1024) {
-                    const off: u32 = (y * 1024 + x) * 2;
-                    const lo: u32 = vram[off] as u32;
-                    const hi: u32 = vram[off + 1] as u32;
-                    const px: u32 = lo | (hi << 8);
-                    const r: u32 = ((px      ) & 0x1F) << 3;
-                    const g: u32 = ((px >> 5 ) & 0x1F) << 3;
-                    const b: u32 = ((px >> 10) & 0x1F) << 3;
-                    const di: u32 = x * 3;
-                    row[di]     = r as u8;
-                    row[di + 1] = g as u8;
-                    row[di + 2] = b as u8;
-                    x = x + 1;
-                }
-                var rp: *const[] u8 = row.asPtr();
-                f.write(rp[0..3072]);
-                y = y + 1;
-            }
-            f.close();
-            print("Wrote VRAM dump: {path}\n");
-        }
-        None { }
-    }
-}
-
-// main
-
 // True if NUL-terminated `p` ends with ".exe" / ".EXE". Mirrors
 // disc.jam's pathEndsWithCue so an EXE passed as argv[2] is routed to
 // the sideload path instead of discOpen.
@@ -534,7 +478,7 @@ fn main() {
     if (fullVram) {
         sdlW = VRAM_WIDTH;
         sdlH = VRAM_HEIGHT;
-        print("JAM_PSONE_FULL_VRAM set — showing full VRAM\n");
+        print("JAM_PSONE_FULL_VRAM set. Showing full VRAM\n");
     }
     var sdl: Sdl = sdlInit(title, sdlW, sdlH);
     // Audio device - callback + SPSC ring buffer. The SPU is advanced
@@ -554,12 +498,11 @@ fn main() {
     } else {
         print("Audio device opened (id={audioDev}, 44.1kHz S16 stereo, callback+ring)\n");
     }
-    print("SDL2 ready.\n");
     // VRAM was already zero-filled when the Bus was allocated; the BIOS
     // renders into it within the first frame, so the brief black flash
     // before its first GP0 commit is fine.
 
-    print("Running — Esc or close to quit\n");
+    print("Running. Esc or close to quit\n");
 
     // Active-low button mask the SDL pump updates from keyboard events.
     // 0xFFFF = no buttons pressed; sdlPump clears bits on KEYDOWN and
@@ -678,12 +621,8 @@ fn main() {
         }
     }
 
-    // Persist memcard slot 1 to disk before freeing the bus.
     mcdRamSave(bus.mcdRam.ptr, mcdPath);
-
     sdlAudioClose(audioDev);
-    // audioCtx and buttons are stack arrays - they vanish with main()'s
-    // frame; no manual free needed.
     sdlQuit(sdl);
-    print("\nsdl quitted\n");
+    print("\njamstation quitted\n");
 }

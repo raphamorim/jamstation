@@ -256,21 +256,6 @@ pub fn cueAlloc() Box(Cue) {
     });
 }
 
-// Append a NUL-terminated string into pathBuf, returning the start offset.
-pub fn pathBufAppend(raw: *mut[] u8, src: *mut[] u8, len: u32) u32 {
-    var c: *mut[] Cue = raw as *mut[] Cue;
-    const off: u32 = c[0].pathBufLen;
-    if (off + len + 1 >= c[0].pathBufCap) { return 0; }
-    var i: u32 = 0;
-    while (i < len) {
-        c[0].pathBuf.ptr[off + i] = src[i];
-        i = i + 1;
-    }
-    c[0].pathBuf.ptr[off + len] = 0;
-    c[0].pathBufLen = off + len + 1;
-    return off;
-}
-
 // track-range computation
 //
 // After parsing all FILE/TRACK/INDEX lines, walk each file's track list

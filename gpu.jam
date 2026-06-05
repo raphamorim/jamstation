@@ -68,24 +68,6 @@ pub fn vramWritePixel(vram: *mut[] u8, x: u32, y: u32, bgr555: u32) {
     vram[off + 1] = ((bgr555 >> 8)  & 0xFF) as u8;
 }
 
-// Mask-bit-aware write. Honors GP0(0xE6) state from `g[58]` (set-mask =
-// always OR 0x8000 into the written value) and `g[59]` (check-mask =
-// skip if destination already has bit 15 set). Used by command paths
-// that draw pixels - the raw `vramWritePixel` stays available for paths
-// where the GPU command logic intentionally bypasses the mask.
-pub fn vramWritePixelMasked(g: *mut[] u32, vram: *mut[] u8, x: u32, y: u32, bgr555: u32) {
-    if (x >= 1024 || y >= 512) { return; }
-    if (g[59] != 0) {
-        const cur: u32 = vramReadPixel(vram, x, y);
-        if ((cur & 0x8000) != 0) { return; }
-    }
-    var v: u32 = bgr555;
-    if (g[58] != 0) { v = v | 0x8000; }
-    const off: u32 = (y * 1024 + x) * 2;
-    vram[off]     = (v        & 0xFF) as u8;
-    vram[off + 1] = ((v >> 8) & 0xFF) as u8;
-}
-
 pub fn vramReadPixel(vram: *mut[] u8, x: u32, y: u32) u32 {
     if (x >= 1024 || y >= 512) { return 0; }
     const off: u32 = (y * 1024 + x) * 2;
@@ -538,10 +520,6 @@ pub fn sext32(v: u32) i64 {
 pub fn gpuTopLeftRule(z: i64, ax: u32, ay: u32, bx: u32, by: u32) bool {
     if (z < 0) { return true; }
     if (z != 0) { return false; }
-    const ay32: u32 = ay & 0xFFFF;
-    const by32: u32 = by & 0xFFFF;
-    const ax32: u32 = ax & 0xFFFF;
-    const bx32: u32 = bx & 0xFFFF;
     // Use raw signed compare via sext32 helper.
     const ays: i64 = sext32(ay);
     const bys: i64 = sext32(by);
@@ -1349,10 +1327,6 @@ pub fn gpuBlend(fore: u32, back: u32, mode: u32) u32 {
 // directly. The function had two competing accumulators (one fractional
 // 11/7 path, one ×2 path), neither correct. Keeping the constants in
 // case a future per-cycle GPU tick is added.
-const GPU_CYC_HDRAW_NTSC: u32 = 2560;
-const GPU_CYC_SCANL_NTSC: u32 = 3413;
-const GPU_LINES_VDRAW:    u32 = 240;
-const GPU_LINES_TOTAL:    u32 = 263;
 
 // struct wrapper
 //

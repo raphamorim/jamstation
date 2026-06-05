@@ -20,20 +20,10 @@ const SDL_INIT_EVENTS: u32 = 0x00004000;
 const SDL_WINDOW_SHOWN:     u32 = 0x00000004;
 const SDL_WINDOW_RESIZABLE: u32 = 0x00000020;
 
-// SDL_PIXELFORMAT_BGR555 - actually a Macro-alias for XBGR1555. The
-// numerical value is determined by SDL's `SDL_DEFINE_PIXELFORMAT` macro
-// (type=PACKED16, order=XBGR, layout=1555, bits=16, bytes=2) which
-// resolves to 0x15530F02 on SDL 2.0.x. Hand-computing the macro from
-// scratch is error-prone - I had 0x14110A02 here originally, which made
-// SDL reinterpret PSX VRAM bytes through a different bit layout and
-// the screen rendered with a green tint. Verified value by linking a
-// 5-line C program against SDL2 and printing the constant.
-const SDL_PIXELFORMAT_BGR555:  u32 = 0x15530F02;
 const SDL_PIXELFORMAT_ARGB8888: u32 = 0x16362004;
 const SDL_TEXTUREACCESS_STREAMING: i32 = 1;
 
 const SDL_RENDERER_ACCELERATED: u32 = 0x00000002;
-const SDL_RENDERER_PRESENTVSYNC: u32 = 0x00000004;
 
 // SDL_Event type constants we care about.
 const SDL_QUIT:       u32 = 0x100;
@@ -134,11 +124,6 @@ pub const Sdl = struct {
     width:  i32,
     height: i32,
 };
-
-// SDL_Event is a 56-byte union in v2.x; we don't decode the body, just
-// peek at the type field (offset 0, 4 bytes). Allocate 64 bytes to be
-// safe across SDL releases.
-const SDL_EVENT_SIZE: u32 = 64;
 
 // Hold a process-lifetime "user initiated" NSProcessInfo activity, which
 // disables macOS App Nap so the emulator keeps running at full speed when its
@@ -644,27 +629,3 @@ pub fn sdlTicks() u32 {
     return SDL_GetTicks();
 }
 
-// Fill a 1024×512 RGB555 buffer with a debug pattern - vertical bands
-// that show colour and let us verify the SDL pipe is alive even before
-// the GPU emits its first pixel.
-pub fn fillTestPattern(buf: *mut[] u8) {
-    var y: u32 = 0;
-    while (y < 512) {
-        var x: u32 = 0;
-        while (x < 1024) {
-            const off: u32 = (y * 1024 + x) * 2;
-            // Pick a colour from x position: 5 bits R, 5 G, 5 B, packed
-            // little-endian as a u16. We sweep R left-to-right and add
-            // a G tint based on y. This produces a smooth gradient
-            // rectangle that's instantly recognisable as "not noise".
-            const r: u32 = (x >> 5) & 0x1F;            // 0..31 across the width
-            const g: u32 = (y >> 4) & 0x1F;            // 0..31 down the height
-            const b: u32 = ((x + y) >> 5) & 0x1F;
-            const px: u32 = (b << 10) | (g << 5) | r;
-            buf[off]     = (px & 0xFF) as u8;
-            buf[off + 1] = ((px >> 8) & 0xFF) as u8;
-            x = x + 1;
-        }
-        y = y + 1;
-    }
-}

@@ -30,19 +30,10 @@ const GLOBAL_BASE:    u32 = 0x400 + 24 * 256;     // 0x1C00
 const CD_FIFO_BASE:   u32 = 0x1D00;
 const CD_FIFO_CAP:    u32 = 1024;        // entries (power of two)
 const CD_FIFO_MASK:   u32 = 1023;
-const CD_FIFO_BYTES:  u32 = 4096;        // 1024 × 4 bytes (i16 L + i16 R)
-// Final mixed-output FIFO. Producer = spuGetSample (one stereo sample
-// per emit, 44.1 kHz). Consumer = main.jam's SDL audio drain. 4096
-// entries × 4 bytes = 16 KB, lives at 0x2D00. ~93 ms latency buffer.
-const OUT_FIFO_BASE:  u32 = 0x2D00;
-const OUT_FIFO_CAP:   u32 = 4096;
-const OUT_FIFO_MASK:  u32 = 4095;
-const OUT_FIFO_BYTES: u32 = 16384;
 // Gaussian-interpolation coefficient table - 512 i16 entries =
 // 1024 bytes. The standard PSX Gaussian table. Populated by
 // spuGaussInit at spuAlloc time so we don't need a runtime fopen.
 const SPU_GAUSS_OFF:   u32 = 0x6D00;
-const SPU_GAUSS_BYTES: u32 = 1024;
 const SPU_STATE_SIZE: u32 = 0x6D00 + 1024; // 0x7100
 const SPU_RAM_SIZE:   u32 = 0x80000;
 
@@ -161,9 +152,6 @@ const G_LRSR:       u32 = 0x54;
 // writes tail. Equal head == tail -> empty.
 const G_CD_HEAD:    u32 = 0x60;
 const G_CD_TAIL:    u32 = 0x64;
-// Final mixed-output FIFO head/tail. Producer = spuGetSample.
-const G_OUT_HEAD:   u32 = 0x68;
-const G_OUT_TAIL:   u32 = 0x6C;
 // Noise generator state (free space before CD_FIFO_BASE=0x1D00): the 16-bit
 // LFSR level and the 32-bit fractional clock accumulator. Ticked once per
 // output sample by spuStepNoise; voices with their NON bit set output the
@@ -488,30 +476,6 @@ pub fn setU32(s: *mut[] u8, off: u32, v: u32) {
     s[off + 2] = ((v >> 16) & 0xFF) as u8;
     s[off + 3] = ((v >> 24) & 0xFF) as u8;
 }
-// 64-bit accessors. Used to round-trip pointer addresses through
-// SDL_AudioSpec (the callback / userdata slots are pointer-sized) and
-// the AudioCtx blob the audio thread reads its bus handles from.
-pub fn getU64(s: *mut[] u8, off: u32) u64 {
-    return  (s[off]         as u64)
-         | ((s[off + 1]     as u64) <<  8)
-         | ((s[off + 2]     as u64) << 16)
-         | ((s[off + 3]     as u64) << 24)
-         | ((s[off + 4]     as u64) << 32)
-         | ((s[off + 5]     as u64) << 40)
-         | ((s[off + 6]     as u64) << 48)
-         | ((s[off + 7]     as u64) << 56);
-}
-pub fn setU64(s: *mut[] u8, off: u32, v: u64) {
-    s[off]     = (v         & 0xFF) as u8;
-    s[off + 1] = ((v >>  8) & 0xFF) as u8;
-    s[off + 2] = ((v >> 16) & 0xFF) as u8;
-    s[off + 3] = ((v >> 24) & 0xFF) as u8;
-    s[off + 4] = ((v >> 32) & 0xFF) as u8;
-    s[off + 5] = ((v >> 40) & 0xFF) as u8;
-    s[off + 6] = ((v >> 48) & 0xFF) as u8;
-    s[off + 7] = ((v >> 56) & 0xFF) as u8;
-}
-
 pub fn getI16(s: *mut[] u8, off: u32) i32 {
     const u: u32 = getU16(s, off);
     if ((u & 0x8000) != 0) { return (u | 0xFFFF0000) as i32; }
@@ -704,23 +668,6 @@ pub fn spuHandleAdsr(s: *mut[] u8, v: u32) {
     // Mirror the envelope volume into the voice register so games can read it.
     setU16(s, voiceRegBase(v) + VR_ENVCVOL, getI32(s, base + D_CVOL) as u32);
     setI32(s, base + D_ACYCLES, getI32(s, base + D_ACYRELOAD));
-}
-
-// Advance every playing voice's ADSR envelope by ONE SPU sample. Called
-// CPU-synchronously (once per 768 CPU cycles = 44.1 kHz) from runOneFrame
-// so the envelope level the game POLLS at voice reg 0xC (ENVCVOL) is
-// deterministic and matches hardware - instead of advancing on the
-// wall-clock audio thread (which desyncs from the CPU and made Brave Fencer
-// read a wrong envelope level, looping the intro resource-load -> black FMV).
-// The audio thread no longer steps the envelope (removed from spuGetSample).
-pub fn spuStepAdsrCpu(s: *mut[] u8) {
-    var v: u32 = 0;
-    while (v < VOICE_COUNT) {
-        if (getU32(s, voiceRTBase(v) + D_PLAYING) != 0) {
-            spuHandleAdsr(s, v);
-        }
-        v = v + 1;
-    }
 }
 
 // KON / KOFF
@@ -1088,48 +1035,6 @@ pub fn spuGetSample(s: *mut[] u8, ram: *mut[] u8,
     const cr: i32 = (sat16(right) * mainr) >> 15;
     const packed: u32 = (cl as u32 & 0xFFFF) | ((cr as u32 & 0xFFFF) << 16);
     return packed;
-}
-
-// Push the mixed stereo sample into the output FIFO. Drops on full so
-// audio falls behind silently rather than blocking the SPU mixer. The
-// SDL drain (main.jam) pulls samples each frame at the audio device
-// rate (44.1 kHz) so a half-full buffer is the normal steady state.
-pub fn spuPushOutSample(s: *mut[] u8, packed: u32) {
-    const head: u32 = getU32(s, GLOBAL_BASE + G_OUT_HEAD);
-    const tail: u32 = getU32(s, GLOBAL_BASE + G_OUT_TAIL);
-    if ((head - tail) >= OUT_FIFO_CAP) { return; }     // full -> drop
-    const slot: u32 = OUT_FIFO_BASE + ((head & OUT_FIFO_MASK) << 2);
-    setU32(s, slot, packed);
-    setU32(s, GLOBAL_BASE + G_OUT_HEAD, head + 1);
-}
-
-// Pop up to `max` stereo samples into a host-supplied i16 buffer. dst
-// is treated as 2 × i16 per entry (interleaved L,R). Returns the count
-// actually written. Returns early if the FIFO drains.
-pub fn spuDrainOut(s: *mut[] u8, dst: *mut[] u8, max: u32) u32 {
-    var n: u32 = 0;
-    var head: u32 = getU32(s, GLOBAL_BASE + G_OUT_HEAD);
-    var tail: u32 = getU32(s, GLOBAL_BASE + G_OUT_TAIL);
-    while (n < max && head != tail) {
-        const slot: u32 = OUT_FIFO_BASE + ((tail & OUT_FIFO_MASK) << 2);
-        const lo: u32 = getU16(s, slot);
-        const hi: u32 = getU16(s, slot + 2);
-        const dOff: u32 = n << 2;
-        dst[dOff]     = (lo        & 0xFF) as u8;
-        dst[dOff + 1] = ((lo >> 8) & 0xFF) as u8;
-        dst[dOff + 2] = (hi        & 0xFF) as u8;
-        dst[dOff + 3] = ((hi >> 8) & 0xFF) as u8;
-        tail = tail + 1;
-        n = n + 1;
-    }
-    setU32(s, GLOBAL_BASE + G_OUT_TAIL, tail);
-    return n;
-}
-
-// Number of stereo samples ready to drain.
-pub fn spuOutAvailable(s: *mut[] u8) u32 {
-    return getU32(s, GLOBAL_BASE + G_OUT_HEAD)
-         - getU32(s, GLOBAL_BASE + G_OUT_TAIL);
 }
 
 // per-scanline tick

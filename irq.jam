@@ -40,9 +40,6 @@ const C0_CAUSE: u32 = 13;
 // its drop frees on scope exit, no irqFree helper needed.
 pub fn irqAlloc() Vec(u32) { return Vec(u32).filled(0, 16); }
 
-pub fn irqStat(ic: *mut[] u32) u32 { return ic[0]; }
-pub fn irqMask(ic: *mut[] u32) u32 { return ic[1]; }
-
 // Update COP0_CAUSE.IP2 based on the current (stat & mask). Called
 // after every write and every irqRaise so the CPU sees the right
 // pending state on its next fetch.
@@ -143,10 +140,4 @@ pub fn irqRaise(ic: *mut[] u32, cop0: *mut[] u32, lines: u32) {
         b = b + 1;
     }
     irqReevaluate(ic, cop0);
-}
-
-// Return the fire count for source bit `b` (0=VBLANK ... 10=LP_PIO).
-pub fn irqCount(ic: *mut[] u32, b: u32) u32 {
-    if (b >= 11) { return 0; }
-    return ic[2 + b];
 }

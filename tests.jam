@@ -17,7 +17,7 @@ const {
     allocRegFile,
     gprRead, gprWrite,
     cop0Read, cop0Write,
-    run, runHooked,
+    run,
     step, biosHook, commitLoad,
     encR, encI, encJ
 } = import("cpu");

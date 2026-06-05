@@ -1286,25 +1286,6 @@ pub fn biosHook(c: mut Cpu, bus: Bus, regs: *mut[] u32) {
     }
 }
 
-// Stripped: previously emitted [diag-*] traces for BIOS C0 syscalls,
-// exception entries, IRQ-handler-chain walks, and a one-shot mem dump
-// at PC=0x80059DCC. All prints removed; the function is kept so the
-// runHooked test path still has a hook target.
-pub fn biosHookDiag(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32) {
-}
-
-pub fn runHooked(c: mut Cpu, bus: Bus, regs: *mut[] u32, cop0: *mut[] u32,
-                 maxSteps: u32) {
-    var i: u32 = 0;
-    while (i < maxSteps && c.halted == 0) {
-        biosHook(c, bus, regs);
-        biosHookDiag(c, bus, regs, cop0);
-        step(c, bus, regs, cop0);
-        i = i + 1;
-    }
-    commitLoad(c, regs);
-}
-
 // MIPS instruction encoders (for hand-assembling tests)
 
 pub fn encR(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, fn_: u32) u32 {

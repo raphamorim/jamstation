@@ -30,8 +30,6 @@ const MDEC_CMD_SET_ST:  u32 = 3;
 
 // Output depth values.
 const DEPTH_4BIT:  u32 = 0;
-const DEPTH_8BIT:  u32 = 1;
-const DEPTH_24BIT: u32 = 2;
 const DEPTH_15BIT: u32 = 3;
 
 // Zig-zag table - index into yblk in iDCT-input order.
