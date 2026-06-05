@@ -1,0 +1,35 @@
+name: build-latest-jam
+
+# Weekly canary: rebuild the Jam compiler from the tip of
+# github.com/raphamorim/jam and make sure jamstation still compiles against
+# it. Catches upstream compiler changes that break the emulator's build.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 9 * * 5" # every Friday at 09:30 UTC
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout jamstation
+        uses: actions/checkout@v4
+
+      - name: Install SDL2
+        run: brew install sdl2
+
+      - name: Install latest jam (builds HEAD from source)
+        run: |
+          brew tap raphamorim/jam https://github.com/raphamorim/jam
+          brew install --HEAD jam
+          jam --version || true
+
+      - name: Build jamstation
+        run: |
+          LIBRARY_PATH="$(brew --prefix)/lib" \
+            jam -lSDL2 -lobjc -C opt-level=3 -o jamstation main.jam
+
+      - name: Verify the binary
+        run: test -x ./jamstation && echo "jamstation built successfully against latest jam"
