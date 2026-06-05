@@ -64,6 +64,12 @@ extern fn SDL_RenderPresent(renderer: *mut[] u8);
 extern fn SDL_Delay(ms: u32);
 extern fn SDL_PollEvent(event: *mut[] u8) i32;
 extern fn SDL_GetTicks() u32;
+// Actual render-target size in PIXELS. On a HiDPI / retina display this is
+// larger than the window's point size (e.g. 2×), so we must scale the blit
+// against THIS, not the window size — otherwise the image lands in a corner.
+extern fn SDL_GetRendererOutputSize(renderer: *mut[] u8, w: *mut[] i32, h: *mut[] i32) i32;
+// Letterbox/pillarbox bars are painted with the render draw colour on clear.
+extern fn SDL_SetRenderDrawColor(renderer: *mut[] u8, r: u8, g: u8, b: u8, a: u8) i32;
 
 // macOS App Nap disable (Objective-C runtime)
 // When the jam window is not focused, macOS App Nap throttles the process's
@@ -205,6 +211,10 @@ pub fn sdlInit(title: []u8, width: i32, height: i32) Sdl {
         const nameSlice: []u8 = np[0..nlen];
         print("[sdl] render driver: {nameSlice}\n");
     }
+    // Opaque black for the RenderClear bars: when the window's aspect doesn't
+    // match the PSX display, sdlBlit centers the image and leaves black
+    // letterbox/pillarbox margins.
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
     // Use ARGB8888 (32-bit) so the blit can target both 15bpp and 24bpp
     // PSX display modes through a single texture. The conversion happens
     // per-pixel in sdlBlit; SDL gets a canonical 4-byte format.
@@ -420,9 +430,10 @@ pub fn packRect(buf: *mut[] u8, x: i32, y: i32, w: i32, h: i32) {
 pub fn sdlBlit(s: Sdl, pixels: *mut[] u8,
                dx: i32, dy: i32, dw: i32, dh: i32,
                is24bpp: bool, displayOff: bool) {
-    // SDL_Rect = 4 × i32 = 16 bytes; both are filled in-place by packRect.
-    var fullRect: [16]u8 = [0; 16];
-    packRect(fullRect.asMutPtr(), 0, 0, s.width, s.height);
+    // SDL_Rect = 4 × i32 = 16 bytes. dstOnTex selects the dw×dh sub-rect of
+    // the texture we actually filled; dstRect (the on-screen target) is
+    // computed against the live output size just before present.
+    var dstRect: [16]u8 = [0; 16];
     var dstOnTex: [16]u8 = [0; 16];
     packRect(dstOnTex.asMutPtr(), 0, 0, dw, dh);
 
@@ -488,12 +499,42 @@ pub fn sdlBlit(s: Sdl, pixels: *mut[] u8,
         }
     }
 
+    // Scale the dw×dh image to fill the CURRENT window, preserving the source
+    // aspect ratio (the leftover margin becomes black letterbox/pillarbox
+    // bars). We size against the renderer's OUTPUT size in pixels — not the
+    // window's point size — so this is correct on HiDPI/retina (output is
+    // larger than the window) AND tracks live user resizes. Same approach as
+    // psxe's screen.c (SDL_GetRendererOutputSize + a computed dstrect); jam's
+    // window is resizable, so we recompute every frame instead of on a
+    // display-mode event.
+    var owBuf: [1]i32 = [0; 1];
+    var ohBuf: [1]i32 = [0; 1];
+    SDL_GetRendererOutputSize(s.renderer, owBuf.asMutPtr(), ohBuf.asMutPtr());
+    var ow: i32 = owBuf[0];
+    var oh: i32 = ohBuf[0];
+    if (ow <= 0 || oh <= 0) { ow = s.width; oh = s.height; }
+    // Aspect fit by cross-multiplying (ow/oh vs dw/dh) to stay in integers.
+    var fitW: i32 = ow;
+    var fitH: i32 = oh;
+    if (ow * dh > oh * dw) {
+        // Window wider than the image → full height, pillarbox the sides.
+        fitH = oh;
+        fitW = (oh * dw) / dh;
+    } else {
+        // Window taller/narrower → full width, letterbox top/bottom.
+        fitW = ow;
+        fitH = (ow * dh) / dw;
+    }
+    const offX: i32 = (ow - fitW) / 2;
+    const offY: i32 = (oh - fitH) / 2;
+    packRect(dstRect.asMutPtr(), offX, offY, fitW, fitH);
+
     SDL_UpdateTexture(s.texture, dstOnTex.asMutPtr(), cropped.ptr, dw * 4);
     SDL_RenderClear(s.renderer);
-    SDL_RenderCopy(s.renderer, s.texture, dstOnTex.asMutPtr(), fullRect.asMutPtr());
+    SDL_RenderCopy(s.renderer, s.texture, dstOnTex.asMutPtr(), dstRect.asMutPtr());
     SDL_RenderPresent(s.renderer);
-    // cropped auto-drops on function-scope exit. dstOnTex / fullRect are
-    // stack arrays that vanish with the frame; no manual cleanup.
+    // cropped auto-drops on function-scope exit. dstRect / dstOnTex are stack
+    // arrays that vanish with the frame; no manual cleanup.
 }
 
 // SDL scancodes (USB HID page 7) — see SDL2 SDL_scancode.h.

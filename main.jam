@@ -76,6 +76,8 @@ extern fn SDL_RenderPresent(renderer: *mut[] u8);
 extern fn SDL_Delay(ms: u32);
 extern fn SDL_PollEvent(event: *mut[] u8) i32;
 extern fn SDL_GetTicks() u32;
+extern fn SDL_GetRendererOutputSize(renderer: *mut[] u8, w: *mut[] i32, h: *mut[] i32) i32;
+extern fn SDL_SetRenderDrawColor(renderer: *mut[] u8, r: u8, g: u8, b: u8, a: u8) i32;
 extern fn SDL_OpenAudioDevice(device: u64, iscapture: i32,
                               desired: *mut[] u8, obtained: *mut[] u8,
                               allowed_changes: i32) u32;
