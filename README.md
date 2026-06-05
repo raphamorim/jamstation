@@ -50,6 +50,17 @@ Keyboard maps to a digital PSX controller in slot 1:
 | Select     | Right Shift |
 | Quit       | Esc       |
 
+## Memory cards
+
+JamStation emulates a standard 128 KB PlayStation memory card in slot 1, so games save and load exactly as they would on real hardware.
+
+The card is backed by a file named **`slot1.mcd`** in the current working directory:
+
+- On startup it's loaded if present (you'll see `Loaded memcard: ./slot1.mcd`).
+- On a clean exit: press **Esc** or close the window, the card is written back, so saves persist across runs.
+
+It's a raw 128 KB image (the common headerless `.mcd` / `.mcr` format), so cards are interchangeable with emulators like PCSX-Redux and DuckStation. To start fresh, delete `slot1.mcd`; a blank card shows up as unformatted, and the BIOS Memory Card manager (or the game) will offer to format it.
+
 ## References
 
 - https://github.com/allkern/psxe
