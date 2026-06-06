@@ -8,6 +8,7 @@ Kindly reminder that Jam lang is experimental yet.
 
 ```bash
 # LIBRARY_PATH should be where SDL2 is located, in this case is an example in MacOS
+# NOTE: MacOS requires -lobjc as well!
 LIBRARY_PATH=/opt/homebrew/lib jam -lSDL2 -C opt-level=3 -o jamstation main.jam
 
 # Run: jamstation <BIOS_PATH> [GAME_PATH]
